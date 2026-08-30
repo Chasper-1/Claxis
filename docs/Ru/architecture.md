@@ -23,10 +23,9 @@
 | Модуль | Ответственность | Детали |
 |---|---|---|
 | `buffer` | Rope-буфер документа | [buffer-and-cursors.md](buffer-and-cursors.md) |
-| `cursor` | Мультикурсорность | [buffer-and-cursors.md](buffer-and-cursors.md) |
 | `modes` | Машина состояний режимов | [modes.md](modes.md) |
 | `commands` | Реестр и исполнение команд | [command-system.md](command-system.md) |
-| `config` | Конфигурация (TOML) | [config.md](config.md) |
+| `config` | Конфигурация (RON) | [config.md](config.md) |
 | `ui` | Рендер, вкладки, командная строка | — |
 | `i18n` | Локализация интерфейса | — |
 | `tutorial` | Встроенный обучающий курс | — |
