@@ -206,34 +206,48 @@ flowchart TD
 Фрагмент RON-конфига с алиасами и хоткеями (полное описание формата — в [`config.md`](config.md)):
 
 ```ron
-# --- Алиасы (только для командной строки) ---
+// --- Алиасы (только для командной строки) ---
 
-[aliases.global]
-w   = "std::file::save"
-q   = "std::file::close"
+Aliases(
+    global: {
+        "w": "std::file::save",
+        "q": "std::file::close",
+    },
+    mode: (
+        edit: {
+            "dd": "std::edit::delete::line",
+            "yy": "std::edit::copy::line",
+        },
+    ),
+)
 
-[aliases.mode.edit]
-dd  = "std::edit::delete::line"
-yy  = "std::edit::copy::line"
+// --- Хоткеи (прямое выполнение, минуя командную строку) ---
 
-# --- Хоткеи (прямое выполнение, минуя командную строку) ---
-
-[hotkeys.global]
-"Ctrl+s"     = "std::file::save"
-"Alt+`"      = "std::ui::commandline::open"
-
-[hotkeys.mode.edit]
-"Ctrl+z"     = "std::edit::undo"
-"Ctrl+y"     = "std::edit::redo"
-"Alt+Up"     = "std::edit::move::up"
-"Alt+Down"   = "std::edit::move::down"
-
-[hotkeys.submode.edit.select]
-"Shift+Left" = "std::edit::select::char_left"
-"Shift+End"  = "std::edit::select::line_end"
+Hotkeys(
+    global: {
+        "Ctrl+s": "std::file::save",
+        "Alt+`": "std::ui::commandline::open",
+    },
+    mode: (
+        edit: {
+            "Ctrl+z": "std::edit::undo",
+            "Ctrl+y": "std::edit::redo",
+            "Alt+Up": "std::edit::move::up",
+            "Alt+Down": "std::edit::move::down",
+        },
+    ),
+    submode: (
+        edit: (
+            select: {
+                "Shift+Left": "std::edit::select::char_left",
+                "Shift+End": "std::edit::select::line_end",
+            },
+        ),
+    ),
+)
 ```
 
-Уровни вложенности `[aliases.*]` / `[hotkeys.*]` соответствуют приоритету разрешения: `submode` → `mode` → `global`.
+Вложенность в структуре `Aliases` / `Hotkeys` соответствует приоритету разрешения: `submode` → `mode` → `global`.
 
 ---
 
