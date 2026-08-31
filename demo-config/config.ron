@@ -3,21 +3,31 @@
 // ---
 
 Modes {
-    editor {
+
+    General {
+        color_modes: bool,
+        auto_format: bool,         // Enable automatic formatting on save
+        insert_final_newline: bool 
+    },
+
+    Editor {
     // mouse settings
         mouse_mode: bool,
         middle_click_paste: bool,
         step_scroll_lines: "u8",
         
     // space edit settings
+        cursorline: bool,
+        cursorcolumn: bool,
         end_padding: u8,
-        shell_os: "String", // Unix: "sh -c" / Windows: "cmd /C"
-        line_number: Enum, // Enum > absolute else relative. line_number: absolute
-        continue_comments: bool, // If you create a new line while in the comment line, the new line will continue the comment.
+        shell_os: Enum,            // Enum > Unix: "sh -c" / Windows: "cmd /C"
+        line_number: Enum,         // Enum > absolute else relative. line_number: absolute
+        continue_comments: bool,   // If you create a new line while in the comment line, the new line will continue the comment.
         auto_completion: bool,
-        path_completion: "String",
-    }
-}
+        path_completion: (Struct), // (files: bool, directory: bool)
+        max_text_width: u8,
+    },
+},
 
 Themes {
     path: "~/Desktop/config/editor/theme",
