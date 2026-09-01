@@ -208,48 +208,34 @@ flowchart TD
 
 ## Пример конфигурации
 
-Фрагмент RON-конфига с алиасами и хоткеями (полное описание формата — в [`config.md`](config.md)):
+Фрагмент TOML-конфига с алиасами и хоткеями (полное описание формата — в [`config.md`](config.md)):
 
-```ron
-// --- Алиасы (командный режим: Alt + ввод букв) ---
+```toml
+# --- Алиасы (командный режим: Alt + ввод букв) ---
 
-Aliases(
-    global: {
-        "w": "std::file::save",
-        "q": "std::file::close",
-    },
-    state: (
-        edit: {
-            "dd": "std::edit::delete::line",
-            "yy": "std::edit::copy::line",
-        },
-    ),
-)
+[Aliases.global]
+"w" = "std::file::save"
+"q" = "std::file::close"
 
-// --- Хоткеи (Ctrl + клавиша, доступны глобально) ---
+[Aliases.state.edit]
+"dd" = "std::edit::delete::line"
+"yy" = "std::edit::copy::line"
 
-Hotkeys(
-    global: {
-        "Ctrl+s": "std::file::save",
-    },
-    state: (
-        edit: {
-            "Ctrl+z": "std::edit::undo",
-            "Ctrl+y": "std::edit::redo",
-        },
-    ),
-    regime: (
-        edit: (
-            select: {
-                "Shift+Left": "std::edit::select::char_left",
-                "Shift+End": "std::edit::select::line_end",
-            },
-        ),
-    ),
-)
+# --- Хоткеи (Ctrl + клавиша, доступны глобально) ---
+
+[Hotkeys.global]
+"Ctrl+s" = "std::file::save"
+
+[Hotkeys.state.edit]
+"Ctrl+z" = "std::edit::undo"
+"Ctrl+y" = "std::edit::redo"
+
+[Hotkeys.regime.edit.select]
+"Shift+Left" = "std::edit::select::char_left"
+"Shift+End" = "std::edit::select::line_end"
 ```
 
-Вложенность в структуре `Aliases` / `Hotkeys` соответствует приоритету разрешения: `regime` → `state` → `global`.
+Вложенность в структуре `[Aliases.*]` / `[Hotkeys.*]` соответствует приоритету разрешения: `regime` → `state` → `global`.
 
 ---
 

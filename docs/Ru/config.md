@@ -1,6 +1,6 @@
 # Конфигурация
 
-> **О чём документ:** этот документ описывает систему конфигурации редактора — формат RON, перечень настраиваемых параметров, слои конфигурации, строгую модель обработки ошибок и механизм хранения последней рабочей версии конфига. Документ фиксирует уже принятые проектные решения.
+> **О чём документ:** этот документ описывает систему конфигурации редактора — формат TOML, перечень настраиваемых параметров, слои конфигурации, строгую модель обработки ошибок и механизм хранения последней рабочей версии конфига. Документ фиксирует уже принятые проектные решения.
 
 ---
 
@@ -17,7 +17,7 @@
 
 ## Формат и что настраивается
 
-Конфигурация — единый файл в формате **RON** (Rusty Object Notation).
+Конфигурация — единый файл в формате **TOML**.
 
 ### Modes
 
@@ -104,7 +104,7 @@ flowchart LR
 
 ```text
 Ошибка конфигурации: неизвестный параметр "shell_oz" в секции Editor
-  файл:    ~/.config/my-editor/config.ron
+  файл:    ~/.config/my-editor/config.toml
   запись:  Modes.Editor.shell_oz
   ошибка:  допустимое имя — "shell_os"
 
@@ -135,40 +135,36 @@ flowchart LR
 
 ## Пример полного конфига
 
-```ron
-// ---
-// my-editor — пользовательская конфигурация
-// Слои: встроенные дефолты <- этот файл (пользовательский имеет приоритет)
-// ---
+```toml
+# ---
+# my-editor — пользовательская конфигурация
+# Слои: встроенные дефолты <- этот файл (пользовательский имеет приоритет)
+# ---
 
-Modes(
-    General(
-        color_modes: true,
-        auto_format: true,
-        insert_final_newline: true,
-    ),
-    Editor(
-        // mouse settings
-        mouse_mode: true,
-        middle_click_paste: true,
-        step_scroll_lines: 3,
+[Modes.General]
+color_modes = true
+auto_format = true
+insert_final_newline = true
 
-        // space edit settings
-        cursorline: true,
-        cursorcolumn: false,
-        end_padding: 1,
-        shell_os: "Unix",
-        line_number: "absolute",
-        continue_comments: true,
-        auto_completion: true,
-        path_completion: (files: true, directory: true),
-        max_text_width: 80,
-    ),
-),
+[Modes.Editor]
+# mouse settings
+mouse_mode = true
+middle_click_paste = true
+step_scroll_lines = 3
 
-Themes(
-    path: "~/.config/my-editor/themes",
-)
+# space edit settings
+cursorline = true
+cursorcolumn = false
+end_padding = 1
+shell_os = "Unix"
+line_number = "absolute"
+continue_comments = true
+auto_completion = true
+path_completion = { files = true, directory = true }
+max_text_width = 80
+
+[Themes]
+path = "~/.config/my-editor/themes"
 ```
 
 ---

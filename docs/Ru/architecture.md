@@ -25,7 +25,7 @@
 | `buffer` | Rope-буфер документа | [buffer-and-cursors.md](buffer-and-cursors.md) |
 | `modes` | Машина состояний (4 глобальных состояния + режимы) | [modes.md](modes.md) |
 | `commands` | Реестр и исполнение команд | [command-system.md](command-system.md) |
-| `config` | Конфигурация (RON) | [config.md](config.md) |
+| `config` | Конфигурация (TOML) | [config.md](config.md) |
 | `ui` | Рендер, вкладки, командный режим | — |
 | `i18n` | Локализация интерфейса | — |
 | `tutorial` | Встроенный обучающий курс | — |
