@@ -11,7 +11,7 @@ insert_final_newline = bool
 # mouse settings
 mouse_mode = bool
 middle_click_paste = bool
-step_scroll_lines = "u8"
+step_scroll_lines = u8
 
 # space edit settings
 cursorline = bool
@@ -21,7 +21,7 @@ shell_os = Enum            # Enum > Unix: "sh -c" / Windows: "cmd /C"
 line_number = Enum         # Enum > absolute else relative. line_number: absolute
 continue_comments = bool   # If you create a new line while in the comment line, the new line will continue the comment.
 auto_completion = bool
-path_completion = (Struct) # (files: bool, directory: bool)
+path_completion = [Struct] # (files: bool, directory: bool)
 max_text_width = u8
 
 [Themes]
