@@ -119,5 +119,5 @@ struct Cursor {
 ## Связанные документы
 
 - [`architecture.md`](architecture.md) — общая архитектура редактора.
-- [`modes.md`](modes.md) — режимы и логика курсора в них.
+- [`modes.md`](modes.md) — состояния и режимы, логика курсора в них.
 - [`mvp.md`](mvp.md) — место буфера.
