@@ -21,7 +21,7 @@ center =
 right = [ "position",  ]
 
 [Statusline.settings]
-mode_name = { edit = "Edit", command = "Command", search = "Searсh", files = "Files" }
+name_modes = { edit = "Edit", command = "Command", search = "Searсh", files = "Files", selection = "Selection", hotkeys = "Hot-keys" }
 position = { cursor = "number", selection = "number" } # selection = "percentage", cursor = "percentage"
 
 [Commandline]
