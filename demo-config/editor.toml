@@ -1,0 +1,29 @@
+[General]
+# mouse settings
+mouse_mode = true
+middle_click_paste = true
+step_scroll_lines = 3                              # u8
+
+# space edit settings
+cursorline = true
+cursorcolumn = true
+end_padding = 5                                    # u8
+shell_os = "unix"                                  # Enum > unix = "sh -c" / windows = "cmd /C"
+line_number = "relative"                           # Enum > absolute else relative. line_number: absolute
+continue_comments = true                           # If you create a new line while in the comment line, the new line will continue the comment.
+auto_completion = true
+path_completion = { files = true, directory = true } # files = bool, directory = bool
+max_text_width = 0                                 # u8 
+
+[Statusline]
+left = 
+center = 
+right = [ "position",  ]
+
+[Statusline.settings]
+mode_name = { edit = "Edit", command = "Command", search = "Searсh", files = "Files" }
+position = { cursor = "number", selection = "number" } # selection = "percentage", cursor = "percentage"
+
+[Commandline]
+hide = true
+center_mode = true
