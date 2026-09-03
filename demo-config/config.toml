@@ -3,7 +3,7 @@
 # ---
 
 [Themes]
-path = "~/.config/editor/theme"
+path = "~/.config/claxis/theme"
 
 [General]
 language = "ru"                                      # Enum > ru, en, uk...
