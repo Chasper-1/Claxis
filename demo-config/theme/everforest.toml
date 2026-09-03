@@ -1,7 +1,11 @@
+# ---
+# Config file theme Everforest
+# ---
+
 [Ui]
 name_theme = Everforest
-background = "#2d353b"
-text = "#d3c6aa"
+bg = "#2d353b" # background
+fg = "#d3c6aa" # text
 selection = "#e67e80"
 
 [Ui.statusline]
