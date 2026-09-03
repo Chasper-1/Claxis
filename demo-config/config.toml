@@ -3,7 +3,7 @@
 # ---
 
 [Themes]
-path = "~/Desktop/config/editor/theme"
+path = "~/.config/editor/theme"
 
 [General]
 language = "ru"                                      # Enum > ru, en, uk...
