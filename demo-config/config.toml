@@ -6,7 +6,7 @@
 path = "~/.config/claxis/theme"
 
 [General]
-language = "ru"                                      # Enum > ru, en, uk...
+language = "ru"                                    # Enum > ru, en, uk...
 color_modes = true
 auto_format = true                                 # Enable automatic formatting on save
 insert_final_newline = true
