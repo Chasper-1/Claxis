@@ -99,7 +99,7 @@ std::mode::command
 ```text
 std::              ← edit / file / mode / search / macro
 std::edit::        ← move / delete / select
-std::edit::move::  ← up / down / word_start
+std::edit::move::  ← up / down / word / start
 std::edit::move::up⏎
 ```
 
