@@ -55,8 +55,8 @@ dd = "std::edit::delete::line"
 [Aliases.edit]
 h = "std::edit::move::left"
 
-[Aliases.edit.command]
-v = "std::edit::select::start"
+[Aliases.edit.search]
+s = "std::edit::search::start"
 ```
 
 Алиасы и хоткеи на одном уровне независимы: настраиваются раздельно, в разных секциях, изменение одного не влияет на другой.
