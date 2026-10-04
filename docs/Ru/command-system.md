@@ -32,7 +32,7 @@ p  = ":std::clipboard::paste"
 [Hotkeys.global]
 "Ctrl+s" = ":std::file::save"
 "Ctrl+i" = ":std::mode::edit"
-" space s" = ":std::file::save"
+"space s" = ":std::file::save"
 ```
 
 Хоткеи пишутся в специальном режиме, который активируется нажатием `Ctrl` по умолчанию.
