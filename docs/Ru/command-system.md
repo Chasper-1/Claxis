@@ -18,10 +18,10 @@
 
 ```toml
 [Aliases.global]
-dd = "std::edit::delete::line"
-yy = "std::edit::copy::line"
-j  = "std::edit::move::down"
-p  = "std::clipboard::paste"
+dd = ":std::edit::delete::line"
+yy = ":std::edit::copy::line"
+j  = ":std::edit::move::down"
+p  = ":std::clipboard::paste"
 ```
 
 ## Хоткеи
@@ -30,9 +30,9 @@ p  = "std::clipboard::paste"
 
 ```toml
 [Hotkeys.global]
-"Ctrl+s" = "std::file::save"
-"Ctrl+i" = "std::mode::edit"
-" space s" = "std::file::save"
+"Ctrl+s" = ":std::file::save"
+"Ctrl+i" = ":std::mode::edit"
+" space s" = ":std::file::save"
 ```
 
 Хоткеи пишутся в специальном режиме, который активируется нажатием `Ctrl` по умолчанию.
@@ -50,13 +50,13 @@ p  = "std::clipboard::paste"
 
 ```toml
 [Aliases.global]
-dd = "std::edit::delete::line"
+dd = ":std::edit::delete::line"
 
 [Aliases.edit]
-h = "std::edit::move::left"
+h = ":std::edit::move::left"
 
 [Aliases.edit.search]
-s = "std::edit::search::start"
+s = ":std::edit::search::start"
 ```
 
 Алиасы и хоткеи на одном уровне независимы: настраиваются раздельно, в разных секциях, изменение одного не влияет на другой.
@@ -74,15 +74,15 @@ s = "std::edit::search::start"
 Команда — иерархическая строка с разделителем `::`.
 
 ```
-std::edit::move::up
-std::edit::delete::line
-std::file::save
-std::mode::command
+:std::edit::move::up
+:std::edit::delete::line
+:std::file::save
+:std::mode::command
 ```
 
 | Уровень | Что содержит |
 |---|---|
-| Пространство | `std` — встроенные, `plugin-id` — из плагинов |
+| Пространство | `:std` — встроенные, `plugin-id` — из плагинов |
 | Домен | `edit`, `file`, `mode`, `search`, `macro` |
 | Действие | `move`, `delete`, `select`, `open`, `save` |
 | Уточнение | `up`, `line`, `word_start` |
@@ -104,19 +104,19 @@ std::mode::command
 Набор по уровням, с учётом активного состояния и режима.
 
 ```text
-std::              ← edit / file / mode / search / macro
-std::edit::        ← move / delete / select
-std::edit::move::  ← up / down / word / start
-std::edit::move::up⏎
+:std::              ← edit / file / mode / search / macro
+:std::edit::        ← move / delete / select
+:std::edit::move::  ← up / down / word / start
+:std::edit::move::up⏎
 ```
 
 После `::` предлагаются только продолжения текущего уровня, недоступные в текущем контексте команды не показываются. При единственном совпадении дописывается сразу, при нескольких показывается весь список.
 
 ## Повторения
 
-Числовой префикс — количество повторений. `5dd` удаляет пять строк, `10j` идёт вниз на десять строк, `3 std::edit::move::word::right` смещается на три слова вправо.
+Числовой префикс — количество повторений. `5dd` удаляет пять строк, `10j` идёт вниз на десять строк, `3 :std::edit::move::word::right` смещается на три слова вправо.
 `В алиасах dd или j заранее прописывается пробел, для возможности писать как в примере.`
-`dd = " std::edit::delete::line"` и `j = " std::edit::move::line"`
+`dd = " :std::edit::delete::line"` и `j = " :std::edit::move::line"`
        ^                                  ^
 
 
