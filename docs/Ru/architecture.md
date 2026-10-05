@@ -22,7 +22,7 @@ TUI-only, язык Rust, бэкенд ratatui и crossterm. GUI не делае�
 | `claxis-commands` | Команды, аргументы, автодополнение, разрешение, уровни привязок, конфликты | `core`, `input`, `config`, `files` |
 | `claxis-modes` | Режимы, состояния, переходы, индикация | `core`, `commands` |
 | `claxis-view` | Отображение, компоновка, отрисовка, вкладки, бар, командная строка, оверлеи | `core`, `text`, `term`, `theme`, `i18n` |
-| `claxis-plugin` | Плагины: макросы, Rhai-скрипты, API ядра, очередь исполнения | `core`, `commands` |
+| `claxis-plugin` | Плагины: макросы, Wasm-скрипты, API ядра, очередь исполнения | `core`, `commands` |
 | `claxis` | Бинарник | Все крейты |
 
 
