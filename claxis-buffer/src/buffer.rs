@@ -11,6 +11,16 @@ pub struct Buffer {
     current: Current,
 }
 
+pub struct Snapshot {
+    original: Vec<u8>,
+}
+
+impl Snapshot {
+    pub fn original(&self) -> &[u8] {
+        &self.original
+    }
+}
+
 impl Buffer {
     pub fn new(original: impl AsRef<[u8]>) -> Self {
         let original = original.as_ref().to_vec();
@@ -36,7 +46,7 @@ impl Buffer {
     }
 
     pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
-        self.current.segments()
+        self.current.segments(&self.arena)
     }
 
     pub fn len(&self) -> usize {
@@ -60,8 +70,16 @@ impl Buffer {
         if data.is_empty() {
             return Ok(());
         }
-        let add = self.arena.push(data);
-        let surgery = self.current.apply_insert(pos, add, data.len());
+        let add = match self.arena.push(data) {
+            Some(add) => add,
+            None => return Err(Error::ArenaFull),
+        };
+        let off = self
+            .arena
+            .start(add)
+            .expect("add только что записан в арену");
+        let cursor = self.current.cursor_at(pos);
+        let surgery = self.current.apply_insert(cursor, add, off, data.len());
         self.history.record(Record {
             edit: Edit::Insert { pos, add },
             surgery,
@@ -74,7 +92,9 @@ impl Buffer {
         if len == 0 {
             return Ok(());
         }
-        let surgery = self.current.apply_delete(pos, len);
+        let start = self.current.cursor_at(pos);
+        let end = self.current.cursor_at(pos + len);
+        let surgery = self.current.apply_delete(start, end);
         self.history.record(Record {
             edit: Edit::Delete { pos, len },
             surgery,
@@ -84,8 +104,21 @@ impl Buffer {
 
     pub fn replace(&mut self, pos: usize, len: usize, data: &[u8]) -> Result<(), Error> {
         self.check(pos, len)?;
+        if !data.is_empty() && data.len() > self.arena.remaining() {
+            return Err(Error::ArenaFull);
+        }
         self.delete(pos, len)?;
         self.insert(pos, data)
+    }
+
+    pub fn snapshot(&mut self) -> Snapshot {
+        let materialized = self.read();
+        let original = std::mem::replace(&mut self.original, materialized);
+        self.arena.reset();
+        self.history = History::default();
+        let current = Current::from_original(&self.original);
+        self.current = current;
+        Snapshot { original }
     }
 
     pub fn undo(&mut self) -> Option<Edit> {

@@ -587,6 +587,57 @@ fn discarding_redo_keeps_data_and_correct_state() {
 }
 
 #[test]
+fn arena_full_returns_error_and_snapshot_resets_generation() {
+    let mut b = Buffer::new("base");
+    let chunk = vec![b'x'; 16 * 1024];
+    for _ in 0..8 {
+        b.insert(b.len(), &chunk).unwrap();
+    }
+    assert_eq!(b.add_count(), 8);
+
+    let text = b.read();
+    assert_eq!(b.insert(b.len(), &chunk), Err(Error::ArenaFull));
+    assert_eq!(b.read(), text);
+
+    let snapshot = b.snapshot();
+    assert_eq!(snapshot.original(), b"base");
+    assert_eq!(b.original(), text);
+    assert_eq!(b.read(), text);
+    assert_eq!(b.add_count(), 0);
+    assert!(b.undo_stack().is_empty());
+    assert!(b.redo_stack().is_empty());
+
+    b.insert(b.len(), &chunk).unwrap();
+    let mut expected = text;
+    expected.extend_from_slice(&chunk);
+    assert_eq!(b.read(), expected);
+    assert_eq!(b.add_count(), 1);
+    assert!(b.undo().is_some());
+    assert_eq!(b.read(), expected[..expected.len() - chunk.len()].to_vec());
+    b.redo().unwrap();
+    assert_eq!(b.read(), expected);
+    check_invariants(&b);
+}
+
+#[test]
+fn replace_fails_cleanly_when_arena_full() {
+    let mut b = Buffer::new("");
+    let chunk = vec![b'x'; 16 * 1024];
+    for _ in 0..8 {
+        b.insert(b.len(), &chunk).unwrap();
+    }
+    let text = b.read();
+    let history_len = b.undo_stack().len();
+
+    assert_eq!(b.replace(0, 1, b"y"), Err(Error::ArenaFull));
+    assert_eq!(b.read(), text);
+    assert_eq!(b.undo_stack().len(), history_len);
+
+    assert_eq!(b.replace(0, 1, b""), Ok(()));
+    assert_eq!(b.read(), text[1..].to_vec());
+}
+
+#[test]
 fn differential_against_reference_string() {
     for initial in ["", "hello", "aaaabbbbcccc"] {
         for seed in 0..6u64 {

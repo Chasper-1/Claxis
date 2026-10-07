@@ -6,7 +6,7 @@ mod history;
 mod segment;
 
 pub use arena::{AddArena, AddId};
-pub use buffer::Buffer;
+pub use buffer::{Buffer, Snapshot};
 pub use current::Current;
 pub use edit::{Edit, Error};
 pub use history::{History, Record};

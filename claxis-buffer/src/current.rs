@@ -1,62 +1,59 @@
 use crate::arena::{AddArena, AddId};
 use crate::segment::{Segment, Source};
 
-pub(crate) type NodeId = usize;
+pub(crate) type NodeId = u32;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Link {
-    Head,
-    Node(NodeId),
+struct Node {
+    src: u32,
+    off: usize,
+    len: usize,
+    next: Option<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Write {
-    link: Link,
+    link: NodeId,
     to: Option<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Split {
-    node: NodeId,
-    tail: NodeId,
-    rel: usize,
-    full: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct Surgery {
-    apply: [Write; 2],
-    apply_n: u8,
-    undo: [Write; 2],
-    undo_n: u8,
-    splits: [Option<Split>; 2],
+    apply: Write,
+    undo: Write,
     delta: i64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Cursor {
+    pub(crate) pre: NodeId,
+    pub(crate) node: Option<NodeId>,
+    pub(crate) rel: usize,
+    pub(crate) pos: usize,
+}
+
 #[derive(Debug)]
-struct Node {
-    seg: Segment,
-    next: Option<NodeId>,
-}
-
-struct Boundary {
-    pre: Link,
-    node: Option<NodeId>,
-    split: Option<Split>,
-}
-
-const FILLER: Write = Write {
-    link: Link::Head,
-    to: None,
-};
-
-#[derive(Debug, Default)]
 pub struct Current {
     nodes: Vec<Node>,
-    head: Option<NodeId>,
-    base: Option<NodeId>,
-    original_len: usize,
     len: usize,
+    original_len: usize,
+    base: Option<NodeId>,
+}
+
+impl Default for Current {
+    fn default() -> Self {
+        Self {
+            nodes: vec![Node {
+                src: 0,
+                off: 0,
+                len: 0,
+                next: None,
+            }],
+            len: 0,
+            original_len: 0,
+            base: None,
+        }
+    }
 }
 
 impl Current {
@@ -64,16 +61,25 @@ impl Current {
         if original.is_empty() {
             Self::default()
         } else {
-            let node = Node {
-                seg: Segment::new(Source::Original, 0, original.len()),
-                next: None,
-            };
+            let nodes = vec![
+                Node {
+                    src: 0,
+                    off: 0,
+                    len: 0,
+                    next: Some(1),
+                },
+                Node {
+                    src: 0,
+                    off: 0,
+                    len: original.len(),
+                    next: None,
+                },
+            ];
             Self {
-                nodes: vec![node],
-                head: Some(0),
-                base: Some(0),
-                original_len: original.len(),
+                nodes,
                 len: original.len(),
+                original_len: original.len(),
+                base: Some(1),
             }
         }
     }
@@ -86,13 +92,21 @@ impl Current {
         self.len == 0
     }
 
-    pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
-        let mut cur = self.head;
+    pub fn segments<'a>(&'a self, arena: &'a AddArena) -> impl Iterator<Item = Segment> + 'a {
+        let mut cur = self.nodes[0].next;
         std::iter::from_fn(move || {
             let id = cur?;
-            let node = &self.nodes[id];
+            let node = &self.nodes[id as usize];
             cur = node.next;
-            Some(node.seg)
+            if node.src == 0 {
+                Some(Segment::new(Source::Original, node.off, node.len))
+            } else {
+                let add = node.src as usize - 1;
+                let start = arena
+                    .start(add)
+                    .expect("сегмент ссылается на несуществующую запись arena");
+                Some(Segment::new(Source::Add(add), node.off - start, node.len))
+            }
         })
     }
 
@@ -103,145 +117,176 @@ impl Current {
     }
 
     pub fn read_into(&self, out: &mut Vec<u8>, original: &[u8], arena: &AddArena) {
-        let mut cur = self.head;
+        let bases = [original.as_ptr(), arena.as_ptr()];
+        let mut cur = self.nodes[0].next;
         while let Some(id) = cur {
-            let node = &self.nodes[id];
+            let node = &self.nodes[id as usize];
             if let Some(nid) = node.next {
-                prefetch(self.nodes.as_ptr().wrapping_add(nid).cast());
+                prefetch(self.nodes.as_ptr().wrapping_add(nid as usize).cast());
             }
-            out.extend_from_slice(segment_bytes(node, original, arena));
+            let base = unsafe { *bases.get_unchecked((node.src != 0) as usize) };
+            let bytes = unsafe { std::slice::from_raw_parts(base.add(node.off), node.len) };
+            out.extend_from_slice(bytes);
             cur = node.next;
         }
     }
 
-    pub(crate) fn apply_insert(&mut self, pos: usize, add: AddId, data_len: usize) -> Surgery {
+    pub(crate) fn cursor_at(&self, pos: usize) -> Cursor {
         debug_assert!(pos <= self.len);
+        let mut pre: NodeId = 0;
+        let mut cur = self.nodes[0].next;
+        let mut offset = 0usize;
+        while let Some(id) = cur {
+            let node = &self.nodes[id as usize];
+            if offset + node.len > pos {
+                return Cursor {
+                    pre,
+                    node: Some(id),
+                    rel: pos - offset,
+                    pos,
+                };
+            }
+            offset += node.len;
+            pre = id;
+            cur = node.next;
+        }
+        debug_assert_eq!(pos, self.len, "cursor_at вышел за конец документа");
+        Cursor {
+            pre,
+            node: None,
+            rel: 0,
+            pos,
+        }
+    }
+
+    pub(crate) fn apply_insert(
+        &mut self,
+        cursor: Cursor,
+        add: AddId,
+        off: usize,
+        data_len: usize,
+    ) -> Surgery {
         debug_assert!(data_len > 0);
-        let boundary = self.resolve(pos);
-        let undo_to = match boundary.split {
-            Some(split) => self.nodes[split.tail].next,
-            None => boundary.node,
+        debug_assert!(add < u32::MAX as usize);
+        let src = add as u32 + 1;
+        let (apply_to, undo_to) = match cursor.node {
+            Some(n) if cursor.rel == 0 => {
+                let i = self.push(Node {
+                    src,
+                    off,
+                    len: data_len,
+                    next: Some(n),
+                });
+                (Some(i), Some(n))
+            }
+            Some(n) => {
+                let old = self.nodes[n as usize];
+                let s = self.push(Node {
+                    src: old.src,
+                    off: old.off + cursor.rel,
+                    len: old.len - cursor.rel,
+                    next: old.next,
+                });
+                let i = self.push(Node {
+                    src,
+                    off,
+                    len: data_len,
+                    next: Some(s),
+                });
+                let p = self.push(Node {
+                    src: old.src,
+                    off: old.off,
+                    len: cursor.rel,
+                    next: Some(i),
+                });
+                (Some(p), Some(n))
+            }
+            None => {
+                let i = self.push(Node {
+                    src,
+                    off,
+                    len: data_len,
+                    next: None,
+                });
+                (Some(i), None)
+            }
         };
-        let node = self.nodes.len();
-        self.nodes.push(Node {
-            seg: Segment::new(Source::Add(add), 0, data_len),
-            next: boundary.node,
-        });
-        let apply = [
-            Write {
-                link: boundary.pre,
-                to: Some(node),
-            },
-            Write {
-                link: Link::Node(node),
-                to: boundary.node,
-            },
-        ];
-        self.write(apply[0]);
-        self.write(apply[1]);
+        let apply = Write {
+            link: cursor.pre,
+            to: apply_to,
+        };
+        self.write(apply);
         self.len += data_len;
         Surgery {
             apply,
-            apply_n: 2,
-            undo: [Write {
-                link: boundary.pre,
+            undo: Write {
+                link: cursor.pre,
                 to: undo_to,
-            }, FILLER],
-            undo_n: 1,
-            splits: [boundary.split, None],
+            },
             delta: data_len as i64,
         }
     }
 
-    pub(crate) fn apply_delete(&mut self, pos: usize, del_len: usize) -> Surgery {
-        debug_assert!(
-            pos.checked_add(del_len)
-                .is_some_and(|end| end <= self.len)
-        );
-        debug_assert!(del_len > 0);
-        let start = self.resolve(pos);
-        let first = start.node.expect("удаление начинается внутри документа");
-        let end = self.resolve(pos + del_len);
-
-        let apply = [
-            Write {
-                link: end.pre,
-                to: end.node,
-            },
-            Write {
-                link: start.pre,
-                to: end.node,
-            },
-        ];
-
-        let mut undo = [FILLER; 2];
-        let mut undo_n: u8 = 0;
-        let mut end_absorb: Option<(NodeId, Option<NodeId>)> = None;
-        if let Some(split) = end.split {
-            let to = self.nodes[split.tail].next;
-            undo[undo_n as usize] = Write {
-                link: Link::Node(split.node),
-                to,
-            };
-            undo_n += 1;
-            end_absorb = Some((split.node, to));
-        }
-        match start.split {
-            Some(_) => {
-                let to = match end_absorb {
-                    Some((node, to)) if node == first => to,
-                    _ => self.nodes[first].next,
-                };
-                undo[undo_n as usize] = Write {
-                    link: start.pre,
-                    to,
-                };
-                undo_n += 1;
+    pub(crate) fn apply_delete(&mut self, start: Cursor, end: Cursor) -> Surgery {
+        debug_assert!(start.pos < end.pos);
+        debug_assert!(end.pos <= self.len);
+        let after = match end.node {
+            Some(n) if end.rel == 0 => Some(n),
+            Some(n) => {
+                let old = self.nodes[n as usize];
+                let t = self.push(Node {
+                    src: old.src,
+                    off: old.off + end.rel,
+                    len: old.len - end.rel,
+                    next: old.next,
+                });
+                Some(t)
             }
-            None => {
-                undo[undo_n as usize] = Write {
-                    link: start.pre,
-                    to: Some(first),
-                };
-                undo_n += 1;
+            None => None,
+        };
+        let (apply_to, undo_to) = match start.node {
+            Some(n) if start.rel > 0 => {
+                let old = self.nodes[n as usize];
+                let k = self.push(Node {
+                    src: old.src,
+                    off: old.off,
+                    len: start.rel,
+                    next: after,
+                });
+                (Some(k), Some(n))
             }
-        }
-
-        self.write(apply[0]);
-        self.write(apply[1]);
-        self.len -= del_len;
+            Some(n) => (after, Some(n)),
+            None => (after, None),
+        };
+        let apply = Write {
+            link: start.pre,
+            to: apply_to,
+        };
+        self.write(apply);
+        let delta = end.pos - start.pos;
+        self.len -= delta;
         Surgery {
             apply,
-            apply_n: 2,
-            undo,
-            undo_n,
-            splits: [start.split, end.split],
-            delta: -(del_len as i64),
+            undo: Write {
+                link: start.pre,
+                to: undo_to,
+            },
+            delta: -(delta as i64),
         }
     }
 
     pub(crate) fn apply_surgery(&mut self, surgery: Surgery) {
-        for split in surgery.splits.iter().flatten() {
-            self.nodes[split.node].seg.len = split.rel;
-        }
-        for &write in surgery.apply.iter().take(surgery.apply_n as usize) {
-            self.write(write);
-        }
+        self.write(surgery.apply);
         self.shift_len(surgery.delta);
     }
 
     pub(crate) fn undo_surgery(&mut self, surgery: Surgery) {
-        for &write in surgery.undo.iter().take(surgery.undo_n as usize) {
-            self.write(write);
-        }
-        for split in surgery.splits.iter().flatten() {
-            self.nodes[split.node].seg.len = split.full;
-        }
+        self.write(surgery.undo);
         self.shift_len(-surgery.delta);
     }
 
     pub(crate) fn rebuild(&mut self, active: impl Iterator<Item = Surgery>) {
-        self.head = self.base;
+        self.nodes[0].next = self.base;
         self.len = self.original_len;
         for surgery in active {
             self.apply_surgery(surgery);
@@ -253,6 +298,12 @@ impl Current {
         self.nodes.len()
     }
 
+    fn push(&mut self, node: Node) -> NodeId {
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(node);
+        id
+    }
+
     fn shift_len(&mut self, delta: i64) {
         let next = self.len as i64 + delta;
         debug_assert!(next >= 0, "длина документа стала отрицательной");
@@ -260,64 +311,7 @@ impl Current {
     }
 
     fn write(&mut self, write: Write) {
-        match write.link {
-            Link::Head => self.head = write.to,
-            Link::Node(id) => self.nodes[id].next = write.to,
-        }
-    }
-
-    fn resolve(&mut self, pos: usize) -> Boundary {
-        let mut cur = self.head;
-        let mut prev: Option<NodeId> = None;
-        let mut offset = 0usize;
-        while let Some(id) = cur {
-            let seg = self.nodes[id].seg;
-            if offset + seg.len > pos {
-                let rel = pos - offset;
-                if rel == 0 {
-                    return Boundary {
-                        pre: prev.map_or(Link::Head, Link::Node),
-                        node: Some(id),
-                        split: None,
-                    };
-                }
-                let tail = Node {
-                    seg: Segment::new(seg.source, seg.offset + rel, seg.len - rel),
-                    next: self.nodes[id].next,
-                };
-                let tail_id = self.nodes.len();
-                self.nodes.push(tail);
-                self.nodes[id].seg.len = rel;
-                self.nodes[id].next = Some(tail_id);
-                return Boundary {
-                    pre: Link::Node(id),
-                    node: Some(tail_id),
-                    split: Some(Split {
-                        node: id,
-                        tail: tail_id,
-                        rel,
-                        full: seg.len,
-                    }),
-                };
-            }
-            offset += seg.len;
-            prev = Some(id);
-            cur = self.nodes[id].next;
-        }
-        debug_assert_eq!(pos, self.len, "resolve вышел за конец документа");
-        Boundary {
-            pre: prev.map_or(Link::Head, Link::Node),
-            node: None,
-            split: None,
-        }
-    }
-}
-
-#[inline(always)]
-fn segment_bytes<'a>(node: &Node, original: &'a [u8], arena: &'a AddArena) -> &'a [u8] {
-    match node.seg.source {
-        Source::Original => &original[node.seg.offset..node.seg.end()],
-        Source::Add(add) => &arena[add][node.seg.offset..node.seg.end()],
+        self.nodes[write.link as usize].next = write.to;
     }
 }
 

@@ -15,6 +15,7 @@ pub enum Error {
         len: usize,
         doc_len: usize,
     },
+    ArenaFull,
 }
 
 impl fmt::Display for Error {
@@ -31,6 +32,7 @@ impl fmt::Display for Error {
                     "range {pos}..{end} is outside the document of length {doc_len}"
                 )
             }
+            Error::ArenaFull => write!(f, "add arena is full"),
         }
     }
 }
