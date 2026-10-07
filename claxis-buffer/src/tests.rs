@@ -631,7 +631,11 @@ fn arena_cycle_survives_rebuild() {
 
     b.rebuild();
 
-    assert_eq!(segments(&b), before, "rebuild разошёлся после границы арены");
+    assert_eq!(
+        segments(&b),
+        before,
+        "rebuild разошёлся после границы арены"
+    );
     check_invariants(&b);
 }
 

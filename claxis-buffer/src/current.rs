@@ -3,7 +3,7 @@ use crate::segment::{Segment, Source};
 
 pub(crate) type NodeId = u32;
 
-/// Узел — только ссылки: источник, смещение, длина, следующий узел.
+/// Узел — только ссылки: источник, смещение, длина, соседи.
 /// Записей истории здесь нет, `Current` их не держит.
 #[derive(Clone, Copy, Debug)]
 struct Node {
@@ -11,6 +11,7 @@ struct Node {
     off: u32,
     len: u32,
     next: Option<NodeId>,
+    prev: NodeId,
 }
 
 /// Перестановка одной ссылки цепочки.
@@ -34,6 +35,13 @@ pub struct Current {
     len: u32,
     original_len: u32,
     base: Option<NodeId>,
+    /// Отслеженное положение курсора: известная позиция, предыдущая нода,
+    /// сама нода и смещение в ней. Отсюда считается следующая позиция —
+    /// прибавлением длин, а не обходом от головы.
+    cursor_pos: u32,
+    cursor_pre: NodeId,
+    cursor_node: Option<NodeId>,
+    cursor_rel: u32,
 }
 
 impl Default for Current {
@@ -44,10 +52,15 @@ impl Default for Current {
                 off: 0,
                 len: 0,
                 next: None,
+                prev: 0,
             }],
             len: 0,
             original_len: 0,
             base: None,
+            cursor_pos: 0,
+            cursor_pre: 0,
+            cursor_node: None,
+            cursor_rel: 0,
         }
     }
 }
@@ -64,12 +77,14 @@ impl Current {
                     off: 0,
                     len: 0,
                     next: Some(1),
+                    prev: 0,
                 },
                 Node {
                     src: 0,
                     off: 0,
                     len,
                     next: None,
+                    prev: 0,
                 },
             ];
             Self {
@@ -77,6 +92,10 @@ impl Current {
                 len,
                 original_len: len,
                 base: Some(1),
+                cursor_pos: 0,
+                cursor_pre: 0,
+                cursor_node: Some(1),
+                cursor_rel: 0,
             }
         }
     }
@@ -90,23 +109,72 @@ impl Current {
     }
 
     /// Нода, которой принадлежит байт `pos`: предыдущая, сама и смещение внутри неё.
-    /// `pos` известен заранее в байтах, искать нечего — проход по дескрипторам.
-    fn locate(&self, pos: u32) -> (NodeId, Option<NodeId>, u32) {
+    ///
+    /// Считается от отслеженного положения курсора: разница позиций — это
+    /// сумма длин нод на пути, то есть прибавление по ходу, а не обход от головы.
+    fn locate(&mut self, pos: u32) -> (NodeId, Option<NodeId>, u32) {
         debug_assert!(pos <= self.len);
-        let mut pre: NodeId = 0;
-        let mut cur = self.nodes[0].next;
-        let mut offset: u32 = 0;
-        while let Some(id) = cur {
-            let node = unsafe { self.nodes.get_unchecked(id as usize) };
-            if pos.wrapping_sub(offset) < node.len {
-                return (pre, Some(id), pos - offset);
+        let mut pre = self.cursor_pre;
+        let mut node = self.cursor_node;
+        let mut rel = self.cursor_rel;
+        let mut offset = self.cursor_pos;
+
+        if pos >= offset {
+            // Разница позиций — сумма длин: идём вперёд, прибавляя длины.
+            while offset < pos {
+                let id = match node {
+                    Some(id) => id,
+                    None => {
+                        debug_assert_eq!(pos, self.len, "locate: позиция за концом документа");
+                        break;
+                    }
+                };
+                let n = self.nodes[id as usize];
+                let room = n.len - rel;
+                let step = pos - offset;
+                if step < room {
+                    // Позиция внутри этой ноды — дальше идти не надо.
+                    rel += step;
+                    break;
+                }
+                if let Some(next) = n.next {
+                    prefetch(self.nodes.as_ptr().wrapping_add(next as usize).cast());
+                }
+                offset += room;
+                pre = id;
+                node = n.next;
+                rel = 0;
             }
-            offset += node.len;
-            pre = id;
-            cur = node.next;
+        } else {
+            // Назад: та же арифметика, но вычитанием.
+            while offset > pos {
+                let back = offset - pos;
+                if back <= rel {
+                    rel -= back;
+                    break;
+                }
+                offset -= rel;
+                let id = pre;
+                if id == 0 {
+                    debug_assert_eq!(pos, 0, "locate: позиция до начала документа");
+                    node = None;
+                    rel = 0;
+                    pre = 0;
+                    break;
+                }
+                let n = self.nodes[id as usize];
+                if n.prev != 0 {
+                    prefetch(self.nodes.as_ptr().wrapping_add(n.prev as usize).cast());
+                }
+                pre = n.prev;
+                node = Some(id);
+                rel = n.len;
+            }
         }
-        debug_assert_eq!(pos, self.len, "locate: позиция за концом документа");
-        (pre, None, 0)
+
+        let found = (pre, node, rel);
+        self.set_cursor(pos, found);
+        found
     }
 
     pub fn segments<'a>(&'a self, arena: &'a AddArena) -> impl Iterator<Item = Segment> + 'a {
@@ -141,8 +209,12 @@ impl Current {
             if let Some(nid) = node.next {
                 prefetch(self.nodes.as_ptr().wrapping_add(nid as usize).cast());
             }
+            #[cfg(debug_assertions)]
+            self.debug_check_node(node, original, arena);
             let base = unsafe { *bases.get_unchecked((node.src != 0) as usize) };
-            let bytes = unsafe { std::slice::from_raw_parts(base.add(node.off as usize), node.len as usize) };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(base.add(node.off as usize), node.len as usize)
+            };
             out.extend_from_slice(bytes);
             cur = node.next;
         }
@@ -164,30 +236,36 @@ impl Current {
         };
         debug_assert!(
             node.off >= lo && node.off + node.len <= hi,
-            "нода выходит за границы источника: {:?} при {}", node, hi
+            "нода выходит за границы источника: {:?} при {}",
+            node,
+            hi
         );
     }
 
     /// Вставка в позицию `pos`. Позиция и длина известны, узел делится на месте курсора.
-    pub(crate) fn apply_insert(
-        &mut self,
-        pos: u32,
-        add: AddId,
-        off: u32,
-        len: u32,
-    ) -> Surgery {
+    pub(crate) fn apply_insert(&mut self, pos: u32, add: AddId, off: u32, len: u32) -> Surgery {
         debug_assert!(len > 0);
         let (pre, node, rel) = self.locate(pos);
+        // Курсор может стоять ровно на конце ноды — делить её нельзя,
+        // пустой хвост. Переносим вставку за эту ноду.
+        let (pre, node, rel) = match (pre, node, rel) {
+            (_, Some(n), r) if r >= self.nodes[n as usize].len => {
+                (n, self.nodes[n as usize].next, 0)
+            }
+            other => other,
+        };
         let src = add + 1;
-        let (apply_to, undo_to) = match node {
+        let (apply_to, undo_to, cursor) = match node {
             Some(n) if rel == 0 => {
                 let i = self.push(Node {
                     src,
                     off,
                     len,
                     next: Some(n),
+                    prev: pre,
                 });
-                (Some(i), Some(n))
+                self.nodes[n as usize].prev = i;
+                (Some(i), Some(n), (pre, Some(i), len))
             }
             Some(n) => {
                 let old = self.nodes[n as usize];
@@ -196,20 +274,28 @@ impl Current {
                     off: old.off + rel,
                     len: old.len - rel,
                     next: old.next,
+                    prev: 0,
                 });
                 let i = self.push(Node {
                     src,
                     off,
                     len,
                     next: Some(s),
+                    prev: 0,
                 });
                 let p = self.push(Node {
                     src: old.src,
                     off: old.off,
                     len: rel,
                     next: Some(i),
+                    prev: pre,
                 });
-                (Some(p), Some(n))
+                self.nodes[s as usize].prev = i;
+                self.nodes[i as usize].prev = p;
+                if let Some(next) = old.next {
+                    self.nodes[next as usize].prev = s;
+                }
+                (Some(p), Some(n), (p, Some(i), len))
             }
             None => {
                 let i = self.push(Node {
@@ -217,8 +303,9 @@ impl Current {
                     off,
                     len,
                     next: None,
+                    prev: pre,
                 });
-                (Some(i), None)
+                (Some(i), None, (i, None, 0))
             }
         };
         let apply = Write {
@@ -227,6 +314,7 @@ impl Current {
         };
         self.write(apply);
         self.shift_len(len as i64);
+        self.set_cursor(pos + len, cursor);
         Surgery {
             apply,
             undo: Write {
@@ -240,9 +328,7 @@ impl Current {
     /// Удаление диапазона `[pos, pos + len)`.
     pub(crate) fn apply_delete(&mut self, pos: u32, len: u32) -> Surgery {
         debug_assert!(len > 0);
-        let end = pos
-            .checked_add(len)
-            .expect("переполнение pos + len");
+        let end = pos.checked_add(len).expect("переполнение pos + len");
         debug_assert!(end <= self.len);
         let (start_pre, start_node, start_rel) = self.locate(pos);
         let (_, end_node, end_rel) = self.locate(end);
@@ -251,12 +337,17 @@ impl Current {
             Some(n) if end_rel == 0 => Some(n),
             Some(n) => {
                 let old = self.nodes[n as usize];
-                Some(self.push(Node {
+                let t = self.push(Node {
                     src: old.src,
                     off: old.off + end_rel,
                     len: old.len - end_rel,
                     next: old.next,
-                }))
+                    prev: 0,
+                });
+                if let Some(next) = old.next {
+                    self.nodes[next as usize].prev = t;
+                }
+                Some(t)
             }
             None => None,
         };
@@ -268,6 +359,7 @@ impl Current {
                     off: old.off,
                     len: start_rel,
                     next: after,
+                    prev: start_pre,
                 });
                 (Some(k), Some(n))
             }
@@ -279,7 +371,14 @@ impl Current {
             to: apply_to,
         };
         self.write(apply);
+        // Узел сразу за оставшейся частью теперь идёт после неё.
+        if let Some(a) = apply_to {
+            if let Some(succ) = self.nodes[a as usize].next {
+                self.nodes[succ as usize].prev = a;
+            }
+        }
         self.shift_len(-(len as i64));
+        self.set_cursor(pos, (start_pre, apply_to, start_rel));
         Surgery {
             apply,
             undo: Write {
@@ -293,19 +392,26 @@ impl Current {
     pub(crate) fn apply_surgery(&mut self, surgery: Surgery) {
         self.write(surgery.apply);
         self.shift_len(surgery.delta);
+        self.reset_cursor();
     }
 
     pub(crate) fn undo_surgery(&mut self, surgery: Surgery) {
         self.write(surgery.undo);
         self.shift_len(-surgery.delta);
+        self.reset_cursor();
     }
 
     pub(crate) fn rebuild(&mut self, active: impl Iterator<Item = Surgery>) {
         self.nodes[0].next = self.base;
+        if let Some(base) = self.base {
+            self.nodes[base as usize].prev = 0;
+        }
         self.len = self.original_len;
         for surgery in active {
-            self.apply_surgery(surgery);
+            self.write(surgery.apply);
+            self.shift_len(surgery.delta);
         }
+        self.reset_cursor();
     }
 
     #[cfg(test)]
@@ -329,6 +435,24 @@ impl Current {
 
     fn write(&mut self, write: Write) {
         self.nodes[write.link as usize].next = write.to;
+        if let Some(to) = write.to {
+            self.nodes[to as usize].prev = write.link;
+        }
+    }
+
+    /// Запомнить, где теперь стоит курсор.
+    fn set_cursor(&mut self, pos: u32, cursor: (NodeId, Option<NodeId>, u32)) {
+        self.cursor_pos = pos;
+        self.cursor_pre = cursor.0;
+        self.cursor_node = cursor.1;
+        self.cursor_rel = cursor.2;
+    }
+
+    /// Сброс отслеживания: цепочка перестроена, прежняя нода могла выпасть.
+    /// Отсчёт от головы цепочки, а не от `base`: при пустом оригинале `base` нет.
+    fn reset_cursor(&mut self) {
+        let head = self.nodes[0].next;
+        self.set_cursor(0, (0, head, 0));
     }
 }
 
