@@ -4,13 +4,7 @@ use crate::edit::{Edit, Error};
 use crate::history::{History, Record};
 use crate::segment::Segment;
 
-pub struct Buffer {
-    original: Vec<u8>,
-    arena: AddArena,
-    history: History,
-    current: Current,
-}
-
+/// Байты снапшота: текущее состояние документа перед переездом `Original`.
 pub struct Snapshot {
     original: Vec<u8>,
 }
@@ -19,6 +13,13 @@ impl Snapshot {
     pub fn original(&self) -> &[u8] {
         &self.original
     }
+}
+
+pub struct Buffer {
+    original: Vec<u8>,
+    arena: AddArena,
+    history: History,
+    current: Current,
 }
 
 impl Buffer {
@@ -41,7 +42,7 @@ impl Buffer {
         self.arena.get(add)
     }
 
-    pub fn add_count(&self) -> usize {
+    pub fn add_count(&self) -> u32 {
         self.arena.len()
     }
 
@@ -49,7 +50,7 @@ impl Buffer {
         self.current.segments(&self.arena)
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> u32 {
         self.current.len()
     }
 
@@ -65,21 +66,17 @@ impl Buffer {
         self.history.redo_stack()
     }
 
-    pub fn insert(&mut self, pos: usize, data: &[u8]) -> Result<(), Error> {
+    pub fn insert(&mut self, pos: u32, data: &[u8]) -> Result<(), Error> {
         self.check(pos, 0)?;
         if data.is_empty() {
             return Ok(());
         }
-        let add = match self.arena.push(data) {
-            Some(add) => add,
-            None => return Err(Error::ArenaFull),
-        };
+        let add = self.store(data)?;
         let off = self
             .arena
             .start(add)
             .expect("add только что записан в арену");
-        let cursor = self.current.cursor_at(pos);
-        let surgery = self.current.apply_insert(cursor, add, off, data.len());
+        let surgery = self.current.apply_insert(pos, add, off, data.len() as u32);
         self.history.record(Record {
             edit: Edit::Insert { pos, add },
             surgery,
@@ -87,14 +84,12 @@ impl Buffer {
         Ok(())
     }
 
-    pub fn delete(&mut self, pos: usize, len: usize) -> Result<(), Error> {
+    pub fn delete(&mut self, pos: u32, len: u32) -> Result<(), Error> {
         self.check(pos, len)?;
         if len == 0 {
             return Ok(());
         }
-        let start = self.current.cursor_at(pos);
-        let end = self.current.cursor_at(pos + len);
-        let surgery = self.current.apply_delete(start, end);
+        let surgery = self.current.apply_delete(pos, len);
         self.history.record(Record {
             edit: Edit::Delete { pos, len },
             surgery,
@@ -102,23 +97,21 @@ impl Buffer {
         Ok(())
     }
 
-    pub fn replace(&mut self, pos: usize, len: usize, data: &[u8]) -> Result<(), Error> {
+    pub fn replace(&mut self, pos: u32, len: u32, data: &[u8]) -> Result<(), Error> {
         self.check(pos, len)?;
-        if !data.is_empty() && data.len() > self.arena.remaining() {
-            return Err(Error::ArenaFull);
+        if !data.is_empty() && data.len() as u32 > self.arena.remaining() {
+            self.snapshot_cycle();
         }
         self.delete(pos, len)?;
         self.insert(pos, data)
     }
 
+    /// Снапшот: `Current` собирается в текст, текст становится `Original` #2,
+    /// арена переиспользуется.
     pub fn snapshot(&mut self) -> Snapshot {
-        let materialized = self.read();
-        let original = std::mem::replace(&mut self.original, materialized);
-        self.arena.reset();
-        self.history = History::default();
-        let current = Current::from_original(&self.original);
-        self.current = current;
-        Snapshot { original }
+        let old = self.original.clone();
+        self.snapshot_cycle();
+        Snapshot { original: old }
     }
 
     pub fn undo(&mut self) -> Option<Edit> {
@@ -155,11 +148,33 @@ impl Buffer {
     }
 
     #[cfg(test)]
-    pub(crate) fn node_count(&self) -> usize {
+    pub(crate) fn node_count(&self) -> u32 {
         self.current.node_count()
     }
 
-    fn check(&self, pos: usize, len: usize) -> Result<(), Error> {
+    /// Записать данные в арену. Если остатка не хватает — цикл арены: снапшот
+    /// переносит текущий текст в новый `Original`, арена освобождается.
+    fn store(&mut self, data: &[u8]) -> Result<AddId, Error> {
+        if data.len() > ARENA_CAPACITY_LIMIT {
+            return Err(Error::ArenaFull);
+        }
+        if let Some(add) = self.arena.push(data) {
+            return Ok(add);
+        }
+        self.snapshot_cycle();
+        self.arena.push(data).ok_or(Error::ArenaFull)
+    }
+
+    fn snapshot_cycle(&mut self) {
+        let text = self.read();
+        self.original = text;
+        self.arena.reset();
+        self.current = Current::from_original(&self.original);
+        // TODO: переезд истории на новый `Original` — см. отчёт.
+        self.history = History::default();
+    }
+
+    fn check(&self, pos: u32, len: u32) -> Result<(), Error> {
         match pos.checked_add(len) {
             Some(end) if end <= self.len() => Ok(()),
             _ => Err(Error::OutOfBounds {
@@ -170,3 +185,6 @@ impl Buffer {
         }
     }
 }
+
+/// Данные крупнее арены не помещаются ни в каком случае.
+const ARENA_CAPACITY_LIMIT: usize = crate::arena::ARENA_CAPACITY;

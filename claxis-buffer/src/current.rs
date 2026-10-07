@@ -3,20 +3,24 @@ use crate::segment::{Segment, Source};
 
 pub(crate) type NodeId = u32;
 
+/// Узел — только ссылки: источник, смещение, длина, следующий узел.
+/// Записей истории здесь нет, `Current` их не держит.
 #[derive(Clone, Copy, Debug)]
 struct Node {
     src: u32,
-    off: usize,
-    len: usize,
+    off: u32,
+    len: u32,
     next: Option<NodeId>,
 }
 
+/// Перестановка одной ссылки цепочки.
 #[derive(Clone, Copy, Debug)]
 struct Write {
     link: NodeId,
     to: Option<NodeId>,
 }
 
+/// Характеристика операции: как применить, как отменить, на сколько меняется длина.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Surgery {
     apply: Write,
@@ -24,19 +28,11 @@ pub(crate) struct Surgery {
     delta: i64,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Cursor {
-    pub(crate) pre: NodeId,
-    pub(crate) node: Option<NodeId>,
-    pub(crate) rel: usize,
-    pub(crate) pos: usize,
-}
-
 #[derive(Debug)]
 pub struct Current {
     nodes: Vec<Node>,
-    len: usize,
-    original_len: usize,
+    len: u32,
+    original_len: u32,
     base: Option<NodeId>,
 }
 
@@ -58,7 +54,8 @@ impl Default for Current {
 
 impl Current {
     pub fn from_original(original: &[u8]) -> Self {
-        if original.is_empty() {
+        let len = original.len() as u32;
+        if len == 0 {
             Self::default()
         } else {
             let nodes = vec![
@@ -71,25 +68,45 @@ impl Current {
                 Node {
                     src: 0,
                     off: 0,
-                    len: original.len(),
+                    len,
                     next: None,
                 },
             ];
             Self {
                 nodes,
-                len: original.len(),
-                original_len: original.len(),
+                len,
+                original_len: len,
                 base: Some(1),
             }
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn len(&self) -> u32 {
         self.len
     }
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Нода, которой принадлежит байт `pos`: предыдущая, сама и смещение внутри неё.
+    /// `pos` известен заранее в байтах, искать нечего — проход по дескрипторам.
+    fn locate(&self, pos: u32) -> (NodeId, Option<NodeId>, u32) {
+        debug_assert!(pos <= self.len);
+        let mut pre: NodeId = 0;
+        let mut cur = self.nodes[0].next;
+        let mut offset: u32 = 0;
+        while let Some(id) = cur {
+            let node = unsafe { self.nodes.get_unchecked(id as usize) };
+            if pos.wrapping_sub(offset) < node.len {
+                return (pre, Some(id), pos - offset);
+            }
+            offset += node.len;
+            pre = id;
+            cur = node.next;
+        }
+        debug_assert_eq!(pos, self.len, "locate: позиция за концом документа");
+        (pre, None, 0)
     }
 
     pub fn segments<'a>(&'a self, arena: &'a AddArena) -> impl Iterator<Item = Segment> + 'a {
@@ -101,7 +118,7 @@ impl Current {
             if node.src == 0 {
                 Some(Segment::new(Source::Original, node.off, node.len))
             } else {
-                let add = node.src as usize - 1;
+                let add = node.src - 1;
                 let start = arena
                     .start(add)
                     .expect("сегмент ссылается на несуществующую запись arena");
@@ -111,7 +128,7 @@ impl Current {
     }
 
     pub fn read(&self, original: &[u8], arena: &AddArena) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.len);
+        let mut out = Vec::with_capacity(self.len as usize);
         self.read_into(&mut out, original, arena);
         out
     }
@@ -125,56 +142,49 @@ impl Current {
                 prefetch(self.nodes.as_ptr().wrapping_add(nid as usize).cast());
             }
             let base = unsafe { *bases.get_unchecked((node.src != 0) as usize) };
-            let bytes = unsafe { std::slice::from_raw_parts(base.add(node.off), node.len) };
+            let bytes = unsafe { std::slice::from_raw_parts(base.add(node.off as usize), node.len as usize) };
             out.extend_from_slice(bytes);
             cur = node.next;
         }
     }
 
-    pub(crate) fn cursor_at(&self, pos: usize) -> Cursor {
-        debug_assert!(pos <= self.len);
-        let mut pre: NodeId = 0;
-        let mut cur = self.nodes[0].next;
-        let mut offset = 0usize;
-        while let Some(id) = cur {
-            let node = &self.nodes[id as usize];
-            if offset + node.len > pos {
-                return Cursor {
-                    pre,
-                    node: Some(id),
-                    rel: pos - offset,
-                    pos,
-                };
-            }
-            offset += node.len;
-            pre = id;
-            cur = node.next;
-        }
-        debug_assert_eq!(pos, self.len, "cursor_at вышел за конец документа");
-        Cursor {
-            pre,
-            node: None,
-            rel: 0,
-            pos,
-        }
+    /// Инвариант для чтения через сырые указатели: диапазон ноды внутри источника.
+    /// В release не вызывается — в горячем цикле чтения проверки быть не должно.
+    #[cfg(debug_assertions)]
+    fn debug_check_node(&self, node: &Node, original: &[u8], arena: &AddArena) {
+        debug_assert!(node.len > 0, "нулевая нода: {:?}", node);
+        let (lo, hi) = if node.src == 0 {
+            (0u32, original.len() as u32)
+        } else {
+            let add = node.src - 1;
+            let (start, len) = arena
+                .range(add)
+                .expect("сегмент ссылается на несуществующую запись arena");
+            (start, start + len)
+        };
+        debug_assert!(
+            node.off >= lo && node.off + node.len <= hi,
+            "нода выходит за границы источника: {:?} при {}", node, hi
+        );
     }
 
+    /// Вставка в позицию `pos`. Позиция и длина известны, узел делится на месте курсора.
     pub(crate) fn apply_insert(
         &mut self,
-        cursor: Cursor,
+        pos: u32,
         add: AddId,
-        off: usize,
-        data_len: usize,
+        off: u32,
+        len: u32,
     ) -> Surgery {
-        debug_assert!(data_len > 0);
-        debug_assert!(add < u32::MAX as usize);
-        let src = add as u32 + 1;
-        let (apply_to, undo_to) = match cursor.node {
-            Some(n) if cursor.rel == 0 => {
+        debug_assert!(len > 0);
+        let (pre, node, rel) = self.locate(pos);
+        let src = add + 1;
+        let (apply_to, undo_to) = match node {
+            Some(n) if rel == 0 => {
                 let i = self.push(Node {
                     src,
                     off,
-                    len: data_len,
+                    len,
                     next: Some(n),
                 });
                 (Some(i), Some(n))
@@ -183,20 +193,20 @@ impl Current {
                 let old = self.nodes[n as usize];
                 let s = self.push(Node {
                     src: old.src,
-                    off: old.off + cursor.rel,
-                    len: old.len - cursor.rel,
+                    off: old.off + rel,
+                    len: old.len - rel,
                     next: old.next,
                 });
                 let i = self.push(Node {
                     src,
                     off,
-                    len: data_len,
+                    len,
                     next: Some(s),
                 });
                 let p = self.push(Node {
                     src: old.src,
                     off: old.off,
-                    len: cursor.rel,
+                    len: rel,
                     next: Some(i),
                 });
                 (Some(p), Some(n))
@@ -205,52 +215,58 @@ impl Current {
                 let i = self.push(Node {
                     src,
                     off,
-                    len: data_len,
+                    len,
                     next: None,
                 });
                 (Some(i), None)
             }
         };
         let apply = Write {
-            link: cursor.pre,
+            link: pre,
             to: apply_to,
         };
         self.write(apply);
-        self.len += data_len;
+        self.shift_len(len as i64);
         Surgery {
             apply,
             undo: Write {
-                link: cursor.pre,
+                link: pre,
                 to: undo_to,
             },
-            delta: data_len as i64,
+            delta: len as i64,
         }
     }
 
-    pub(crate) fn apply_delete(&mut self, start: Cursor, end: Cursor) -> Surgery {
-        debug_assert!(start.pos < end.pos);
-        debug_assert!(end.pos <= self.len);
-        let after = match end.node {
-            Some(n) if end.rel == 0 => Some(n),
+    /// Удаление диапазона `[pos, pos + len)`.
+    pub(crate) fn apply_delete(&mut self, pos: u32, len: u32) -> Surgery {
+        debug_assert!(len > 0);
+        let end = pos
+            .checked_add(len)
+            .expect("переполнение pos + len");
+        debug_assert!(end <= self.len);
+        let (start_pre, start_node, start_rel) = self.locate(pos);
+        let (_, end_node, end_rel) = self.locate(end);
+
+        let after = match end_node {
+            Some(n) if end_rel == 0 => Some(n),
             Some(n) => {
                 let old = self.nodes[n as usize];
-                let t = self.push(Node {
+                Some(self.push(Node {
                     src: old.src,
-                    off: old.off + end.rel,
-                    len: old.len - end.rel,
+                    off: old.off + end_rel,
+                    len: old.len - end_rel,
                     next: old.next,
-                });
-                Some(t)
+                }))
             }
             None => None,
         };
-        let (apply_to, undo_to) = match start.node {
-            Some(n) if start.rel > 0 => {
+        let (apply_to, undo_to) = match start_node {
+            Some(n) if start_rel > 0 => {
                 let old = self.nodes[n as usize];
                 let k = self.push(Node {
                     src: old.src,
                     off: old.off,
-                    len: start.rel,
+                    len: start_rel,
                     next: after,
                 });
                 (Some(k), Some(n))
@@ -259,19 +275,18 @@ impl Current {
             None => (after, None),
         };
         let apply = Write {
-            link: start.pre,
+            link: start_pre,
             to: apply_to,
         };
         self.write(apply);
-        let delta = end.pos - start.pos;
-        self.len -= delta;
+        self.shift_len(-(len as i64));
         Surgery {
             apply,
             undo: Write {
-                link: start.pre,
+                link: start_pre,
                 to: undo_to,
             },
-            delta: -(delta as i64),
+            delta: -(len as i64),
         }
     }
 
@@ -294,12 +309,13 @@ impl Current {
     }
 
     #[cfg(test)]
-    pub(crate) fn node_count(&self) -> usize {
-        self.nodes.len()
+    pub(crate) fn node_count(&self) -> u32 {
+        self.nodes.len() as u32
     }
 
     fn push(&mut self, node: Node) -> NodeId {
         let id = self.nodes.len() as NodeId;
+        debug_assert!(id < u32::MAX, "переполнение NodeId");
         self.nodes.push(node);
         id
     }
@@ -307,7 +323,8 @@ impl Current {
     fn shift_len(&mut self, delta: i64) {
         let next = self.len as i64 + delta;
         debug_assert!(next >= 0, "длина документа стала отрицательной");
-        self.len = next as usize;
+        debug_assert!(next <= u32::MAX as i64, "документ длиннее 4 ГиБ");
+        self.len = next as u32;
     }
 
     fn write(&mut self, write: Write) {

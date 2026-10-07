@@ -9,12 +9,12 @@ pub enum Source {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Segment {
     pub source: Source,
-    pub offset: usize,
-    pub len: usize,
+    pub offset: u32,
+    pub len: u32,
 }
 
 impl Segment {
-    pub fn new(source: Source, offset: usize, len: usize) -> Self {
+    pub fn new(source: Source, offset: u32, len: u32) -> Self {
         Self {
             source,
             offset,
@@ -22,7 +22,7 @@ impl Segment {
         }
     }
 
-    pub fn end(&self) -> usize {
+    pub fn end(&self) -> u32 {
         self.offset + self.len
     }
 }

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use claxis_buffer::Buffer;
 
-const HISTORY: usize = 40_000;
+const HISTORY: u32 = 40_000;
 const SEGMENTS: usize = 28_000;
 const ITERS: usize = 20;
 
@@ -23,7 +23,7 @@ fn rebuild_bench() {
 fn read_bench() {
     let original = vec![b'a'; 1_000_000];
     let mut b = Buffer::new(&original);
-    for i in 0..SEGMENTS {
+    for i in 0..SEGMENTS as u32 {
         let pos = (i * 37) % (b.len() + 1);
         b.insert(pos, b"[]").unwrap();
     }

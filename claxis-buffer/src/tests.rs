@@ -1,6 +1,6 @@
 use crate::*;
 
-fn seg(source: Source, offset: usize, len: usize) -> Segment {
+fn seg(source: Source, offset: u32, len: u32) -> Segment {
     Segment::new(source, offset, len)
 }
 
@@ -9,13 +9,13 @@ fn segments(buffer: &Buffer) -> Vec<Segment> {
 }
 
 fn check_invariants(buffer: &Buffer) {
-    let mut total = 0;
+    let mut total: u32 = 0;
     for segment in buffer.segments() {
         assert!(segment.len > 0, "пустой сегмент: {segment:?}");
         match segment.source {
             Source::Original => {
                 assert!(
-                    segment.end() <= buffer.original().len(),
+                    segment.end() <= buffer.original().len() as u32,
                     "сегмент выходит за границы Original: {segment:?}"
                 );
             }
@@ -24,7 +24,7 @@ fn check_invariants(buffer: &Buffer) {
                     .arena_entry(add)
                     .expect("сегмент ссылается на несуществующую запись arena");
                 assert!(
-                    segment.end() <= entry.len(),
+                    segment.end() <= entry.len() as u32,
                     "сегмент выходит за границы записи arena: {segment:?}"
                 );
             }
@@ -52,6 +52,10 @@ impl Rng {
 
     fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
+    }
+
+    fn below_u32(&mut self, n: u32) -> u32 {
+        (self.next() % n as u64) as u32
     }
 }
 
@@ -165,22 +169,10 @@ fn undo_and_redo_walk_history_linearly() {
     b.delete(0, 5).unwrap();
     assert_eq!(b.read(), b" world");
 
-    assert_eq!(
-        b.undo(),
-        Some(Edit::Delete {
-            pos: 0,
-            len: 5
-        })
-    );
+    assert_eq!(b.undo(), Some(Edit::Delete { pos: 0, len: 5 }));
     assert_eq!(b.read(), b"hello world");
 
-    assert_eq!(
-        b.undo(),
-        Some(Edit::Insert {
-            pos: 5,
-            add: 0
-        })
-    );
+    assert_eq!(b.undo(), Some(Edit::Insert { pos: 5, add: 0 }));
     assert_eq!(b.read(), b"hello");
     assert!(b.undo().is_none());
 
@@ -357,7 +349,7 @@ fn rebuild_after_every_edit_matches_incremental_state() {
     let text = b.read();
     b.rebuild();
     assert_eq!(b.read(), text);
-    assert_eq!(b.len(), text.len());
+    assert_eq!(b.len(), text.len() as u32);
 }
 
 #[test]
@@ -388,7 +380,7 @@ fn rebuild_after_full_undo_restores_original() {
 
     assert_eq!(text_before, original);
     assert_eq!(b.read(), original);
-    assert_eq!(b.len(), original.len());
+    assert_eq!(b.len(), original.len() as u32);
     check_invariants(&b);
 }
 
@@ -541,7 +533,7 @@ fn undo_redo_are_lifo_stacks() {
 fn node_arena_is_write_once() {
     let mut b = Buffer::new("0123456789abcdef");
     for i in 0..20u32 {
-        let pos = i as usize * 3 % (b.len() + 1);
+        let pos = i * 3 % (b.len() + 1);
         b.insert(pos, b"inserted").unwrap();
         let len = b.len();
         if len > 4 {
@@ -586,20 +578,92 @@ fn discarding_redo_keeps_data_and_correct_state() {
     assert_eq!(b.arena_entry(1), Some(b"xy".as_ref()));
 }
 
-#[test]
-fn arena_full_returns_error_and_snapshot_resets_generation() {
+/// Заполняет арену целиком, перенося её через границу, и возвращает текст до переноса.
+fn fill_arena() -> (Buffer, Vec<u8>) {
     let mut b = Buffer::new("base");
     let chunk = vec![b'x'; 16 * 1024];
-    for _ in 0..8 {
+    // 65 × 16 КиБ > 1 МиБ: цикл арены обязан сработать.
+    for _ in 0..65 {
         b.insert(b.len(), &chunk).unwrap();
     }
-    assert_eq!(b.add_count(), 8);
-
     let text = b.read();
-    assert_eq!(b.insert(b.len(), &chunk), Err(Error::ArenaFull));
+    (b, text)
+}
+
+#[test]
+fn arena_cycle_moves_current_into_new_original() {
+    let (b, text) = fill_arena();
+
     assert_eq!(b.read(), text);
+    assert!(b.add_count() < 65, "арена не была переиспользована");
+    assert_ne!(b.original(), b"base", "Original не сменился на новый");
+    // Перенос происходит до вставки, последний чанк ложится уже в чистую арену.
+    assert_eq!(
+        b.original(),
+        &text[..text.len() - 16 * 1024],
+        "Original не равен тексту на момент переноса"
+    );
+    check_invariants(&b);
+}
+
+#[test]
+fn arena_cycle_keeps_text_across_boundary() {
+    let (mut b, _) = fill_arena();
+    let text = b.read();
+
+    // Вставка после переноса идёт в чистую арену и не теряется.
+    b.insert(b.len(), b"tail").unwrap();
+    let mut expected = text.clone();
+    expected.extend_from_slice(b"tail");
+    assert_eq!(b.read(), expected);
+
+    b.undo().unwrap();
+    assert_eq!(b.read(), text);
+    b.redo().unwrap();
+    assert_eq!(b.read(), expected);
+    check_invariants(&b);
+}
+
+#[test]
+fn arena_cycle_survives_rebuild() {
+    let (mut b, _) = fill_arena();
+    let before = segments(&b);
+
+    b.rebuild();
+
+    assert_eq!(segments(&b), before, "rebuild разошёлся после границы арены");
+    check_invariants(&b);
+}
+
+#[test]
+fn delete_across_arena_boundary() {
+    let mut b = Buffer::new("abcdefghij");
+    let chunk = vec![b'X'; 64 * 1024];
+    for _ in 0..20 {
+        b.insert(b.len(), &chunk).unwrap();
+    }
+    let text = b.read();
+
+    // Удаление через границу арены: затрагивает и Original, и новую арену.
+    b.delete(5, text.len() as u32 - 15).unwrap();
+
+    let mut expected = text[..5].to_vec();
+    expected.extend_from_slice(&text[text.len() - 10..]);
+    assert_eq!(b.read(), expected);
+    check_invariants(&b);
+
+    b.undo().unwrap();
+    assert_eq!(b.read(), text);
+}
+
+#[test]
+fn snapshot_moves_current_into_new_original() {
+    let mut b = Buffer::new("base");
+    b.insert(4, b"ZZ").unwrap();
+    let text = b.read();
 
     let snapshot = b.snapshot();
+
     assert_eq!(snapshot.original(), b"base");
     assert_eq!(b.original(), text);
     assert_eq!(b.read(), text);
@@ -607,34 +671,46 @@ fn arena_full_returns_error_and_snapshot_resets_generation() {
     assert!(b.undo_stack().is_empty());
     assert!(b.redo_stack().is_empty());
 
-    b.insert(b.len(), &chunk).unwrap();
+    b.insert(b.len(), b"-end").unwrap();
     let mut expected = text;
-    expected.extend_from_slice(&chunk);
+    expected.extend_from_slice(b"-end");
     assert_eq!(b.read(), expected);
     assert_eq!(b.add_count(), 1);
-    assert!(b.undo().is_some());
-    assert_eq!(b.read(), expected[..expected.len() - chunk.len()].to_vec());
+    b.undo().unwrap();
+    assert_eq!(b.read(), expected[..expected.len() - 4].to_vec());
     b.redo().unwrap();
     assert_eq!(b.read(), expected);
     check_invariants(&b);
 }
 
 #[test]
-fn replace_fails_cleanly_when_arena_full() {
-    let mut b = Buffer::new("");
-    let chunk = vec![b'x'; 16 * 1024];
-    for _ in 0..8 {
+fn insert_larger_than_arena_is_an_error() {
+    let mut b = Buffer::new("base");
+    // Крупнее арены не помещается ни в каком случае, даже в пустую.
+    assert!(ARENA_CAPACITY + 1 > ARENA_CAPACITY);
+    let huge = vec![b'y'; ARENA_CAPACITY + 1];
+    let before = b.read();
+    assert_eq!(b.insert(4, &huge), Err(Error::ArenaFull));
+    assert_eq!(b.read(), before);
+    check_invariants(&b);
+}
+
+#[test]
+fn replace_across_arena_boundary() {
+    let mut b = Buffer::new("head");
+    let chunk = vec![b'Z'; 64 * 1024];
+    for _ in 0..20 {
         b.insert(b.len(), &chunk).unwrap();
     }
+    b.insert(0, b"TAIL").unwrap();
     let text = b.read();
-    let history_len = b.undo_stack().len();
 
-    assert_eq!(b.replace(0, 1, b"y"), Err(Error::ArenaFull));
-    assert_eq!(b.read(), text);
-    assert_eq!(b.undo_stack().len(), history_len);
+    b.replace(0, 4, b"HEAD").unwrap();
 
-    assert_eq!(b.replace(0, 1, b""), Ok(()));
-    assert_eq!(b.read(), text[1..].to_vec());
+    let mut expected = b"HEAD".to_vec();
+    expected.extend_from_slice(&text[4..]);
+    assert_eq!(b.read(), expected);
+    check_invariants(&b);
 }
 
 #[test]
@@ -652,7 +728,7 @@ fn differential_against_reference_string() {
             for step in 0..300 {
                 match rng.below(100) {
                     0..=34 => {
-                        let pos = rng.below(buffer.len() + 1);
+                        let pos = rng.below_u32(buffer.len() + 1);
                         let data = if rng.below(8) == 0 {
                             Vec::new()
                         } else {
@@ -661,24 +737,26 @@ fn differential_against_reference_string() {
                         buffer.insert(pos, &data).unwrap();
                         if !data.is_empty() {
                             let text = String::from_utf8(data).unwrap();
-                            reference.edit(|s| s.insert_str(pos, &text));
+                            let at = pos as usize;
+                            reference.edit(|s| s.insert_str(at, &text));
                         }
                     }
                     35..=59 => {
                         let len = buffer.len();
                         if len > 0 {
-                            let pos = rng.below(len);
-                            let del = 1 + rng.below(len - pos);
+                            let pos = rng.below_u32(len);
+                            let del = 1 + rng.below_u32(len - pos);
                             buffer.delete(pos, del).unwrap();
+                            let (at, upto) = (pos as usize, (pos + del) as usize);
                             reference.edit(|s| {
-                                s.replace_range(pos..pos + del, "");
+                                s.replace_range(at..upto, "");
                             });
                         }
                     }
                     60..=69 => {
                         let len = buffer.len();
-                        let pos = rng.below(len + 1);
-                        let del = rng.below(len - pos + 1);
+                        let pos = rng.below_u32(len + 1);
+                        let del = rng.below_u32(len - pos + 1);
                         let data = if rng.below(5) == 0 {
                             Vec::new()
                         } else {
@@ -686,13 +764,15 @@ fn differential_against_reference_string() {
                         };
                         buffer.replace(pos, del, &data).unwrap();
                         if del > 0 {
+                            let (at, upto) = (pos as usize, (pos + del) as usize);
                             reference.edit(|s| {
-                                s.replace_range(pos..pos + del, "");
+                                s.replace_range(at..upto, "");
                             });
                         }
                         if !data.is_empty() {
                             let text = String::from_utf8(data).unwrap();
-                            reference.edit(|s| s.insert_str(pos, &text));
+                            let at = pos as usize;
+                            reference.edit(|s| s.insert_str(at, &text));
                         }
                     }
                     70..=84 => {
@@ -711,7 +791,11 @@ fn differential_against_reference_string() {
                     reference.current.as_bytes(),
                     "текст разошёлся: {context}"
                 );
-                assert_eq!(buffer.len(), reference.current.len(), "длина: {context}");
+                assert_eq!(
+                    buffer.len(),
+                    reference.current.len() as u32,
+                    "длина: {context}"
+                );
                 assert_eq!(buffer.original(), initial.as_bytes(), "original: {context}");
                 assert!(buffer.add_count() >= adds, "arena уменьшилась: {context}");
                 adds = buffer.add_count();
