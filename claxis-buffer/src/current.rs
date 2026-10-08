@@ -157,6 +157,11 @@ impl Current {
         &self.segs[..self.count]
     }
 
+    #[cfg(test)]
+    pub(crate) fn parked_count(&self) -> usize {
+        self.parked
+    }
+
     pub fn read(&self, original: &[u8], added: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len as usize);
         self.read_into(&mut out, original, added);
@@ -196,6 +201,22 @@ impl Current {
     /// сегменты описывают ровно удалённый диапазон и ни байтом больше.
     /// Возвращает их относительное смещение в отложенной области.
     pub(crate) fn apply_delete(&mut self, pos: u32, len: u32) -> u32 {
+        self.cut(pos, len, true)
+    }
+
+    /// Повторное исключение диапазона из чтения: повтор удаления.
+    ///
+    /// Откладывать нечего: копия от исходного удаления уже лежит в
+    /// отложенной области, и её относительное смещение в записи осталось
+    /// тем же. Повторное откладывание только раздувало бы буфер.
+    pub(crate) fn redo_delete(&mut self, pos: u32, len: u32) {
+        self.cut(pos, len, false);
+    }
+
+    /// Убирает диапазон из чтения. При `park_removed` удалённые сегменты
+    /// кладутся в отложенную область и возвращается их относительное
+    /// смещение, иначе считается, что они там уже лежат.
+    fn cut(&mut self, pos: u32, len: u32, park_removed: bool) -> u32 {
         debug_assert!(len > 0, "нулевое удаление");
         debug_assert!(pos + len <= self.len, "удаление за концом документа");
         let (first, start_off) = self.locate(pos);
@@ -240,12 +261,16 @@ impl Current {
                 self.removed.push(Segment::new(tail.src, tail.off, end_off));
             }
         }
-        let parked = park(
-            &mut self.segs,
-            &mut self.parked,
-            &mut self.parked_from,
-            &self.removed,
-        );
+        let parked = if park_removed {
+            park(
+                &mut self.segs,
+                &mut self.parked,
+                &mut self.parked_from,
+                &self.removed,
+            )
+        } else {
+            0
+        };
 
         let taken = last - first + 1;
         splice(

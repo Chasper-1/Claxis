@@ -841,3 +841,28 @@ fn segment_buffer_is_allocated_once() {
     assert_eq!(b.read(), b"0123456789abcdef");
     check_invariants(&b);
 }
+
+/// Повтор удаления не откладывает сегменты заново: копия от исходного
+/// удаления уже лежит в отложенной области. Без этого отложенная область
+/// росла бы на сегмент за цикл и переполняла буфер за ~16 000 циклов.
+#[test]
+fn redo_of_delete_does_not_grow_parked_area() {
+    let mut b = Buffer::new("0123456789abcdef");
+    b.delete(4, 6).unwrap();
+    let deleted = b.parked_count();
+    assert!(deleted > 0, "удаление ничего не отложило");
+
+    for _ in 0..20_000 {
+        b.undo().unwrap();
+        assert_eq!(b.read(), b"0123456789abcdef", "откат вернул не тот текст");
+        b.redo().unwrap();
+        assert_eq!(b.read(), b"0123abcdef", "повтор удаления испортил текст");
+    }
+
+    assert_eq!(
+        b.parked_count(),
+        deleted,
+        "отложенная область выросла при повторе удаления"
+    );
+    check_invariants(&b);
+}

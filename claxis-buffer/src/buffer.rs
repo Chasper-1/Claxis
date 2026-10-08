@@ -48,6 +48,11 @@ impl Buffer {
         self.arena.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn parked_count(&self) -> usize {
+        self.current.parked_count()
+    }
+
     pub fn segments(&self) -> &[Segment] {
         self.current.segments()
     }
@@ -181,7 +186,7 @@ impl Buffer {
                 .current
                 .apply_insert(record.pos(), record.data(), record.len()),
             Kind::Delete => {
-                self.current.apply_delete(record.pos(), record.len());
+                self.current.redo_delete(record.pos(), record.len());
             }
         }
         Some(edit)
