@@ -1,4 +1,4 @@
-use crate::arena::{Kind, ARENA_CAPACITY};
+use crate::arena::{ARENA_CAPACITY, Kind};
 use crate::segment::{ADDED, Segment};
 
 /// Сколько сегментов помещается в арену записей.
@@ -206,8 +206,7 @@ impl Current {
         // Что остаётся в чтении: неразрезанные края диапазона.
         self.kept.clear();
         if start_off > 0 {
-            self.kept
-                .push(Segment::new(head.src, head.off, start_off));
+            self.kept.push(Segment::new(head.src, head.off, start_off));
         }
         if end_off < tail.len() {
             self.kept.push(Segment::new(
@@ -436,11 +435,7 @@ fn park(
     );
     segs.resize(dest + n, Segment::original(0, 0));
     segs[dest..dest + n].copy_from_slice(items);
-    let rel = if *parked == 0 {
-        0
-    } else {
-        dest - *parked_from
-    };
+    let rel = if *parked == 0 { 0 } else { dest - *parked_from };
     if *parked == 0 {
         *parked_from = dest;
     }

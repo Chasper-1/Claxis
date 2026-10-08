@@ -2,95 +2,107 @@ use std::time::Instant;
 
 use claxis_buffer::Buffer;
 
-const HISTORY: u32 = 40_000;
-const SEGMENTS: usize = 28_000;
-const ITERS: usize = 20;
+/// Меряем то, что редактор делает каждый день: вставка, удаление, чтение и
+/// движение курсора. Пересборка — восстановление потерянного кеша, вызовов в
+/// редакторе нет, поэтому в горячие замеры не входит.
+const SEGMENTS: [u32; 3] = [1_000, 8_000, 16_000];
+const ROUNDS: u32 = 20_000;
 
-/// Документ с `n` сегментами, полученный рассеянными вставками в начало.
-/// Каждая операция меряется сама по себе, на своём размере.
-fn scattered(n: u32) -> Buffer {
-    let mut b = Buffer::new(&vec![b'a'; 200_000]);
+/// Документ из `n` сегментов: рассеянные вставки, каждая разрезает исходник.
+fn document(n: u32) -> Buffer {
+    let mut b = Buffer::new(&vec![b'a'; 500_000]);
     for i in 0..n {
-        let pos = (i * 37) % (b.len() + 1);
-        b.insert(pos, b"xx").unwrap();
+        b.insert((i * 37) % (b.len() + 1), b"xx").unwrap();
     }
     b
 }
 
-fn bench_insert_at_end() {
-    let mut b = Buffer::new("");
-    for _ in 0..HISTORY {
-        b.insert(b.len(), b"z").unwrap();
-    }
-    let segs = b.segments().len();
-    let start = Instant::now();
-    for _ in 0..ITERS {
-        b.insert(b.len(), b"z").unwrap();
-        b.delete(b.len() - 1, 1).unwrap();
-    }
-    println!(
-        "insert_at_end: {:?}  ({segs} сегментов)",
-        start.elapsed() / (ITERS * 2) as u32
-    );
-}
-
-fn bench_insert_middle() {
-    for n in [1_000u32, 10_000, 20_000] {
-        let mut b = scattered(n);
+fn bench_insert() {
+    for target in SEGMENTS {
+        let mut b = document(target);
         let segs = b.segments().len();
+        let mid = b.len() / 2;
         let start = Instant::now();
-        let rounds = 1_000;
-        for _ in 0..rounds {
-            b.insert(b.len() / 2, b"y").unwrap();
-            b.delete(b.len() / 2, 1).unwrap();
+        for _ in 0..ROUNDS {
+            b.insert(mid, b"y").unwrap();
+            b.delete(mid, 1).unwrap();
         }
-        println!(
-            "insert_middle: {:?}  ({segs} сегментов)",
-            start.elapsed() / (rounds * 2) as u32
-        );
+        let each = start.elapsed() / (ROUNDS * 2) as u32;
+        // Вставка в конец ничего не двигает — отдельная точка.
+        let start = Instant::now();
+        for _ in 0..ROUNDS {
+            b.insert(b.len(), b"y").unwrap();
+            b.delete(b.len() - 1, 1).unwrap();
+        }
+        let end = start.elapsed() / (ROUNDS * 2) as u32;
+        println!("insert: середина {each:?}, конец {end:?}  ({segs} сегментов)");
     }
 }
 
 fn bench_read() {
-    let original = vec![b'a'; 1_000_000];
-    let mut b = Buffer::new(&original);
-    for i in 0..SEGMENTS as u32 {
-        let pos = (i * 37) % (b.len() + 1);
-        b.insert(pos, b"[]").unwrap();
+    for target in SEGMENTS {
+        let b = document(target);
+        let segs = b.segments().len();
+        let bytes = b.len();
+        let start = Instant::now();
+        for _ in 0..50 {
+            let text = b.read();
+            std::hint::black_box(&text);
+        }
+        println!(
+            "read: {:?}  ({segs} сегментов, {bytes} байт)",
+            start.elapsed() / 50
+        );
     }
-    let segments = b.segments().len();
-    let start = Instant::now();
-    for _ in 0..ITERS {
-        let data = b.read();
-        std::hint::black_box(&data);
-    }
-    println!(
-        "read: {:?}  ({segments} сегментов, {} байт)",
-        start.elapsed() / ITERS as u32,
-        b.len()
-    );
 }
 
-fn bench_rebuild() {
-    let mut b = Buffer::new("");
-    for i in 0..HISTORY {
-        b.insert(i % (b.len() + 1), b"x").unwrap();
+/// Курсор ходит по документу туда и обратно. Позиционирование вызывается самой
+/// правкой, поэтому движение проверяется вставкой и удалением по ходу.
+fn bench_cursor() {
+    for target in SEGMENTS {
+        let mut b = document(target);
+        let segs = b.segments().len();
+        let len = b.len();
+        let start = Instant::now();
+        let mut pos = len / 2;
+        for i in 0..ROUNDS {
+            // Вперёд и назад: разница между позициями определяет направление.
+            pos = if i % 2 == 0 {
+                (pos + 7) % len
+            } else {
+                (pos + len - 7) % len
+            };
+            b.insert(pos, b"y").unwrap();
+            b.delete(pos, 1).unwrap();
+        }
+        println!(
+            "cursor: {:?}  ({segs} сегментов, шаг 7 байт туда и обратно)",
+            start.elapsed() / (ROUNDS * 2) as u32
+        );
     }
-    let segs = b.segments().len();
-    let start = Instant::now();
-    for _ in 0..ITERS {
-        b.rebuild();
+}
+
+/// Удаление широкого диапазона: откладывает много сегментов сразу.
+fn bench_wide_delete() {
+    for target in SEGMENTS {
+        let mut b = document(target);
+        let segs = b.segments().len();
+        let len = b.len();
+        let start = Instant::now();
+        for _ in 0..2_000 {
+            b.delete(0, len / 2).unwrap();
+            b.undo().unwrap();
+        }
+        println!(
+            "wide_delete: {:?}  ({segs} сегментов, половина документа)",
+            start.elapsed() / 2_000 as u32
+        );
     }
-    println!(
-        "rebuild: {:?}  ({segs} сегментов, {HISTORY} правок)",
-        start.elapsed() / ITERS as u32
-    );
-    assert_eq!(b.len(), HISTORY);
 }
 
 fn main() {
-    bench_insert_at_end();
-    bench_insert_middle();
+    bench_insert();
     bench_read();
-    bench_rebuild();
+    bench_cursor();
+    bench_wide_delete();
 }
