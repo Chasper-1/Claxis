@@ -1,7 +1,8 @@
-use crate::arena::{AddArena, AddId};
+use crate::arena::{self, AddArena, RecordId};
 use crate::current::Current;
 use crate::edit::{Edit, Error};
-use crate::history::{History, Record};
+use crate::history::History;
+use crate::history::Record;
 use crate::segment::Segment;
 
 /// Байты снапшота: текущее состояние документа перед переездом `Original`.
@@ -17,6 +18,9 @@ impl Snapshot {
 
 pub struct Buffer {
     original: Vec<u8>,
+    /// Растущий буфер всего вставленного текста. Арена метаданных сюда не
+    /// пишет: текст масштабируется свободно, ограничены только записи.
+    added: Vec<u8>,
     arena: AddArena,
     history: History,
     current: Current,
@@ -28,6 +32,7 @@ impl Buffer {
         let current = Current::from_original(&original);
         Self {
             original,
+            added: Vec::new(),
             arena: AddArena::default(),
             history: History::default(),
             current,
@@ -38,8 +43,18 @@ impl Buffer {
         &self.original
     }
 
-    pub fn arena_entry(&self, add: AddId) -> Option<&[u8]> {
+    pub fn arena_record(&self, add: RecordId) -> Option<&arena::Record> {
         self.arena.get(add)
+    }
+
+    /// Участок растущего буфера вставленного текста: `off` — смещение,
+    /// `len` — сколько байт взять.
+    pub fn added(&self, off: u32, len: u32) -> Option<&[u8]> {
+        self.added.get(off as usize..(off + len) as usize)
+    }
+
+    pub fn added_len(&self) -> u32 {
+        self.added.len() as u32
     }
 
     pub fn add_count(&self) -> u32 {
@@ -47,7 +62,7 @@ impl Buffer {
     }
 
     pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
-        self.current.segments(&self.arena)
+        self.current.segments()
     }
 
     pub fn len(&self) -> u32 {
@@ -71,12 +86,15 @@ impl Buffer {
         if data.is_empty() {
             return Ok(());
         }
-        let add = self.store(data)?;
-        let off = self
+        if self.arena.remaining() == 0 {
+            self.snapshot_cycle();
+        }
+        let text_off = self.push_text(data);
+        let add = self
             .arena
-            .start(add)
-            .expect("add только что записан в арену");
-        let surgery = self.current.apply_insert(pos, add, off, data.len() as u32);
+            .push(arena::Record::insert(pos, data.len() as u32, text_off))
+            .ok_or(Error::ArenaFull)?;
+        let surgery = self.current.apply_insert(pos, text_off, data.len() as u32);
         self.history.record(Record {
             edit: Edit::Insert { pos, add },
             surgery,
@@ -89,6 +107,12 @@ impl Buffer {
         if len == 0 {
             return Ok(());
         }
+        if self.arena.remaining() == 0 {
+            self.snapshot_cycle();
+        }
+        self.arena
+            .push(arena::Record::delete(pos, len))
+            .ok_or(Error::ArenaFull)?;
         let surgery = self.current.apply_delete(pos, len);
         self.history.record(Record {
             edit: Edit::Delete { pos, len },
@@ -140,11 +164,11 @@ impl Buffer {
     }
 
     pub fn read(&self) -> Vec<u8> {
-        self.current.read(&self.original, &self.arena)
+        self.current.read(&self.original, &self.added)
     }
 
     pub fn read_into(&self, out: &mut Vec<u8>) {
-        self.current.read_into(out, &self.original, &self.arena);
+        self.current.read_into(out, &self.original, &self.added);
     }
 
     #[cfg(test)]
@@ -152,22 +176,17 @@ impl Buffer {
         self.current.node_count()
     }
 
-    /// Записать данные в арену. Если остатка не хватает — цикл арены: снапшот
-    /// переносит текущий текст в новый `Original`, арена освобождается.
-    fn store(&mut self, data: &[u8]) -> Result<AddId, Error> {
-        if data.len() > ARENA_CAPACITY_LIMIT {
-            return Err(Error::ArenaFull);
-        }
-        if let Some(add) = self.arena.push(data) {
-            return Ok(add);
-        }
-        self.snapshot_cycle();
-        self.arena.push(data).ok_or(Error::ArenaFull)
+    /// Текст вставки уходит в растущий буфер — он ничем не ограничен.
+    fn push_text(&mut self, data: &[u8]) -> u32 {
+        let text_off = self.added.len() as u32;
+        self.added.extend_from_slice(data);
+        text_off
     }
 
     fn snapshot_cycle(&mut self) {
         let text = self.read();
         self.original = text;
+        self.added.clear();
         self.arena.reset();
         self.current = Current::from_original(&self.original);
         // TODO: переезд истории на новый `Original` — см. отчёт.
@@ -185,6 +204,3 @@ impl Buffer {
         }
     }
 }
-
-/// Данные крупнее арены не помещаются ни в каком случае.
-const ARENA_CAPACITY_LIMIT: usize = crate::arena::ARENA_CAPACITY;

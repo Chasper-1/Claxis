@@ -19,13 +19,10 @@ fn check_invariants(buffer: &Buffer) {
                     "сегмент выходит за границы Original: {segment:?}"
                 );
             }
-            Source::Add(add) => {
-                let entry = buffer
-                    .arena_entry(add)
-                    .expect("сегмент ссылается на несуществующую запись arena");
+            Source::Add(_) => {
                 assert!(
-                    segment.end() <= entry.len() as u32,
-                    "сегмент выходит за границы записи arena: {segment:?}"
+                    segment.end() <= buffer.added_len(),
+                    "сегмент выходит за границы вставленного текста: {segment:?}"
                 );
             }
         }
@@ -219,8 +216,8 @@ fn nested_insert_resolves_to_flat_segments() {
         [
             seg(Source::Original, 0, 1),
             seg(Source::Add(0), 0, 5),
-            seg(Source::Add(1), 0, 4),
-            seg(Source::Add(0), 5, 5),
+            seg(Source::Add(10), 10, 4),
+            seg(Source::Add(5), 5, 5),
             seg(Source::Original, 1, 1),
         ]
     );
@@ -239,9 +236,9 @@ fn nested_delete_cuts_inside_add() {
         [
             seg(Source::Original, 0, 1),
             seg(Source::Add(0), 0, 1),
-            seg(Source::Add(0), 4, 1),
-            seg(Source::Add(1), 0, 4),
-            seg(Source::Add(0), 5, 5),
+            seg(Source::Add(4), 4, 1),
+            seg(Source::Add(10), 10, 4),
+            seg(Source::Add(5), 5, 5),
             seg(Source::Original, 1, 1),
         ]
     );
@@ -289,7 +286,7 @@ fn delete_over_whole_add_removes_it() {
         segments(&b),
         [seg(Source::Original, 0, 1), seg(Source::Original, 1, 1)]
     );
-    assert_eq!(b.arena_entry(0), Some(b"XX".as_ref()));
+    assert_eq!(b.added(0, 2), Some(b"XX".as_ref()));
 }
 
 #[test]
@@ -395,9 +392,11 @@ fn arena_entries_survive_undo() {
     b.undo().unwrap();
 
     assert_eq!(b.add_count(), 2);
-    assert_eq!(b.arena_entry(0), Some(b"XX".as_ref()));
-    assert_eq!(b.arena_entry(1), Some(b"YY".as_ref()));
-    assert_eq!(b.arena_entry(2), None);
+    assert_eq!(b.added(0, 2), Some(b"XX".as_ref()));
+    assert_eq!(b.added(2, 2), Some(b"YY".as_ref()));
+    assert_eq!(b.arena_record(2), None);
+    assert!(b.arena_record(0).is_some(), "запись вставки пережила undo");
+    assert!(b.arena_record(1).is_some(), "запись вставки пережила undo");
 }
 
 #[test]
@@ -574,17 +573,16 @@ fn discarding_redo_keeps_data_and_correct_state() {
     b.rebuild();
     assert_eq!(b.read(), b"xyabc");
     assert_eq!(b.add_count(), 2);
-    assert_eq!(b.arena_entry(0), Some(b"DEF".as_ref()));
-    assert_eq!(b.arena_entry(1), Some(b"xy".as_ref()));
+    assert_eq!(b.added(0, 3), Some(b"DEF".as_ref()));
+    assert_eq!(b.added(3, 2), Some(b"xy".as_ref()));
 }
 
-/// Заполняет арену целиком, перенося её через границу, и возвращает текст до переноса.
+/// Заполняет арену записями, перенося её через границу.
 fn fill_arena() -> (Buffer, Vec<u8>) {
     let mut b = Buffer::new("base");
-    let chunk = vec![b'x'; 16 * 1024];
-    // 65 × 16 КиБ > 1 МиБ: цикл арены обязан сработать.
-    for _ in 0..65 {
-        b.insert(b.len(), &chunk).unwrap();
+    // Мест в арене меньше, чем записей: цикл обязан сработать.
+    for i in 0..ARENA_CAPACITY / size_of::<ArenaRecord>() as usize + 10 {
+        b.insert(b.len(), b"x").unwrap();
     }
     let text = b.read();
     (b, text)
@@ -594,15 +592,24 @@ fn fill_arena() -> (Buffer, Vec<u8>) {
 fn arena_cycle_moves_current_into_new_original() {
     let (b, text) = fill_arena();
 
+    let capacity = (ARENA_CAPACITY / size_of::<ArenaRecord>()) as u32;
     assert_eq!(b.read(), text);
-    assert!(b.add_count() < 65, "арена не была переиспользована");
+    assert!(
+        b.add_count() < capacity + 10,
+        "арена не была переиспользована"
+    );
     assert_ne!(b.original(), b"base", "Original не сменился на новый");
-    // Перенос происходит до вставки, последний чанк ложится уже в чистую арену.
+    // Цикл сработал на последней вставке: текст, бывший в `Original` до
+    // переноса, лежит в нём целиком, а вставки после цикла — в `added`.
+    // Цикл сработал до последних вставок: `Original` — это текст на момент
+    // переноса, то есть весь текущий минус то, что легло в `added` после.
+    let cut = text.len() - b.added_len() as usize;
     assert_eq!(
         b.original(),
-        &text[..text.len() - 16 * 1024],
+        &text[..cut],
         "Original не равен тексту на момент переноса"
     );
+    assert_eq!(b.add_count(), 10, "в арене записи только после цикла");
     check_invariants(&b);
 }
 
@@ -687,15 +694,16 @@ fn snapshot_moves_current_into_new_original() {
     check_invariants(&b);
 }
 
+/// В арене лежат только метаданные, поэтому объём вставки не ограничен:
+/// текст уходит в растущий буфер и масштабируется свободно.
 #[test]
-fn insert_larger_than_arena_is_an_error() {
+fn huge_insert_is_not_limited_by_arena() {
     let mut b = Buffer::new("base");
-    // Крупнее арены не помещается ни в каком случае, даже в пустую.
-    assert!(ARENA_CAPACITY + 1 > ARENA_CAPACITY);
-    let huge = vec![b'y'; ARENA_CAPACITY + 1];
-    let before = b.read();
-    assert_eq!(b.insert(4, &huge), Err(Error::ArenaFull));
-    assert_eq!(b.read(), before);
+    let huge = vec![b'y'; ARENA_CAPACITY * 4];
+    b.insert(4, &huge).unwrap();
+    let mut expected = b"base".to_vec();
+    expected.extend_from_slice(&huge);
+    assert_eq!(b.read(), expected);
     check_invariants(&b);
 }
 

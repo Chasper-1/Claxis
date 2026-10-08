@@ -1,85 +1,111 @@
-use std::ops::Index;
+/// Вид изменения текста.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    /// Новое перекрывает диапазон: старое физически цело, лежит под новым.
+    Insert,
+    /// Диапазон исключён из документа. Текста нет, только границы.
+    Delete,
+}
 
-pub type AddId = u32;
+/// Запись об изменении — метаданные, без текста.
+/// Текст вставки лежит в растущем буфере, `text_off` на него указывает.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Record {
+    kind: Kind,
+    pos: u32,
+    len: u32,
+    text_off: u32,
+}
 
-pub const ARENA_CAPACITY: usize = 1024 * 1024;
+impl Record {
+    pub fn insert(pos: u32, len: u32, text_off: u32) -> Self {
+        Self {
+            kind: Kind::Insert,
+            pos,
+            len,
+            text_off,
+        }
+    }
 
+    pub fn delete(pos: u32, len: u32) -> Self {
+        Self {
+            kind: Kind::Delete,
+            pos,
+            len,
+            text_off: 0,
+        }
+    }
+
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    pub fn pos(&self) -> u32 {
+        self.pos
+    }
+
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    pub fn text_off(&self) -> u32 {
+        self.text_off
+    }
+}
+
+pub type RecordId = u32;
+
+/// Арена метаданных: append-only, фиксированного размера.
+///
+/// Текст сюда не попадает — он в растущем буфере. Сюда падают только записи
+/// об изменениях: они мелкие, их дохуища, и именно они должны быть ограничены.
 #[derive(Debug)]
 pub struct AddArena {
-    data: Vec<u8>,
-    bump: usize,
-    entries: Vec<(u32, u32)>,
+    records: Vec<Record>,
+    capacity: usize,
 }
 
 impl Default for AddArena {
     fn default() -> Self {
         Self {
-            data: vec![0; ARENA_CAPACITY],
-            bump: 0,
-            entries: Vec::new(),
+            records: Vec::new(),
+            capacity: ARENA_CAPACITY / size_of::<Record>(),
         }
     }
 }
 
 impl AddArena {
-    pub fn push(&mut self, data: &[u8]) -> Option<AddId> {
-        if data.len() > ARENA_CAPACITY {
+    pub fn push(&mut self, record: Record) -> Option<RecordId> {
+        if self.records.len() >= self.capacity {
             return None;
         }
-        if self.bump + data.len() > ARENA_CAPACITY {
-            return None;
-        }
-        let start = self.bump;
-        self.data[start..start + data.len()].copy_from_slice(data);
-        self.bump += data.len();
-        let id = self.entries.len() as AddId;
-        self.entries.push((start as u32, data.len() as u32));
+        let id = self.records.len() as RecordId;
+        self.records.push(record);
         Some(id)
     }
 
-    pub fn get(&self, add: AddId) -> Option<&[u8]> {
-        let &(start, len) = self.entries.get(add as usize)?;
-        Some(&self.data[start as usize..start as usize + len as usize])
-    }
-
-    pub fn start(&self, add: AddId) -> Option<u32> {
-        self.entries.get(add as usize).map(|&(start, _)| start)
-    }
-
-    /// Диапазон записи в арене как смещение и длина.
-    pub fn range(&self, add: AddId) -> Option<(u32, u32)> {
-        self.entries.get(add as usize).copied()
-    }
-
-    pub fn as_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
-    }
-
-    pub fn remaining(&self) -> u32 {
-        (ARENA_CAPACITY - self.bump) as u32
-    }
-
-    /// Переиспользование арены: указатель отматывается, записи чистятся.
-    /// Данные не выделяются заново — bump-аллокация просто начинает с нуля.
-    pub fn reset(&mut self) {
-        self.bump = 0;
-        self.entries.clear();
+    pub fn get(&self, id: RecordId) -> Option<&Record> {
+        self.records.get(id as usize)
     }
 
     pub fn len(&self) -> u32 {
-        self.entries.len() as u32
+        self.records.len() as u32
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.records.is_empty()
+    }
+
+    pub fn remaining(&self) -> u32 {
+        (self.capacity - self.records.len()) as u32
+    }
+
+    /// Переиспользование арены: указатель отматывается, записи чистятся.
+    /// Память не перевыделяется — записи просто переписываются с нуля.
+    pub fn reset(&mut self) {
+        self.records.clear();
     }
 }
 
-impl Index<AddId> for AddArena {
-    type Output = [u8];
-
-    fn index(&self, add: AddId) -> &Self::Output {
-        let (start, len) = self.entries[add as usize];
-        &self.data[start as usize..start as usize + len as usize]
-    }
-}
+/// Метаданных в арене помещается столько, сколько влезает в 1 Миб.
+pub const ARENA_CAPACITY: usize = 1024 * 1024;

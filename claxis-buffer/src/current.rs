@@ -1,9 +1,9 @@
-use crate::arena::{AddArena, AddId};
 use crate::segment::{Segment, Source};
 
 pub(crate) type NodeId = u32;
 
 /// Узел — только ссылки: источник, смещение, длина, соседи.
+/// Источник: `0` — `Original`, `1` — растущий буфер вставленного текста.
 /// Записей истории здесь нет, `Current` их не держит.
 #[derive(Clone, Copy, Debug)]
 struct Node {
@@ -177,7 +177,7 @@ impl Current {
         found
     }
 
-    pub fn segments<'a>(&'a self, arena: &'a AddArena) -> impl Iterator<Item = Segment> + 'a {
+    pub fn segments<'a>(&'a self) -> impl Iterator<Item = Segment> + 'a {
         let mut cur = self.nodes[0].next;
         std::iter::from_fn(move || {
             let id = cur?;
@@ -186,23 +186,19 @@ impl Current {
             if node.src == 0 {
                 Some(Segment::new(Source::Original, node.off, node.len))
             } else {
-                let add = node.src - 1;
-                let start = arena
-                    .start(add)
-                    .expect("сегмент ссылается на несуществующую запись arena");
-                Some(Segment::new(Source::Add(add), node.off - start, node.len))
+                Some(Segment::new(Source::Add(node.off), node.off, node.len))
             }
         })
     }
 
-    pub fn read(&self, original: &[u8], arena: &AddArena) -> Vec<u8> {
+    pub fn read(&self, original: &[u8], added: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len as usize);
-        self.read_into(&mut out, original, arena);
+        self.read_into(&mut out, original, added);
         out
     }
 
-    pub fn read_into(&self, out: &mut Vec<u8>, original: &[u8], arena: &AddArena) {
-        let bases = [original.as_ptr(), arena.as_ptr()];
+    pub fn read_into(&self, out: &mut Vec<u8>, original: &[u8], added: &[u8]) {
+        let bases = [original.as_ptr(), added.as_ptr()];
         let mut cur = self.nodes[0].next;
         while let Some(id) = cur {
             let node = &self.nodes[id as usize];
@@ -210,7 +206,7 @@ impl Current {
                 prefetch(self.nodes.as_ptr().wrapping_add(nid as usize).cast());
             }
             #[cfg(debug_assertions)]
-            self.debug_check_node(node, original, arena);
+            self.debug_check_node(node, original, added);
             let base = unsafe { *bases.get_unchecked((node.src != 0) as usize) };
             let bytes = unsafe {
                 std::slice::from_raw_parts(base.add(node.off as usize), node.len as usize)
@@ -223,19 +219,15 @@ impl Current {
     /// Инвариант для чтения через сырые указатели: диапазон ноды внутри источника.
     /// В release не вызывается — в горячем цикле чтения проверки быть не должно.
     #[cfg(debug_assertions)]
-    fn debug_check_node(&self, node: &Node, original: &[u8], arena: &AddArena) {
+    fn debug_check_node(&self, node: &Node, original: &[u8], added: &[u8]) {
         debug_assert!(node.len > 0, "нулевая нода: {:?}", node);
-        let (lo, hi) = if node.src == 0 {
-            (0u32, original.len() as u32)
+        let hi = if node.src == 0 {
+            original.len() as u32
         } else {
-            let add = node.src - 1;
-            let (start, len) = arena
-                .range(add)
-                .expect("сегмент ссылается на несуществующую запись arena");
-            (start, start + len)
+            added.len() as u32
         };
         debug_assert!(
-            node.off >= lo && node.off + node.len <= hi,
+            node.off + node.len <= hi,
             "нода выходит за границы источника: {:?} при {}",
             node,
             hi
@@ -243,23 +235,24 @@ impl Current {
     }
 
     /// Вставка в позицию `pos`. Позиция и длина известны, узел делится на месте курсора.
-    pub(crate) fn apply_insert(&mut self, pos: u32, add: AddId, off: u32, len: u32) -> Surgery {
+    /// `text_off` — где вставленный текст лежит в растущем буфере.
+    pub(crate) fn apply_insert(&mut self, pos: u32, text_off: u32, len: u32) -> Surgery {
         debug_assert!(len > 0);
         let (pre, node, rel) = self.locate(pos);
-        // Курсор может стоять ровно на конце ноды — делить её нельзя,
-        // пустой хвост. Переносим вставку за эту ноду.
+        // Курсор может стоять ровно на конце узла — делить его нельзя,
+        // пустой хвост. Переносим вставку за этот узел.
         let (pre, node, rel) = match (pre, node, rel) {
             (_, Some(n), r) if r >= self.nodes[n as usize].len => {
                 (n, self.nodes[n as usize].next, 0)
             }
             other => other,
         };
-        let src = add + 1;
+        let src = 1;
         let (apply_to, undo_to, cursor) = match node {
             Some(n) if rel == 0 => {
                 let i = self.push(Node {
                     src,
-                    off,
+                    off: text_off,
                     len,
                     next: Some(n),
                     prev: pre,
@@ -278,7 +271,7 @@ impl Current {
                 });
                 let i = self.push(Node {
                     src,
-                    off,
+                    off: text_off,
                     len,
                     next: Some(s),
                     prev: 0,
@@ -300,7 +293,7 @@ impl Current {
             None => {
                 let i = self.push(Node {
                     src,
-                    off,
+                    off: text_off,
                     len,
                     next: None,
                     prev: pre,

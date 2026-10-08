@@ -1,9 +1,8 @@
-use crate::arena::AddId;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source {
     Original,
-    Add(AddId),
+    /// Участок растущего буфера вставленного текста, по смещению.
+    Add(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

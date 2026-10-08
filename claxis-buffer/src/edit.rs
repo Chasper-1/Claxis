@@ -1,10 +1,10 @@
 use std::fmt;
 
-use crate::arena::AddId;
+use crate::arena::RecordId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Edit {
-    Insert { pos: u32, add: AddId },
+    Insert { pos: u32, add: RecordId },
     Delete { pos: u32, len: u32 },
 }
 
