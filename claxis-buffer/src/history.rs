@@ -1,53 +1,44 @@
-use crate::current::Surgery;
-use crate::edit::Edit;
+use crate::arena::RecordId;
 
-#[derive(Debug)]
-pub struct Record {
-    pub edit: Edit,
-    pub(crate) surgery: Surgery,
-}
-
+/// История правок: два стека записей арены.
+///
+/// Хранит только что произошло и в каком порядке. Ничего больше: отмена не
+/// описывается отдельно, она выводится из самой записи — вставка отменяется
+/// удалением, удаление отменяется возвратом отложенных сегментов в чтение.
 #[derive(Debug, Default)]
 pub struct History {
-    undo_stack: Vec<Record>,
-    redo_stack: Vec<Record>,
+    undo_stack: Vec<RecordId>,
+    redo_stack: Vec<RecordId>,
 }
 
 impl History {
-    pub(crate) fn record(&mut self, record: Record) {
+    pub(crate) fn push(&mut self, id: RecordId) {
+        self.undo_stack.push(id);
+    }
+
+    /// Отмена снимает вершину undo и кладёт её в redo. Стек — LIFO.
+    pub(crate) fn undo(&mut self) -> Option<RecordId> {
+        let id = self.undo_stack.pop()?;
+        self.redo_stack.push(id);
+        Some(id)
+    }
+
+    pub(crate) fn redo(&mut self) -> Option<RecordId> {
+        let id = self.redo_stack.pop()?;
+        self.undo_stack.push(id);
+        Some(id)
+    }
+
+    /// Новая правка отменяет redo-ветку: документ пошёл по другой траектории.
+    pub(crate) fn discard_redo(&mut self) {
         self.redo_stack.clear();
-        self.undo_stack.push(record);
     }
 
-    pub(crate) fn peek_undo(&self) -> Option<&Record> {
-        self.undo_stack.last()
-    }
-
-    pub(crate) fn peek_redo(&self) -> Option<&Record> {
-        self.redo_stack.last()
-    }
-
-    pub(crate) fn commit_undo(&mut self) {
-        if let Some(record) = self.undo_stack.pop() {
-            self.redo_stack.push(record);
-        }
-    }
-
-    pub(crate) fn commit_redo(&mut self) {
-        if let Some(record) = self.redo_stack.pop() {
-            self.undo_stack.push(record);
-        }
-    }
-
-    pub(crate) fn active(&self) -> impl Iterator<Item = Surgery> + '_ {
-        self.undo_stack.iter().map(|record| record.surgery)
-    }
-
-    pub fn undo_stack(&self) -> &[Record] {
+    pub(crate) fn undo_stack(&self) -> &[RecordId] {
         &self.undo_stack
     }
 
-    pub fn redo_stack(&self) -> &[Record] {
+    pub(crate) fn redo_stack(&self) -> &[RecordId] {
         &self.redo_stack
     }
 }

@@ -7,14 +7,17 @@ pub enum Kind {
     Delete,
 }
 
-/// Запись об изменении — метаданные, без текста.
-/// Текст вставки лежит в растущем буфере, `text_off` на него указывает.
+/// Запись об изменении — метаданные, без текста. 16 байт.
+///
+/// `data` указывает, где лежат данные правки, и означает разное по виду правки:
+/// для вставки — смещение в растущем буфере вставленного текста, для удаления —
+/// смещение отложенных сегментов относительно начала отложенной области.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Record {
     kind: Kind,
     pos: u32,
     len: u32,
-    text_off: u32,
+    data: u32,
 }
 
 impl Record {
@@ -23,16 +26,16 @@ impl Record {
             kind: Kind::Insert,
             pos,
             len,
-            text_off,
+            data: text_off,
         }
     }
 
-    pub fn delete(pos: u32, len: u32) -> Self {
+    pub fn delete(pos: u32, len: u32, parked: u32) -> Self {
         Self {
             kind: Kind::Delete,
             pos,
             len,
-            text_off: 0,
+            data: parked,
         }
     }
 
@@ -48,8 +51,10 @@ impl Record {
         self.len
     }
 
-    pub fn text_off(&self) -> u32 {
-        self.text_off
+    /// Смещение данных правки: в растущем буфере для вставки, отложенных
+    /// сегментов для удаления.
+    pub fn data(&self) -> u32 {
+        self.data
     }
 }
 

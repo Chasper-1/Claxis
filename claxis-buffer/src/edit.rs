@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::arena::RecordId;
+use crate::arena::{Kind, Record, RecordId};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Edit {
@@ -17,6 +17,22 @@ pub enum Error {
     },
     /// Данные крупнее арены: запись не помещается даже в пустую арену.
     ArenaFull,
+}
+
+impl Edit {
+    /// Правка по записи арены: то, что вернёт отмена.
+    pub fn from_record(record: &Record, id: RecordId) -> Self {
+        match record.kind() {
+            Kind::Insert => Edit::Insert {
+                pos: record.pos(),
+                add: id,
+            },
+            Kind::Delete => Edit::Delete {
+                pos: record.pos(),
+                len: record.len(),
+            },
+        }
+    }
 }
 
 impl fmt::Display for Error {

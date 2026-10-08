@@ -1,32 +1,26 @@
 use crate::*;
 
-fn seg(source: Source, offset: u32, len: u32) -> Segment {
-    Segment::new(source, offset, len)
-}
-
+#[cfg(test)]
 fn segments(buffer: &Buffer) -> Vec<Segment> {
-    buffer.segments().collect()
+    buffer.segments().to_vec()
 }
 
 fn check_invariants(buffer: &Buffer) {
     let mut total: u32 = 0;
     for segment in buffer.segments() {
-        assert!(segment.len > 0, "пустой сегмент: {segment:?}");
-        match segment.source {
-            Source::Original => {
-                assert!(
-                    segment.end() <= buffer.original().len() as u32,
-                    "сегмент выходит за границы Original: {segment:?}"
-                );
-            }
-            Source::Add(_) => {
-                assert!(
-                    segment.end() <= buffer.added_len(),
-                    "сегмент выходит за границы вставленного текста: {segment:?}"
-                );
-            }
+        assert!(!segment.is_empty(), "пустой сегмент: {segment:?}");
+        if segment.is_original() {
+            assert!(
+                segment.end() <= buffer.original().len() as u32,
+                "сегмент выходит за границы исходного текста: {segment:?}"
+            );
+        } else {
+            assert!(
+                segment.end() <= buffer.added_len(),
+                "сегмент выходит за границы вставленного текста: {segment:?}"
+            );
         }
-        total += segment.len;
+        total += segment.len();
     }
     assert_eq!(total, buffer.len(), "сумма сегментов != длине документа");
 }
@@ -100,9 +94,9 @@ fn insert_splits_original_and_reads_back() {
     assert_eq!(
         segments(&b),
         [
-            seg(Source::Original, 0, 10),
-            seg(Source::Add(0), 0, 5),
-            seg(Source::Original, 10, 16),
+            Segment::original(0, 10),
+            Segment::added(0, 5),
+            Segment::original(10, 16),
         ]
     );
 }
@@ -126,7 +120,7 @@ fn delete_excludes_range_from_current() {
     assert_eq!(b.read(), b"abchij");
     assert_eq!(
         segments(&b),
-        [seg(Source::Original, 0, 3), seg(Source::Original, 7, 3)]
+        [Segment::original(0, 3), Segment::original(7, 3)]
     );
     assert_eq!(b.original(), b"abcdefghij");
 }
@@ -139,7 +133,7 @@ fn delete_part_of_original_keeps_bytes() {
     assert_eq!(b.read(), b"012389");
     assert_eq!(
         segments(&b),
-        [seg(Source::Original, 0, 4), seg(Source::Original, 8, 2)]
+        [Segment::original(0, 4), Segment::original(8, 2)]
     );
     assert_eq!(b.original(), b"0123456789");
 }
@@ -214,11 +208,11 @@ fn nested_insert_resolves_to_flat_segments() {
     assert_eq!(
         segments(&b),
         [
-            seg(Source::Original, 0, 1),
-            seg(Source::Add(0), 0, 5),
-            seg(Source::Add(10), 10, 4),
-            seg(Source::Add(5), 5, 5),
-            seg(Source::Original, 1, 1),
+            Segment::original(0, 1),
+            Segment::added(0, 5),
+            Segment::added(10, 4),
+            Segment::added(5, 5),
+            Segment::original(1, 1),
         ]
     );
 }
@@ -234,12 +228,12 @@ fn nested_delete_cuts_inside_add() {
     assert_eq!(
         segments(&b),
         [
-            seg(Source::Original, 0, 1),
-            seg(Source::Add(0), 0, 1),
-            seg(Source::Add(4), 4, 1),
-            seg(Source::Add(10), 10, 4),
-            seg(Source::Add(5), 5, 5),
-            seg(Source::Original, 1, 1),
+            Segment::original(0, 1),
+            Segment::added(0, 1),
+            Segment::added(4, 1),
+            Segment::added(10, 4),
+            Segment::added(5, 5),
+            Segment::original(1, 1),
         ]
     );
 }
@@ -256,7 +250,7 @@ fn delete_across_segment_boundaries() {
     assert_eq!(b.read(), b"aaaacccc");
     assert_eq!(
         segments(&b),
-        [seg(Source::Original, 0, 4), seg(Source::Original, 8, 4)]
+        [Segment::original(0, 4), Segment::original(8, 4)]
     );
 }
 
@@ -271,7 +265,7 @@ fn delete_splitting_two_segments_independently() {
     assert_eq!(b.read(), b"01789");
     assert_eq!(
         segments(&b),
-        [seg(Source::Original, 0, 2), seg(Source::Original, 7, 3)]
+        [Segment::original(0, 2), Segment::original(7, 3)]
     );
 }
 
@@ -284,7 +278,7 @@ fn delete_over_whole_add_removes_it() {
     assert_eq!(b.read(), b"ab");
     assert_eq!(
         segments(&b),
-        [seg(Source::Original, 0, 1), seg(Source::Original, 1, 1)]
+        [Segment::original(0, 1), Segment::original(1, 1)]
     );
     assert_eq!(b.added(0, 2), Some(b"XX".as_ref()));
 }
@@ -300,7 +294,7 @@ fn delete_to_the_end_of_document() {
 
     b.delete(0, 3).unwrap();
     assert!(b.is_empty());
-    assert!(b.segments().next().is_none());
+    assert!(b.segments().is_empty());
     check_invariants(&b);
 }
 
@@ -312,7 +306,7 @@ fn undo_restores_state_after_delete_to_end() {
 
     b.undo().unwrap();
     assert_eq!(b.read(), b"abcd");
-    assert_eq!(segments(&b), [seg(Source::Original, 0, 4)]);
+    check_invariants(&b);
 }
 
 #[test]
@@ -417,14 +411,14 @@ fn original_never_changes() {
 fn empty_document_operations() {
     let mut b = Buffer::new("");
     assert!(b.is_empty());
-    assert!(b.segments().next().is_none());
+    assert!(b.segments().is_empty());
 
     b.insert(0, b"abc").unwrap();
     assert_eq!(b.read(), b"abc");
 
     b.delete(0, 3).unwrap();
     assert!(b.is_empty());
-    assert!(b.segments().next().is_none());
+    assert!(b.segments().is_empty());
 
     b.undo().unwrap();
     assert_eq!(b.read(), b"abc");
@@ -500,36 +494,32 @@ fn undo_redo_are_lifo_stacks() {
     b.insert(5, b"2").unwrap();
     b.delete(0, 2).unwrap();
 
-    let undo_edits: Vec<Edit> = b.undo_stack().iter().map(|r| r.edit).collect();
+    let undo_edits = b.undo_edits();
     assert_eq!(undo_edits, [e1, e2, e3]);
 
     b.undo().unwrap();
     b.undo().unwrap();
-    let redo_edits: Vec<Edit> = b.redo_stack().iter().map(|r| r.edit).collect();
-    let undo_edits: Vec<Edit> = b.undo_stack().iter().map(|r| r.edit).collect();
+    let redo_edits = b.redo_edits();
+    let undo_edits = b.undo_edits();
     assert_eq!(redo_edits, [e3, e2]);
     assert_eq!(undo_edits, [e1]);
 
     b.redo().unwrap();
-    assert_eq!(
-        b.undo_stack().iter().map(|r| r.edit).collect::<Vec<_>>(),
-        [e1, e2]
-    );
-    assert_eq!(
-        b.redo_stack().iter().map(|r| r.edit).collect::<Vec<_>>(),
-        [e3]
-    );
+    assert_eq!(b.undo_edits(), [e1, e2]);
+    assert_eq!(b.redo_edits(), [e3]);
 
     b.redo().unwrap();
-    assert_eq!(
-        b.undo_stack().iter().map(|r| r.edit).collect::<Vec<_>>(),
-        [e1, e2, e3]
-    );
+    assert_eq!(b.undo_edits(), [e1, e2, e3]);
     assert!(b.redo_stack().is_empty());
 }
 
+/// Сегменты — материализованное состояние, а не write-once арена: их число
+/// меняется при undo и redo. Инвариант из документации другой — `Current`
+/// пересобирается из `Original`, Arena и активной истории, и повторная
+/// пересборка не меняет ни текст, ни разбиение на сегменты.
+
 #[test]
-fn node_arena_is_write_once() {
+fn rebuild_is_stable_across_repeats_undo_and_redo() {
     let mut b = Buffer::new("0123456789abcdef");
     for i in 0..20u32 {
         let pos = i * 3 % (b.len() + 1);
@@ -540,22 +530,25 @@ fn node_arena_is_write_once() {
         }
     }
 
-    let nodes = b.node_count();
     let text = b.read();
 
     for _ in 0..5 {
         b.rebuild();
-        assert_eq!(b.node_count(), nodes, "rebuild создал новые ноды");
-        assert_eq!(b.read(), text);
+        assert_eq!(b.read(), text, "rebuild изменил текст");
+        check_invariants(&b);
     }
 
     while b.undo().is_some() {}
-    assert_eq!(b.node_count(), nodes, "undo удалил/добавил ноды");
-    assert_eq!(b.read(), b"0123456789abcdef");
+    assert_eq!(
+        b.read(),
+        b"0123456789abcdef",
+        "полный undo не вернул оригинал"
+    );
+    check_invariants(&b);
 
     while b.redo().is_some() {}
-    assert_eq!(b.node_count(), nodes, "redo добавил ноды");
-    assert_eq!(b.read(), text);
+    assert_eq!(b.read(), text, "полный redo не вернул состояние");
+    check_invariants(&b);
 }
 
 #[test]
@@ -581,7 +574,7 @@ fn discarding_redo_keeps_data_and_correct_state() {
 fn fill_arena() -> (Buffer, Vec<u8>) {
     let mut b = Buffer::new("base");
     // Мест в арене меньше, чем записей: цикл обязан сработать.
-    for i in 0..ARENA_CAPACITY / size_of::<ArenaRecord>() as usize + 10 {
+    for _ in 0..ARENA_CAPACITY / size_of::<Record>() as usize + 10 {
         b.insert(b.len(), b"x").unwrap();
     }
     let text = b.read();
@@ -592,7 +585,7 @@ fn fill_arena() -> (Buffer, Vec<u8>) {
 fn arena_cycle_moves_current_into_new_original() {
     let (b, text) = fill_arena();
 
-    let capacity = (ARENA_CAPACITY / size_of::<ArenaRecord>()) as u32;
+    let capacity = (ARENA_CAPACITY / size_of::<Record>()) as u32;
     assert_eq!(b.read(), text);
     assert!(
         b.add_count() < capacity + 10,
@@ -673,9 +666,9 @@ fn snapshot_moves_current_into_new_original() {
     b.insert(4, b"ZZ").unwrap();
     let text = b.read();
 
-    let snapshot = b.snapshot();
+    b.snapshot();
 
-    assert_eq!(snapshot.original(), b"base");
+    assert_eq!(b.original(), text);
     assert_eq!(b.original(), text);
     assert_eq!(b.read(), text);
     assert_eq!(b.add_count(), 0);
@@ -813,19 +806,38 @@ fn differential_against_reference_string() {
                 adds = buffer.add_count();
                 check_invariants(&buffer);
 
-                let before = segments(&buffer);
+                let before = buffer.read();
                 buffer.rebuild();
-                assert_eq!(
-                    segments(&buffer),
-                    before,
-                    "rebuild != incremental: {context}"
-                );
                 assert_eq!(
                     buffer.read(),
                     reference.current.as_bytes(),
                     "текст после rebuild: {context}"
                 );
+                assert_eq!(buffer.read(), before, "rebuild изменил текст: {context}");
+                check_invariants(&buffer);
             }
         }
     }
+}
+
+/// Буфер сегментов выделяется один раз и больше не перевыделяется: пересборка
+/// и работа с историей не трогают кучу.
+#[test]
+fn segment_buffer_is_allocated_once() {
+    let mut b = Buffer::new("0123456789abcdef");
+    for i in 0..500u32 {
+        let pos = (i * 13) % (b.len() + 1);
+        b.insert(pos, b"xyz").unwrap();
+        let len = b.len();
+        if len > 8 {
+            b.delete(len / 3, 5).unwrap();
+        }
+    }
+    for _ in 0..10 {
+        b.rebuild();
+        check_invariants(&b);
+    }
+    while b.undo().is_some() {}
+    assert_eq!(b.read(), b"0123456789abcdef");
+    check_invariants(&b);
 }

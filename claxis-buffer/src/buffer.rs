@@ -1,20 +1,8 @@
-use crate::arena::{self, AddArena, RecordId};
+use crate::arena::{self, AddArena, Kind, RecordId};
 use crate::current::Current;
 use crate::edit::{Edit, Error};
 use crate::history::History;
-use crate::history::Record;
 use crate::segment::Segment;
-
-/// Байты снапшота: текущее состояние документа перед переездом `Original`.
-pub struct Snapshot {
-    original: Vec<u8>,
-}
-
-impl Snapshot {
-    pub fn original(&self) -> &[u8] {
-        &self.original
-    }
-}
 
 pub struct Buffer {
     original: Vec<u8>,
@@ -43,12 +31,11 @@ impl Buffer {
         &self.original
     }
 
-    pub fn arena_record(&self, add: RecordId) -> Option<&arena::Record> {
-        self.arena.get(add)
+    pub fn arena_record(&self, id: RecordId) -> Option<&arena::Record> {
+        self.arena.get(id)
     }
 
-    /// Участок растущего буфера вставленного текста: `off` — смещение,
-    /// `len` — сколько байт взять.
+    /// Участок растущего буфера вставленного текста.
     pub fn added(&self, off: u32, len: u32) -> Option<&[u8]> {
         self.added.get(off as usize..(off + len) as usize)
     }
@@ -61,7 +48,7 @@ impl Buffer {
         self.arena.len()
     }
 
-    pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
+    pub fn segments(&self) -> &[Segment] {
         self.current.segments()
     }
 
@@ -73,12 +60,37 @@ impl Buffer {
         self.current.is_empty()
     }
 
-    pub fn undo_stack(&self) -> &[Record] {
+    pub fn undo_stack(&self) -> &[RecordId] {
         self.history.undo_stack()
     }
 
-    pub fn redo_stack(&self) -> &[Record] {
+    pub fn redo_stack(&self) -> &[RecordId] {
         self.history.redo_stack()
+    }
+
+    /// Правки в порядке отмены: вершина undo — последняя.
+    pub fn undo_edits(&self) -> Vec<Edit> {
+        self.history
+            .undo_stack()
+            .iter()
+            .filter_map(|id| {
+                self.arena
+                    .get(*id)
+                    .map(|record| Edit::from_record(record, *id))
+            })
+            .collect()
+    }
+
+    pub fn redo_edits(&self) -> Vec<Edit> {
+        self.history
+            .redo_stack()
+            .iter()
+            .filter_map(|id| {
+                self.arena
+                    .get(*id)
+                    .map(|record| Edit::from_record(record, *id))
+            })
+            .collect()
     }
 
     pub fn insert(&mut self, pos: u32, data: &[u8]) -> Result<(), Error> {
@@ -87,18 +99,17 @@ impl Buffer {
             return Ok(());
         }
         if self.arena.remaining() == 0 {
-            self.snapshot_cycle();
+            self.snapshot();
         }
+        self.history.discard_redo();
         let text_off = self.push_text(data);
-        let add = self
+        let len = data.len() as u32;
+        let id = self
             .arena
-            .push(arena::Record::insert(pos, data.len() as u32, text_off))
+            .push(arena::Record::insert(pos, len, text_off))
             .ok_or(Error::ArenaFull)?;
-        let surgery = self.current.apply_insert(pos, text_off, data.len() as u32);
-        self.history.record(Record {
-            edit: Edit::Insert { pos, add },
-            surgery,
-        });
+        self.current.apply_insert(pos, text_off, len);
+        self.history.push(id);
         Ok(())
     }
 
@@ -108,59 +119,91 @@ impl Buffer {
             return Ok(());
         }
         if self.arena.remaining() == 0 {
-            self.snapshot_cycle();
+            self.snapshot();
         }
-        self.arena
-            .push(arena::Record::delete(pos, len))
+        self.history.discard_redo();
+        // Удаление сначала применяется к документу: отложенные сегменты
+        // известны только после него, а в запись они пишутся сразу.
+        let parked = self.current.apply_delete(pos, len);
+        let id = self
+            .arena
+            .push(arena::Record::delete(pos, len, parked))
             .ok_or(Error::ArenaFull)?;
-        let surgery = self.current.apply_delete(pos, len);
-        self.history.record(Record {
-            edit: Edit::Delete { pos, len },
-            surgery,
-        });
+        self.history.push(id);
         Ok(())
     }
 
     pub fn replace(&mut self, pos: u32, len: u32, data: &[u8]) -> Result<(), Error> {
         self.check(pos, len)?;
         if !data.is_empty() && data.len() as u32 > self.arena.remaining() {
-            self.snapshot_cycle();
+            self.snapshot();
         }
         self.delete(pos, len)?;
         self.insert(pos, data)
     }
 
-    /// Снапшот: `Current` собирается в текст, текст становится `Original` #2,
+    /// Снапшот: документ собирается в текст, текст становится новым исходным,
     /// арена переиспользуется.
-    pub fn snapshot(&mut self) -> Snapshot {
-        let old = self.original.clone();
-        self.snapshot_cycle();
-        Snapshot { original: old }
+    pub fn snapshot(&mut self) {
+        let text = self.read();
+        self.original = text;
+        self.added.clear();
+        self.arena.reset();
+        self.current = Current::from_original(&self.original);
+        // TODO: переезд истории на новый исходный текст — см. отчёт.
+        self.history = History::default();
     }
 
     pub fn undo(&mut self) -> Option<Edit> {
-        let (edit, surgery) = {
-            let record = self.history.peek_undo()?;
-            (record.edit, record.surgery)
-        };
-        self.current.undo_surgery(surgery);
-        self.history.commit_undo();
+        let id = self.history.undo()?;
+        let record = *self.arena.get(id)?;
+        let edit = Edit::from_record(&record, id);
+        match record.kind() {
+            // Вставка отменяется удалением: сегменты уходят из чтения.
+            Kind::Insert => {
+                self.current.apply_delete(record.pos(), record.len());
+            }
+            // Удаление отменяется возвратом отложенных сегментов в чтение.
+            Kind::Delete => {
+                self.current
+                    .restore_deleted(record.pos(), record.data(), record.len());
+            }
+        }
         Some(edit)
     }
 
     pub fn redo(&mut self) -> Option<Edit> {
-        let (edit, surgery) = {
-            let record = self.history.peek_redo()?;
-            (record.edit, record.surgery)
-        };
-        self.current.apply_surgery(surgery);
-        self.history.commit_redo();
+        let id = self.history.redo()?;
+        let record = *self.arena.get(id)?;
+        let edit = Edit::from_record(&record, id);
+        match record.kind() {
+            Kind::Insert => self
+                .current
+                .apply_insert(record.pos(), record.data(), record.len()),
+            Kind::Delete => {
+                self.current.apply_delete(record.pos(), record.len());
+            }
+        }
         Some(edit)
     }
 
+    /// Пересборка из исходного текста и активной истории, по порядку.
     pub fn rebuild(&mut self) {
-        let active = self.history.active();
-        self.current.rebuild(active);
+        // Поля берутся раздельно: записи отдаются по одному, без сбора в
+        // промежуточный вектор — пересборка не выделяет память.
+        let Buffer {
+            arena,
+            history,
+            current,
+            ..
+        } = self;
+        current.rebuild(
+            history
+                .undo_stack()
+                .iter()
+                .filter_map(|id| arena.get(*id))
+                .map(|r| (r.kind(), r.pos(), r.len(), r.data())),
+        );
     }
 
     pub fn read(&self) -> Vec<u8> {
@@ -171,26 +214,11 @@ impl Buffer {
         self.current.read_into(out, &self.original, &self.added);
     }
 
-    #[cfg(test)]
-    pub(crate) fn node_count(&self) -> u32 {
-        self.current.node_count()
-    }
-
     /// Текст вставки уходит в растущий буфер — он ничем не ограничен.
     fn push_text(&mut self, data: &[u8]) -> u32 {
         let text_off = self.added.len() as u32;
         self.added.extend_from_slice(data);
         text_off
-    }
-
-    fn snapshot_cycle(&mut self) {
-        let text = self.read();
-        self.original = text;
-        self.added.clear();
-        self.arena.reset();
-        self.current = Current::from_original(&self.original);
-        // TODO: переезд истории на новый `Original` — см. отчёт.
-        self.history = History::default();
     }
 
     fn check(&self, pos: u32, len: u32) -> Result<(), Error> {
