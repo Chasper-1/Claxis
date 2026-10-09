@@ -28,6 +28,8 @@ pub struct Snapshot {
 #[derive(Debug)]
 pub struct SnapshotStore {
     conn: Connection,
+    /// Куда лежит база. Нужно, чтобы открыть ещё одно подключение.
+    path: std::path::PathBuf,
     /// Сколько снапшотов одного файла хранить.
     keep: u32,
 }
@@ -48,9 +50,24 @@ impl SnapshotStore {
         // чтобы записанный снапшот действительно пережил выход из редактора.
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(query)?;
-        let store = Self { conn, keep };
+        let store = Self {
+            conn,
+            path: paths.database(),
+            keep,
+        };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Ещё одно подключение к той же базе.
+    ///
+    /// Буфер живёт дольше сессии, которая его открыла, и не должен её держать.
+    /// SQLite это позволяет: подключений может быть сколько угодно.
+    pub fn reopen(&self) -> Result<Self> {
+        Self::open(
+            &StorePaths::new(self.path.parent().unwrap_or(std::path::Path::new("."))),
+            self.keep,
+        )
     }
 
     /// Сколько снапшотов одного файла хранится.

@@ -3,6 +3,7 @@ use std::mem::size_of;
 
 use crate::arena::{Arena, DEFAULT_DEPTH, MAX_DEPTH, Record, RecordId};
 use crate::current::Current;
+use crate::snapshot::{NullSink, SnapshotSink};
 
 /// Снимок памяти буфера — для диагностики и тестов.
 #[derive(Clone, Copy, Debug)]
@@ -113,6 +114,10 @@ pub struct Buffer {
     added: Vec<u8>,
     arena: Arena,
     current: Current,
+    /// Куда уходят снятые снапшоты. По умолчанию — никуда.
+    sink: Box<dyn SnapshotSink>,
+    /// Документ, которому принадлежит буфер. Нужен снапшоту.
+    file: Option<std::path::PathBuf>,
     /// Сколько раз брался снапшот. Растёт только на снапшоте.
     snapshots: u64,
 }
@@ -156,8 +161,20 @@ impl Buffer {
             added: Vec::new(),
             arena,
             current,
+            sink: Box::new(NullSink),
+            file: None,
             snapshots: 0,
         })
+    }
+
+    /// Привязать снапшоты к документу и приёмнику.
+    ///
+    /// Буфер сам про диск не знает: он отдаёт текст приёмнику, а что с ним
+    /// делать — решает внешний слой. Без приёмника снапшот никуда не пишется
+    /// и живёт только в памяти.
+    pub fn set_sink(&mut self, file: impl Into<std::path::PathBuf>, sink: Box<dyn SnapshotSink>) {
+        self.file = Some(file.into());
+        self.sink = sink;
     }
 
     /// Глубина истории в записях.
@@ -335,6 +352,12 @@ impl Buffer {
             off: 0,
         })?;
         self.snapshots += 1;
+        // Отдать снапшот приёмнику: буфер про диск не знает и просто передаёт
+        // текст. Ошибка сохранения не ломает правку — потеря кеша не должна
+        // стоить пользователю работы.
+        if let Some(file) = self.file.clone() {
+            self.sink.accept(&file, &self.original);
+        }
         Ok(())
     }
 

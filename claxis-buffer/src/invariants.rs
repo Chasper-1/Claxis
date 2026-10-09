@@ -497,7 +497,7 @@ fn every_default_is_present_and_documented() {
 
     // Какая настройка подключена, а какая задумана — проверяется при компиляции.
     const _: () = assert!(snapshots::KEEP.active);
-    const _: () = assert!(!snapshots::PERSIST.active);
+    const _: () = assert!(snapshots::PERSIST.active);
     const _: () = assert!(buffer::HISTORY_DEPTH.active);
     const _: () = assert!(!buffer::MAX_HISTORY_DEPTH.active);
 

@@ -5,16 +5,6 @@
 //! крейтов делает маршрутизатор `crate::router`.
 
 pub use claxis_buffer::{
-    Buffer,
-    En as MessagesEn,
-    Error,
-    Messages,
-    ParseError,
-    Record,
-    RecordId,
-    Segment,
-    DEFAULT_DEPTH,
-    MAX_DEPTH,
-    ORIGINAL_ID,
-    substitute,
+    Buffer, DEFAULT_DEPTH, En as MessagesEn, Error, MAX_DEPTH, Messages, NullSink, ORIGINAL_ID,
+    ParseError, Record, RecordId, Segment, SnapshotSink, substitute,
 };
