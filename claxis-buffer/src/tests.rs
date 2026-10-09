@@ -342,6 +342,65 @@ fn segments_are_sixteen_bytes() {
 }
 
 #[test]
+fn redo_text_is_reused_not_deleted() {
+    // Тексты отменённых вставок не удаляются: `Added` обрезается по хвосту,
+    // и следующая вставка перезаписывает то же место. Проверяем, что новая
+    // вставка действительно легла поверх отменённой, а не после неё.
+    let mut buf = b("");
+    buf.insert(0, b"AAAA").unwrap();
+    buf.insert(4, b"BBBB").unwrap();
+    buf.insert(8, b"CCCC").unwrap();
+    buf.undo().unwrap(); // отменена "CCCC"
+    buf.undo().unwrap(); // отменена "BBBB"
+    assert_eq!(buf.read(), b"AAAA");
+
+    // Новая вставка обязана занять место отменённых, а не дописать после.
+    buf.insert(4, b"ZZ").unwrap();
+    assert_eq!(buf.read(), b"AAAAZZ");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"AAAA");
+    buf.redo().unwrap();
+    assert_eq!(buf.read(), b"AAAAZZ");
+}
+
+#[test]
+fn redo_text_reuse_shrinks_added_back() {
+    // После отмены текст в `Added` остаётся: он нужен, если правка вернётся
+    // redo. Обрезка случается только когда приходит новая правка — тогда
+    // redo-ветка отменяется, а место переиспользуется.
+    let mut buf = b("");
+    for _ in 0..10 {
+        buf.insert(buf.len(), b"0123456789").unwrap();
+    }
+    for _ in 0..10 {
+        buf.undo().unwrap();
+    }
+    assert!(buf.is_empty());
+    assert!(
+        !buf.redo_stack().is_empty(),
+        "отменённые записи ждут в redo, текст из-за них не выбрасывается"
+    );
+    assert_eq!(
+        buf.tree_memory().added_len,
+        100,
+        "текст отменённых вставок остаётся в Added ради redo"
+    );
+
+    // Новая правка: redo очищается, хвост срезается, место переиспользуется.
+    let capacity_before = buf.tree_memory().added_capacity;
+    buf.insert(0, b"x").unwrap();
+    let mem = buf.tree_memory();
+    assert_eq!(mem.added_len, 1, "хвост срезан до новой вставки");
+    assert!(buf.redo_stack().is_empty());
+    assert!(
+        mem.added_capacity <= capacity_before,
+        "ёмкость не должна расти: {} против {capacity_before}",
+        mem.added_capacity
+    );
+    assert_eq!(buf.read(), b"x");
+}
+
+#[test]
 fn arena_blocks_keep_all_records() {
     // Арена 32КБ = 2048 записей в блоке. Ни одна запись не теряется при
     // переполнении блока: выделяется следующий, записи идут дальше.

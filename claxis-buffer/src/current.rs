@@ -290,59 +290,70 @@ impl Current {
 
     /// Склеить два поддерева в одно сбалансированное.
     ///
-    /// Если высоты разошлись больше чем на единицу — поворот. Инвариант
-    /// высот держится, поэтому спуск остаётся логарифмическим.
-    fn join(&mut self, left: u32, right: u32) -> u32 {
-        if left == NIL {
-            return right;
+    /// Высоты могут расходиться на сколько угодно — так бывает при удалении,
+    /// когда одно поддерево схлопнулось вместе с вырезанным куском.
+    ///
+    /// Способ один: спускаемся по краю высокого поддерева, пока оно выше
+    /// низкого больше чем на единицу, и приклеиваем низкое к краю. Если
+    /// высоты встретились ровно — просто ветка. Если же низкое поддерево
+    /// переросло оставшийся край (точка расхождения), оно разрезается
+    /// пополам и обе половины приклеиваются к двум сторонам.
+    ///
+    /// Рекурсия идёт только по краю: высота аргументов на каждом шаге строго
+    /// меньше, поэтому выход гарантирован. Склеивать обе стороны сразу нельзя
+    /// — восстановленный узел получает ту же высоту, что был, и рекурсия
+    /// закручивается.
+    fn join(&mut self, a: u32, b: u32) -> u32 {
+        if a == NIL {
+            return b;
         }
-        if right == NIL {
-            return left;
+        if b == NIL {
+            return a;
         }
-        let (hl, hr) = (self.height_of(left), self.height_of(right));
-        if hl > hr + 1 {
-            let l = self.nodes[left as usize];
-            debug_assert!(!l.is_leaf());
-            let (ll, lr) = (l.left(), l.right());
-            if self.height_of(ll) >= self.height_of(lr) {
-                // Одиночный поворот вправо.
-                let mid = self.new_branch(lr, right);
-                let out = self.new_branch(ll, mid);
-                self.release(left);
-                return out;
+        let (ha, hb) = (self.height_of(a), self.height_of(b));
+        if ha > hb + 1 {
+            let na = self.nodes[a as usize];
+            debug_assert!(!na.is_leaf());
+            let (al, ar) = (na.left(), na.right());
+            if self.height_of(ar) >= hb {
+                // Края хватает: приклеиваем b к правому краю a.
+                let new_ar = self.join(ar, b);
+                self.release(a);
+                self.new_branch(al, new_ar)
+            } else {
+                // Точка расхождения: режем b пополам.
+                let nb = self.nodes[b as usize];
+                debug_assert!(!nb.is_leaf());
+                let (bl, br) = (nb.left(), nb.right());
+                let new_l = self.join(ar, bl);
+                let mid = self.new_branch(new_l, br);
+                self.release(b);
+                let out = self.new_branch(al, mid);
+                self.release(a);
+                out
             }
-            // Двойной поворот: сначала влево по правому ребёнку.
-            let lr_node = self.nodes[lr as usize];
-            debug_assert!(!lr_node.is_leaf());
-            let (lrl, lrr) = (lr_node.left(), lr_node.right());
-            let new_left = self.new_branch(ll, lrl);
-            let new_right = self.new_branch(lrr, right);
-            let out = self.new_branch(new_left, new_right);
-            self.release(lr);
-            self.release(left);
-            return out;
-        }
-        if hr > hl + 1 {
-            let r = self.nodes[right as usize];
-            debug_assert!(!r.is_leaf());
-            let (rl, rr) = (r.left(), r.right());
-            if self.height_of(rr) >= self.height_of(rl) {
-                let mid = self.new_branch(left, rl);
-                let out = self.new_branch(mid, rr);
-                self.release(right);
-                return out;
+        } else if hb > ha + 1 {
+            let nb = self.nodes[b as usize];
+            debug_assert!(!nb.is_leaf());
+            let (bl, br) = (nb.left(), nb.right());
+            if self.height_of(bl) >= ha {
+                let new_bl = self.join(a, bl);
+                self.release(b);
+                self.new_branch(new_bl, br)
+            } else {
+                let na = self.nodes[a as usize];
+                debug_assert!(!na.is_leaf());
+                let (al, ar) = (na.left(), na.right());
+                let new_r = self.join(ar, bl);
+                let mid = self.new_branch(al, new_r);
+                self.release(a);
+                let out = self.new_branch(mid, br);
+                self.release(b);
+                out
             }
-            let rl_node = self.nodes[rl as usize];
-            debug_assert!(!rl_node.is_leaf());
-            let (rll, rlr) = (rl_node.left(), rl_node.right());
-            let new_left = self.new_branch(left, rll);
-            let new_right = self.new_branch(rlr, rr);
-            let out = self.new_branch(new_left, new_right);
-            self.release(rl);
-            self.release(right);
-            return out;
+        } else {
+            self.new_branch(a, b)
         }
-        self.new_branch(left, right)
     }
 
     // ── вставка ───────────────────────────────────────────────────────────
@@ -588,6 +599,41 @@ impl Current {
             self.read_range_rec(left, base, start, end, ctx, out);
             self.read_range_rec(right, right_base, start, end, ctx, out);
         }
+    }
+
+    /// Отладочная проверка: нет ли в дереве повторных индексов, какова
+    /// настоящая глубина и не указывает ли живой узел на освобождённый.
+    pub fn debug_walk(&self) -> (usize, usize, Option<u32>) {
+        let mut is_free = vec![false; self.nodes.len()];
+        for &idx in &self.free {
+            is_free[idx as usize] = true;
+        }
+        let mut seen = vec![false; self.nodes.len()];
+        let mut count = 0usize;
+        let mut depth = 0usize;
+        let mut cycle = None;
+        let mut stack = vec![(self.root, 1usize)];
+        while let Some((idx, d)) = stack.pop() {
+            if idx == NIL {
+                continue;
+            }
+            if seen[idx as usize] {
+                cycle = Some(idx);
+                break;
+            }
+            if is_free[idx as usize] {
+                panic!("живой узел {idx} оказался в свободном списке");
+            }
+            seen[idx as usize] = true;
+            count += 1;
+            depth = depth.max(d);
+            let node = self.nodes[idx as usize];
+            if !node.is_leaf() {
+                stack.push((node.left(), d + 1));
+                stack.push((node.right(), d + 1));
+            }
+        }
+        (count, depth, cycle)
     }
 
     /// Все сегменты в порядке документа — для тестов и отладки.

@@ -13,6 +13,7 @@ pub struct TreeMemory {
     pub free_capacity: usize,
     pub leaves: usize,
     pub node_size: usize,
+    pub added_len: usize,
     pub added_capacity: usize,
     pub original_capacity: usize,
     pub record_size: usize,
@@ -73,6 +74,8 @@ pub struct Buffer {
     added: Vec<u8>,
     arena: Arena,
     current: Current,
+    /// Сколько раз брался снапшот. Растёт только на снапшоте.
+    snapshots: u64,
 }
 
 impl Buffer {
@@ -89,6 +92,7 @@ impl Buffer {
             added: Vec::new(),
             arena,
             current,
+            snapshots: 0,
         }
     }
 
@@ -135,6 +139,7 @@ impl Buffer {
             free_capacity: self.current.free_capacity(),
             leaves: self.current.seg_count() as usize,
             node_size: Current::node_size(),
+            added_len: self.added.len(),
             added_capacity: self.added.capacity(),
             original_capacity: self.original.capacity(),
             record_size: size_of::<Record>(),
@@ -222,6 +227,7 @@ impl Buffer {
     pub fn undo(&mut self) -> Option<RecordId> {
         let id = self.arena.undo()?;
         self.rebuild();
+        self.snapshot_if_needed();
         Some(id)
     }
 
@@ -229,7 +235,18 @@ impl Buffer {
     pub fn redo(&mut self) -> Option<RecordId> {
         let id = self.arena.redo()?;
         self.rebuild();
+        self.snapshot_if_needed();
         Some(id)
+    }
+
+    /// Сколько раз буфер брал снапшот — для бенчей и диагностики.
+    pub fn snapshots_taken(&self) -> u64 {
+        self.snapshots
+    }
+
+    /// Отладочная проверка дерева: (узлов, глубина, цикл).
+    pub fn debug_walk(&self) -> (usize, usize, Option<u32>) {
+        self.current.debug_walk()
     }
 
     /// Снапшот: текст из `Current` становится новым `Original`, всё обнуляется.
@@ -239,6 +256,7 @@ impl Buffer {
         self.added.clear();
         self.arena.reset();
         self.current = Current::from_original(self.original.len() as u32, 0);
+        self.snapshots += 1;
     }
 
     /// Пересборка `Current` линейным проходом по активным записям `undo`.
@@ -251,6 +269,15 @@ impl Buffer {
         self.current.rebuild(self.original.len() as u32, records);
     }
 
+    /// Новая правка при непустом `redo`: стек отменённых записей очищается.
+    ///
+    /// Тексты отменённых вставок не удаляются — `Added` обрезается по хвосту,
+    /// и следующая вставка перезаписывает это место. Отменялись самые поздние
+    /// вставки, поэтому их тексты лежат в самом конце и хвост достаточно
+    /// срезать: ни удаления, ни перемещения памяти.
+    ///
+    /// Слоты записей в пуле арены не переиспользуются: идентификатор записи
+    /// стабилен, на него ссылаются сегменты.
     fn discard_redo_with_cleanup(&mut self) {
         if self.arena.redo_stack().is_empty() {
             return;

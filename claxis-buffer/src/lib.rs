@@ -10,3 +10,6 @@ pub use segment::{ADDED, ORIGINAL, Segment, TextRef};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod invariants;
