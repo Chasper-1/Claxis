@@ -1,5 +1,5 @@
 [workspace]
-members = ["claxis-buffer", "claxis-store"]
+members = ["claxis-buffer", "claxis-store", "claxis-input"]
 
 [package]
 name = "Claxis"
@@ -15,3 +15,4 @@ path = "src/lib.rs"
 [dependencies]
 claxis-buffer = { path = "claxis-buffer" }
 claxis-store = { path = "claxis-store" }
+claxis-input = { path = "claxis-input" }

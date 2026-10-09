@@ -70,8 +70,17 @@
 * [ ] Чтение `language` из конфига, загрузка TOML, проверка ключей.
 * [ ] Тексты `claxis-store` и сессии пока по-английски, без каталога.
 
-## 6. Следующие крейты по `mvp.md`
+## 6. Крейты и их настройки
 
+Настройки живут в том крейте, которому принадлежат, а не в буфере.
+
+* [x] `claxis-buffer` — только `history_depth`.
+* [x] `claxis-store` — `keep`, `persist`. Перенесено из буфера.
+* [x] `claxis-input` — `tap_hold_ms`. Крейт создан заранее, чтобы настройка
+      не потерялась и не лежала не в том крейте.
 * [ ] `claxis-term` — kitty keyboard protocol, raw mode, размер, события.
+      Свои типы событий, не crossterm-овские.
 * [ ] `claxis-config` — см. раздел 4.
-* [ ] `claxis-input`, `claxis-commands`, `claxis-view`, остальные.
+* [ ] `claxis-commands`, `claxis-view`, `claxis-theme`, `claxis-i18n`,
+      `claxis-core`, `claxis-search`, `claxis-files`, `claxis-modes`,
+      `claxis-plugin` — создаются по мере появления содержания.
