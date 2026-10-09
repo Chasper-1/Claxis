@@ -286,16 +286,22 @@ impl Buffer {
     ///
     /// Слоты записей в пуле арены не переиспользуются: идентификатор записи
     /// стабилен, на него ссылаются сегменты.
+    ///
+    /// Стек `redo` очищается на месте: забирать его через `mem::take` значило
+    /// бы угнать вектор в локальную переменную и уронить вместе с ней —
+    /// аллокация и освобождение на каждой правке после отмены.
     fn discard_redo_with_cleanup(&mut self) {
         if self.arena.redo_stack().is_empty() {
             return;
         }
-        let cleared = self.arena.discard_redo();
-        let tail = cleared
+        let tail = self
+            .arena
+            .redo_stack()
             .iter()
             .filter_map(|&id| self.arena.get(id))
             .filter_map(Record::text)
             .min();
+        self.arena.clear_redo();
         if let Some(off) = tail {
             self.added.truncate(off as usize);
         }

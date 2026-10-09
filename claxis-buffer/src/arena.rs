@@ -209,9 +209,12 @@ impl Arena {
         Some(id)
     }
 
-    /// Новая правка отменяет redo-ветку. Возвращает очищенные идентификаторы.
-    pub fn discard_redo(&mut self) -> Vec<RecordId> {
-        std::mem::take(&mut self.redo)
+    /// Очистить redo-ветку на месте, без перемещения вектора.
+    ///
+    /// Ёмкость стека сохраняется и используется следующей веткой отмены —
+    /// освобождать и потом запрашивать память заново незачем.
+    pub fn clear_redo(&mut self) {
+        self.redo.clear();
     }
 
     pub fn undo_stack(&self) -> &[RecordId] {
