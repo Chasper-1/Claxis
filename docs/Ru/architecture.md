@@ -19,7 +19,7 @@ TUI-only, язык Rust, бэкенд ratatui и crossterm. GUI не делае�
 | `claxis-core` | Документ, буферы, selection, cursor, состояние редактора | `text`, `buffer` |
 | `claxis-input` | Клавиши как позиции, раскладки, модификаторы, составление, лидер, отмена | `text` |
 | `claxis-search` | Поиск и замена, обход совпадений по буферу | `core` |
-| `claxis-term` | Терминал: протокол, raw mode, размер, чтение событий | `input` |
+| `claxis-term` | Терминал: протокол, raw mode, размер, чтение событий. Отдаёт свои типы событий, не crossterm-овские | `input` |
 | `claxis-files` | Файлы: чтение, сохранение, кодировки, переводы строк, BOM, Git, shell | `core`, `config` |
 | `claxis-commands` | Команды, аргументы, автодополнение, разрешение, уровни привязок, конфликты | `core`, `input`, `config`, `files` |
 | `claxis-modes` | Режимы, состояния, переходы, индикация | `core`, `commands` |
