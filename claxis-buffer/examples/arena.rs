@@ -29,9 +29,9 @@ fn main() {
 
     // Проверяем, что история жива и отмена работает.
     let before = buf.len();
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     println!("undo: {} -> {}", before, buf.len());
-    buf.redo().unwrap();
+    buf.redo().unwrap().unwrap();
     println!("redo: -> {}", buf.len());
     println!();
 

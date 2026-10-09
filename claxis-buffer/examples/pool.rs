@@ -2,8 +2,8 @@ use claxis_buffer::Buffer;
 
 fn main() {
     println!(
-        "{:>9} | {:>8} | {:>9} | {:>10} | {}",
-        "глубина", "предел", "узлов", "дерево", "пик листьев"
+        "{:>9} | {:>8} | {:>9} | {:>10} | {:>4}",
+        "глубина", "предел", "узлов", "дерево", "пик:"
     );
     for depth in [1u32, 10, 100, 500, 1_000, 4_000, 8_192] {
         // Рассеянные вставки: каждая разрезает сегмент, листья растут.
@@ -12,7 +12,7 @@ fn main() {
         let mut buf = Buffer::with_history_depth(b"", depth).unwrap();
         let want = 2 * depth as usize + 1;
         let mut peak = 0usize;
-        for i in 0..(depth as u32 * 12) {
+        for i in 0..(depth * 12) {
             let pos = (i * 37) % (buf.len() + 1);
             buf.insert(pos, b"x").unwrap();
             peak = peak.max(buf.segments().len());
@@ -23,7 +23,7 @@ fn main() {
             "глубина {depth}: пик листьев {peak} больше предела {want}"
         );
         println!(
-            "{:>9} | {:>8} | {:>9} | {:>10} | {:>4} из {:>4}",
+            "{:>9} | {:>8} | {:>9} | {:>10} | {:>4}/{:>4}",
             depth,
             want,
             m.pool_capacity,

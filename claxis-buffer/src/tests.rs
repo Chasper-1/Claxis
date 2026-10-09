@@ -35,7 +35,7 @@ fn delete_excludes_range_and_undo_restores_exactly() {
     let mut buf = b("0123456789");
     buf.delete(3, 3).unwrap();
     assert_eq!(buf.read(), b"0126789");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"0123456789");
 }
 
@@ -46,7 +46,7 @@ fn delete_across_segment_boundaries() {
     assert_eq!(buf.read(), b"01234abc56789");
     buf.delete(2, 6).unwrap();
     assert_eq!(buf.read(), b"0156789");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"01234abc56789");
 }
 
@@ -55,7 +55,7 @@ fn delete_to_the_end_of_document() {
     let mut buf = b("0123456789");
     buf.delete(7, 3).unwrap();
     assert_eq!(buf.read(), b"0123456");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"0123456789");
 }
 
@@ -75,9 +75,9 @@ fn undo_insert_removes_text_and_redo_restores() {
     let mut buf = b("hello");
     buf.insert(5, b" world").unwrap();
     assert_eq!(buf.read(), b"hello world");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"hello");
-    buf.redo().unwrap();
+    buf.redo().unwrap().unwrap();
     assert_eq!(buf.read(), b"hello world");
 }
 
@@ -88,13 +88,13 @@ fn undo_redo_walk_history_linearly() {
     buf.insert(1, b"B").unwrap();
     buf.insert(2, b"C").unwrap();
     assert_eq!(buf.read(), b"ABC");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"AB");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"A");
-    buf.redo().unwrap();
+    buf.redo().unwrap().unwrap();
     assert_eq!(buf.read(), b"AB");
-    buf.redo().unwrap();
+    buf.redo().unwrap().unwrap();
     assert_eq!(buf.read(), b"ABC");
 }
 
@@ -103,8 +103,8 @@ fn new_edit_after_undo_clears_redo() {
     let mut buf = b("");
     buf.insert(0, b"A").unwrap();
     buf.insert(1, b"B").unwrap();
-    buf.undo().unwrap();
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"");
     assert!(!buf.redo_stack().is_empty());
     buf.insert(0, b"X").unwrap();
@@ -118,9 +118,9 @@ fn replace_is_delete_then_insert() {
     buf.replace(7, 5, b"Claxis").unwrap();
     assert_eq!(buf.read(), b"Hello, Claxis!");
     // replace = delete + insert: первая отмена убирает вставку.
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"Hello, !");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"Hello, world!");
 }
 
@@ -131,7 +131,7 @@ fn nested_inserts_resolve_to_flat_document() {
     buf.insert(1, b"b").unwrap();
     buf.insert(3, b"d").unwrap();
     assert_eq!(buf.read(), b"abcde");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"abce");
 }
 
@@ -141,9 +141,9 @@ fn delete_undo_preserves_state_when_deleted_was_inserted_earlier() {
     buf.insert(5, b"abc").unwrap();
     buf.delete(6, 1).unwrap();
     assert_eq!(buf.read(), b"01234ac56789");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"01234abc56789");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"0123456789");
 }
 
@@ -192,7 +192,7 @@ fn undo_and_redo_are_lifo_stacks() {
     buf.insert(1, b"B").unwrap();
     buf.insert(2, b"C").unwrap();
     assert_eq!(buf.undo_stack().len(), 3);
-    let id = buf.undo().unwrap();
+    let id = buf.undo().unwrap().unwrap();
     assert_eq!(buf.redo_stack().len(), 1);
     assert_eq!(buf.record(id).unwrap().anchor(), 2);
     assert_eq!(buf.record(id).unwrap().head(), 3);
@@ -295,13 +295,13 @@ fn node_pool_does_not_grow_without_bound() {
 fn snapshot_moves_current_into_new_original() {
     let mut buf = b("hello");
     buf.insert(5, b" world").unwrap();
-    buf.snapshot();
+    buf.snapshot().unwrap();
     assert_eq!(buf.original(), b"hello world");
     assert_eq!(buf.read(), b"hello world");
     assert!(buf.undo_stack().is_empty());
     buf.insert(11, b"!").unwrap();
     assert_eq!(buf.read(), b"hello world!");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"hello world");
 }
 
@@ -358,16 +358,16 @@ fn redo_text_is_reused_not_deleted() {
     buf.insert(0, b"AAAA").unwrap();
     buf.insert(4, b"BBBB").unwrap();
     buf.insert(8, b"CCCC").unwrap();
-    buf.undo().unwrap(); // отменена "CCCC"
-    buf.undo().unwrap(); // отменена "BBBB"
+    buf.undo().unwrap().unwrap(); // отменена "CCCC"
+    buf.undo().unwrap().unwrap(); // отменена "BBBB"
     assert_eq!(buf.read(), b"AAAA");
 
     // Новая вставка обязана занять место отменённых, а не дописать после.
     buf.insert(4, b"ZZ").unwrap();
     assert_eq!(buf.read(), b"AAAAZZ");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"AAAA");
-    buf.redo().unwrap();
+    buf.redo().unwrap().unwrap();
     assert_eq!(buf.read(), b"AAAAZZ");
 }
 
@@ -381,7 +381,7 @@ fn redo_text_reuse_shrinks_added_back() {
         buf.insert(buf.len(), b"0123456789").unwrap();
     }
     for _ in 0..10 {
-        buf.undo().unwrap();
+        buf.undo().unwrap().unwrap();
     }
     assert!(buf.is_empty());
     assert!(
@@ -426,7 +426,7 @@ fn arena_blocks_keep_all_records() {
     assert!(buf.snapshots_taken() > 0);
     // Отменить можно только до последнего снапшота: дальше история уже стёрта,
     // поэтому исходный пустой документ недостижим.
-    while buf.undo().is_some() {}
+    while buf.undo().unwrap().is_some() {}
     assert!(
         !buf.is_empty(),
         "откат должен упереться в снапшот, не в ноль"
@@ -484,7 +484,7 @@ fn delete_whole_document() {
     buf.delete(0, 3).unwrap();
     assert!(buf.segments().is_empty());
     assert!(buf.is_empty());
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"abc");
 }
 
@@ -494,7 +494,7 @@ fn huge_insert_is_not_limited_by_arena() {
     let big = vec![b'x'; 1_000_000];
     buf.insert(5, &big).unwrap();
     assert_eq!(buf.len(), 1_000_009);
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"start|end");
 }
 
@@ -503,7 +503,7 @@ fn discarded_redo_texts_removed_from_arena() {
     let mut buf = b("");
     buf.insert(0, b"A").unwrap();
     buf.insert(1, b"B").unwrap();
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"A");
     let before = buf.undo_stack().len();
     buf.insert(1, b"C").unwrap();

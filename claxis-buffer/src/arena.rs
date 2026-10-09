@@ -122,9 +122,16 @@ impl Arena {
     }
 
     /// Кладёт запись в текущий блок (новый, если тот полон) и в `undo`.
+    ///
+    /// Блоков в арене всегда хотя бы один: он создаётся в `new` и `reset`
+    /// ничего не удаляет насовсем. Поэтому обращения идут через `first_mut`
+    /// и `last_mut`, без паники на «должно существовать».
     pub fn push(&mut self, record: Record) -> RecordId {
-        let last = self.blocks.last().unwrap();
-        if last.len() >= self.capacity {
+        if self
+            .blocks
+            .last_mut()
+            .is_none_or(|last| last.len() >= self.capacity)
+        {
             self.blocks.push(Vec::with_capacity(self.capacity));
         }
         let block = self.blocks.len() - 1;
@@ -155,7 +162,8 @@ impl Arena {
 
     /// Свободных мест в текущем блоке.
     pub fn remaining_records(&self) -> usize {
-        self.capacity - self.blocks.last().unwrap().len()
+        let used = self.blocks.last().map_or(0, Vec::len);
+        self.capacity - used
     }
 
     /// Ёмкость одного блока в записях.

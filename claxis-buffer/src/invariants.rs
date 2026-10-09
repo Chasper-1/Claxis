@@ -7,6 +7,7 @@
 
 use crate::arena::{MAX_DEPTH, Record, RecordId};
 use crate::buffer::Buffer;
+use crate::buffer::Error;
 
 /// Короткий конструктор буфера из строки.
 fn b(text: &str) -> Buffer {
@@ -149,7 +150,7 @@ fn tree_accounting_holds_after_undo_and_redo_walk() {
 
     // Отматываем всё до нуля: дерево обязано схлопнуться без остатка.
     let mut undone = 0;
-    while buf.undo().is_some() {
+    while buf.undo().unwrap().is_some() {
         undone += 1;
         check_tree(&buf, "после undo");
         assert!(undone <= history);
@@ -159,7 +160,7 @@ fn tree_accounting_holds_after_undo_and_redo_walk() {
 
     // И возвращаем всё обратно.
     let mut redone = 0;
-    while buf.redo().is_some() {
+    while buf.redo().unwrap().is_some() {
         redone += 1;
         check_tree(&buf, "после redo");
     }
@@ -373,11 +374,160 @@ fn history_depth_bounds_records_and_leaves() {
 }
 
 #[test]
-fn invalid_history_depth_gives_clear_error() {
+fn messages_are_localizable_and_default_to_english() {
+    use crate::messages::{En, Messages, substitute};
+
+    // По умолчанию — английский.
+    let out_of_bounds = Error::OutOfBounds {
+        anchor: 10,
+        len: 5,
+        doc_len: 4,
+    };
+    let text = out_of_bounds.text();
+    assert!(text.contains("outside"), "по умолчанию английский: {text}");
+    assert!(
+        !text.contains("вне"),
+        "русского в дефолте быть не должно: {text}"
+    );
+
+    // Каталог из конфига: текст написан переводчиком, значения подставляются
+    // вместо имён в фигурных скобках.
+    struct Ru;
+    impl Messages for Ru {
+        fn out_of_bounds(&self, anchor: u32, end: u32, doc_len: u32) -> String {
+            substitute(
+                "диапазон {anchor}..{end} вне документа длиной {doc_len}",
+                &[
+                    ("anchor", anchor.to_string()),
+                    ("end", end.to_string()),
+                    ("doc_len", doc_len.to_string()),
+                ],
+            )
+        }
+        fn invalid_history_depth(&self, depth: u32, min: u32, max: u32) -> String {
+            substitute(
+                "глубина истории {depth} недопустима: от {min} до {max}",
+                &[
+                    ("depth", depth.to_string()),
+                    ("min", min.to_string()),
+                    ("max", max.to_string()),
+                ],
+            )
+        }
+        fn tree_pool_exhausted(&self, capacity: usize, depth: u32) -> String {
+            substitute(
+                "пул исчерпан: узлов {capacity}, глубина {depth}",
+                &[
+                    ("capacity", capacity.to_string()),
+                    ("depth", depth.to_string()),
+                ],
+            )
+        }
+        fn bad_placeholder(&self, got: &str, expected: &[&str]) -> String {
+            substitute(
+                "в переводе имя {{{got}}}, а ожидалось одно из: {expected}",
+                &[("got", got.to_string()), ("expected", expected.join(", "))],
+            )
+        }
+        fn unclosed_brace(&self, at: &str) -> String {
+            substitute(
+                "в переводе не закрыта скобка: {at}",
+                &[("at", at.to_string())],
+            )
+        }
+    }
+
+    let ru = out_of_bounds.message(&Ru);
+    assert_eq!(ru, "диапазон 10..15 вне документа длиной 4");
+
+    // Английский каталог даёт английский текст, и это тот же самый.
+    assert_eq!(out_of_bounds.message(&En), text);
+
+    // Все три ошибки собираются через любой каталог.
+    let depth_err = Error::InvalidHistoryDepth { depth: 0 };
+    assert_eq!(
+        depth_err.message(&Ru),
+        "глубина истории 0 недопустима: от 1 до 8192"
+    );
+    let pool_err = Error::TreePoolExhausted {
+        capacity: 408,
+        depth: 100,
+    };
+    assert_eq!(
+        pool_err.message(&Ru),
+        "пул исчерпан: узлов 408, глубина 100"
+    );
+    assert!(pool_err.message(&En).contains("exhausted"));
+}
+
+#[test]
+fn bad_placeholder_names_what_came_and_what_was_expected() {
+    use crate::messages::substitute;
+    use crate::messages::{Messages, ParseError};
+
+    struct Ru;
+    impl Messages for Ru {
+        fn out_of_bounds(&self, _a: u32, _e: u32, _d: u32) -> String {
+            String::new()
+        }
+        fn invalid_history_depth(&self, _d: u32, _min: u32, _max: u32) -> String {
+            String::new()
+        }
+        fn tree_pool_exhausted(&self, _c: usize, _d: u32) -> String {
+            String::new()
+        }
+        fn bad_placeholder(&self, got: &str, expected: &[&str]) -> String {
+            substitute(
+                "в переводе имя {{{got}}}, а ожидалось одно из: {expected}",
+                &[("got", got.to_string()), ("expected", expected.join(", "))],
+            )
+        }
+        fn unclosed_brace(&self, at: &str) -> String {
+            substitute(
+                "в переводе не закрыта скобка: {at}",
+                &[("at", at.to_string())],
+            )
+        }
+    }
+
+    // Опечатка в имени: показываем, что пришло и чего ждали.
+    let unknown = ParseError::UnknownName {
+        got: "capasity",
+        expected: &["capacity", "depth"],
+    };
+    let en = unknown.text();
+    assert!(
+        en.contains("capasity"),
+        "в сообщении должно быть, что пришло: {en}"
+    );
+    assert!(
+        en.contains("capacity"),
+        "в сообщении должен быть ожидаемый список: {en}"
+    );
+    assert!(
+        en.contains("depth"),
+        "в сообщении должен быть ожидаемый список: {en}"
+    );
+
+    let ru = unknown.message(&Ru);
+    assert!(ru.contains("capasity"), "русский каталог: {ru}");
+    assert!(ru.contains("capacity"), "русский каталог: {ru}");
+
+    // Незакрытая скобка: показываем хвост начиная с неё.
+    let unclosed = ParseError::UnclosedBrace { at: "{capacity" };
+    assert!(
+        unclosed.text().contains("{capacity"),
+        "хвост должен быть виден"
+    );
+    assert!(unclosed.message(&Ru).contains("не закрыта"));
+}
+
+#[test]
+fn zero_and_overlarge_depth_report_clear_errors() {
     // Ноль бессмыслен: ни одна правка не поместилась бы. Ошибка, а не паника:
     // значение приходит из конфига, и редактор должен сказать почему.
     let err = Buffer::with_history_depth(b"", 0).expect_err("глубина 0 обязана отвергаться");
-    assert_eq!(err, crate::buffer::Error::InvalidHistoryDepth { depth: 0 });
+    assert_eq!(err, Error::InvalidHistoryDepth { depth: 0 });
     let text = err.to_string();
     assert!(
         text.contains('0'),
@@ -457,19 +607,19 @@ fn snapshot_clears_history_and_keeps_text() {
     assert_eq!(buf.read(), b"hello world!");
 
     let before = buf.snapshots_taken();
-    buf.snapshot();
+    buf.snapshot().unwrap();
     assert_eq!(buf.snapshots_taken(), before + 1);
     assert_eq!(buf.read(), b"hello world!");
     assert_eq!(buf.original(), b"hello world!");
     assert!(buf.undo_stack().is_empty());
     assert!(buf.redo_stack().is_empty());
-    assert!(buf.undo().is_none(), "истории после снапшота нет");
+    assert!(buf.undo().unwrap().is_none(), "истории после снапшота нет");
     check_tree(&buf, "после снапшота");
 
     // Дальше буфер работает как обычно.
     buf.insert(12, b"?").unwrap();
     assert_eq!(buf.read(), b"hello world!?");
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"hello world!");
 }
 
@@ -535,7 +685,9 @@ fn matches_reference_with_undo_redo_mix() {
             } else if roll == 8 && cursor > 0 {
                 // Отмена.
                 cursor -= 1;
-                buf.undo().expect("история должна была быть непустой");
+                buf.undo()
+                    .unwrap()
+                    .expect("история должна была быть непустой");
                 match &history[cursor] {
                     Op::Insert { pos, text: t } => text.replace_range(*pos..*pos + t.len(), ""),
                     Op::Delete { pos, removed } => {
@@ -544,7 +696,7 @@ fn matches_reference_with_undo_redo_mix() {
                 }
             } else if cursor < history.len() {
                 // Повтор.
-                buf.redo().expect("redo должен был быть доступен");
+                buf.redo().unwrap().expect("redo должен был быть доступен");
                 match &history[cursor] {
                     Op::Insert { pos, text: t } => {
                         text.insert_str(*pos, &String::from_utf8_lossy(t))
@@ -566,13 +718,13 @@ fn matches_reference_with_undo_redo_mix() {
         }
 
         // Финальная сверка: отменяем всё до старта и возвращаем обратно.
-        while buf.undo().is_some() {
+        while buf.undo().unwrap().is_some() {
             cursor -= 1;
         }
         assert_eq!(cursor, 0);
         assert_eq!(buf.read(), b"seed", "seed {seed}: не вернулся к началу");
 
-        while buf.redo().is_some() {
+        while buf.redo().unwrap().is_some() {
             cursor += 1;
         }
         assert_eq!(cursor, history.len());
@@ -590,10 +742,10 @@ fn replace_matches_delete_then_insert() {
     buf.replace(4, 5, b"slow").unwrap();
     assert_eq!(buf.read(), b"The slow brown fox");
     // Первая отмена убирает вставку — остаётся документ без "quick".
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"The  brown fox");
     // Вторая отмена возвращает удалённое.
-    buf.undo().unwrap();
+    buf.undo().unwrap().unwrap();
     assert_eq!(buf.read(), b"The quick brown fox");
     check_tree(&buf, "после replace и отмен");
 }

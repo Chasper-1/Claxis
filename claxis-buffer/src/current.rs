@@ -166,6 +166,8 @@ pub struct Current {
     free_head: u32,
     /// Следующий слот, который ещё ни разу не выдавался.
     next_unused: u32,
+    /// Глубина истории, под которую выделен пул. Только для сообщений.
+    depth: u32,
 }
 
 impl Current {
@@ -173,7 +175,11 @@ impl Current {
     ///
     /// Пул узлов выделяется на `node_capacity` узлов — ровно столько, сколько
     /// нужно при выбранной глубине истории.
-    pub fn from_original(original_len: u32, node_capacity: usize) -> Self {
+    pub fn from_original(
+        original_len: u32,
+        node_capacity: usize,
+        depth: u32,
+    ) -> Result<Self, crate::buffer::Error> {
         let mut cur = Self {
             nodes: vec![DEAD; node_capacity],
             root: NIL,
@@ -181,19 +187,19 @@ impl Current {
             leaves: 0,
             free_head: NIL,
             next_unused: 0,
+            depth,
         };
         if original_len > 0 {
-            let leaf = cur.make_leaf(Segment {
+            cur.root = cur.make_leaf(Segment {
                 record: ORIGINAL_ID,
                 pos: 0,
                 len: original_len,
                 off: 0,
-            });
-            cur.root = leaf;
+            })?;
             cur.leaves = 1;
             cur.len = original_len;
         }
-        cur
+        Ok(cur)
     }
 
     pub fn len(&self) -> u32 {
@@ -262,26 +268,29 @@ impl Current {
     /// следующий нетронутый слот. Аллокатор не участвует никогда.
     ///
     /// Пул не кончается: занято не больше `4 · depth + 1` узлов при
-    /// ёмкости `4 · depth + 8`.
-    fn alloc(&mut self, node: Node) -> u32 {
+    /// ёмкости `4 · depth + 8`. Исчерпание — ошибка расчёта, а не состояние
+    /// документа, поэтому это ошибка, а не паника.
+    fn alloc(&mut self, node: Node) -> Result<u32, crate::buffer::Error> {
         let idx = if self.free_head != NIL {
             let idx = self.free_head;
             self.free_head = self.nodes[idx as usize].a;
             idx
         } else {
             let idx = self.next_unused;
-            assert!(
-                (idx as usize) < self.nodes.len(),
-                "пул узлов исчерпан: дерево выросло сверх потолка"
-            );
+            if idx as usize >= self.nodes.len() {
+                return Err(crate::buffer::Error::TreePoolExhausted {
+                    capacity: self.nodes.len(),
+                    depth: self.depth,
+                });
+            }
             self.next_unused += 1;
             idx
         };
         self.nodes[idx as usize] = node;
-        idx
+        Ok(idx)
     }
 
-    fn make_leaf(&mut self, seg: Segment) -> u32 {
+    fn make_leaf(&mut self, seg: Segment) -> Result<u32, crate::buffer::Error> {
         self.leaves += 1;
         self.alloc(Node::leaf(seg))
     }
@@ -346,7 +355,7 @@ impl Current {
         }
     }
 
-    fn new_branch(&mut self, left: u32, right: u32) -> u32 {
+    fn new_branch(&mut self, left: u32, right: u32) -> Result<u32, crate::buffer::Error> {
         let len = self.len_of(left) + self.len_of(right);
         let height = 1 + self.height_of(left).max(self.height_of(right)) as u16;
         self.alloc(Node::branch(left, right, len, height))
@@ -367,12 +376,12 @@ impl Current {
     /// меньше, поэтому выход гарантирован. Склеивать обе стороны сразу нельзя
     /// — восстановленный узел получает ту же высоту, что был, и рекурсия
     /// закручивается.
-    fn join(&mut self, a: u32, b: u32) -> u32 {
+    fn join(&mut self, a: u32, b: u32) -> Result<u32, crate::buffer::Error> {
         if a == NIL {
-            return b;
+            return Ok(b);
         }
         if b == NIL {
-            return a;
+            return Ok(a);
         }
         let (ha, hb) = (self.height_of(a), self.height_of(b));
         if ha > hb + 1 {
@@ -381,39 +390,39 @@ impl Current {
             let (al, ar) = (na.left(), na.right());
             if self.height_of(ar) >= hb {
                 // Края хватает: приклеиваем b к правому краю a.
-                let new_ar = self.join(ar, b);
+                let new_ar = self.join(ar, b)?;
                 self.release(a);
-                self.new_branch(al, new_ar)
+                Ok(self.new_branch(al, new_ar)?)
             } else {
                 // Точка расхождения: режем b пополам.
                 let nb = self.nodes[b as usize];
                 debug_assert!(!nb.is_leaf());
                 let (bl, br) = (nb.left(), nb.right());
-                let new_l = self.join(ar, bl);
-                let mid = self.new_branch(new_l, br);
+                let new_l = self.join(ar, bl)?;
+                let mid = self.new_branch(new_l, br)?;
                 self.release(b);
-                let out = self.new_branch(al, mid);
+                let out = self.new_branch(al, mid)?;
                 self.release(a);
-                out
+                Ok(out)
             }
         } else if hb > ha + 1 {
             let nb = self.nodes[b as usize];
             debug_assert!(!nb.is_leaf());
             let (bl, br) = (nb.left(), nb.right());
             if self.height_of(bl) >= ha {
-                let new_bl = self.join(a, bl);
+                let new_bl = self.join(a, bl)?;
                 self.release(b);
-                self.new_branch(new_bl, br)
+                Ok(self.new_branch(new_bl, br)?)
             } else {
                 let na = self.nodes[a as usize];
                 debug_assert!(!na.is_leaf());
                 let (al, ar) = (na.left(), na.right());
-                let new_r = self.join(ar, bl);
-                let mid = self.new_branch(al, new_r);
+                let new_r = self.join(ar, bl)?;
+                let mid = self.new_branch(al, new_r)?;
                 self.release(a);
-                let out = self.new_branch(mid, br);
+                let out = self.new_branch(mid, br)?;
                 self.release(b);
-                out
+                Ok(out)
             }
         } else {
             self.new_branch(a, b)
@@ -423,22 +432,35 @@ impl Current {
     // ── вставка ───────────────────────────────────────────────────────────
 
     /// Вставка `ins_len` байт из `Added` начиная с `text_off` на позицию `pos`.
-    pub(crate) fn apply_insert(&mut self, pos: u32, text_off: u32, ins_len: u32, id: u32) {
+    pub(crate) fn apply_insert(
+        &mut self,
+        pos: u32,
+        text_off: u32,
+        ins_len: u32,
+        id: u32,
+    ) -> Result<(), crate::buffer::Error> {
         let leaf = self.make_leaf(Segment {
             record: id,
             pos,
             len: ins_len,
             off: text_off,
-        });
-        self.root = self.insert_rec(self.root, 0, pos, leaf);
+        })?;
+        self.root = self.insert_rec(self.root, 0, pos, leaf)?;
         self.len += ins_len;
+        Ok(())
     }
 
     /// Лист `new_leaf` вставляется на позицию `pos` внутри поддерева `idx`,
     /// лежащего от документа от `base`. Возвращает новое поддерево.
-    fn insert_rec(&mut self, idx: u32, base: u32, pos: u32, new_leaf: u32) -> u32 {
+    fn insert_rec(
+        &mut self,
+        idx: u32,
+        base: u32,
+        pos: u32,
+        new_leaf: u32,
+    ) -> Result<u32, crate::buffer::Error> {
         if idx == NIL {
-            return new_leaf;
+            return Ok(new_leaf);
         }
         let node = self.nodes[idx as usize];
         if node.is_leaf() {
@@ -456,24 +478,27 @@ impl Current {
                 pos: seg.pos,
                 len: off,
                 off: seg.off,
-            });
+            })?;
             let tail = self.make_leaf(Segment {
                 record: seg.record,
                 pos: seg.pos + off,
                 len: seg.len - off,
                 off: seg.off + off,
-            });
+            })?;
             self.leaves -= 1; // старый лист разрезан на два
             self.release(idx);
-            let mid = self.join(new_leaf, tail);
+            let mid = self.join(new_leaf, tail)?;
             self.join(head, mid)
         } else {
             let (left, right) = (node.left(), node.right());
             let left_len = self.len_of(left);
             let (nl, nr) = if pos < base + left_len {
-                (self.insert_rec(left, base, pos, new_leaf), right)
+                (self.insert_rec(left, base, pos, new_leaf)?, right)
             } else {
-                (left, self.insert_rec(right, base + left_len, pos, new_leaf))
+                (
+                    left,
+                    self.insert_rec(right, base + left_len, pos, new_leaf)?,
+                )
             };
             self.release(idx);
             self.join(nl, nr)
@@ -487,28 +512,35 @@ impl Current {
     /// Граничные листья обрезаются по границе диапазона, полностью покрытые
     /// поддеревья уходят в пул. Байты никуда не исчезают: они остаются в
     /// `Original` и `Added`, из `Current` уходит только ссылка.
-    pub(crate) fn apply_delete(&mut self, pos: u32, len: u32) {
+    pub(crate) fn apply_delete(&mut self, pos: u32, len: u32) -> Result<(), crate::buffer::Error> {
         if len == 0 || self.root == NIL {
-            return;
+            return Ok(());
         }
-        self.root = self.delete_rec(self.root, 0, pos, pos + len);
+        self.root = self.delete_rec(self.root, 0, pos, pos + len)?;
         self.len -= len;
+        Ok(())
     }
 
     /// Вырезает `start..end` из поддерева `idx`, лежащего от `base`.
-    fn delete_rec(&mut self, idx: u32, base: u32, start: u32, end: u32) -> u32 {
+    fn delete_rec(
+        &mut self,
+        idx: u32,
+        base: u32,
+        start: u32,
+        end: u32,
+    ) -> Result<u32, crate::buffer::Error> {
         if idx == NIL {
-            return NIL;
+            return Ok(NIL);
         }
         let node_end = base + self.len_of(idx);
         // Нет пересечения — поддерево остаётся как есть.
         if end <= base || start >= node_end {
-            return idx;
+            return Ok(idx);
         }
         // Полное покрытие — поддерево уходит целиком.
         if start <= base && end >= node_end {
             self.release_tree(idx);
-            return NIL;
+            return Ok(NIL);
         }
         let node = self.nodes[idx as usize];
         if node.is_leaf() {
@@ -522,7 +554,7 @@ impl Current {
                     pos: seg.pos,
                     len: off_start,
                     off: seg.off,
-                })
+                })?
             } else {
                 NIL
             };
@@ -532,7 +564,7 @@ impl Current {
                     pos: seg.pos + off_end,
                     len: seg.len - off_end,
                     off: seg.off + off_end,
-                })
+                })?
             } else {
                 NIL
             };
@@ -544,8 +576,8 @@ impl Current {
             // База правого ребёнка — конец левого. Считаем до рекурсии:
             // после спуска `left` может быть уже освобождён.
             let right_base = base + self.len_of(left);
-            let nl = self.delete_rec(left, base, start, end);
-            let nr = self.delete_rec(right, right_base, start, end);
+            let nl = self.delete_rec(left, base, start, end)?;
+            let nr = self.delete_rec(right, right_base, start, end)?;
             self.release(idx);
             self.join(nl, nr)
         }
@@ -556,7 +588,7 @@ impl Current {
         &mut self,
         original_len: u32,
         records: impl Iterator<Item = (u32, Record)>,
-    ) {
+    ) -> Result<(), crate::buffer::Error> {
         self.clear();
         if original_len > 0 {
             let leaf = self.make_leaf(Segment {
@@ -564,7 +596,7 @@ impl Current {
                 pos: 0,
                 len: original_len,
                 off: 0,
-            });
+            })?;
             self.root = leaf;
             self.leaves = 1;
             self.len = original_len;
@@ -572,16 +604,17 @@ impl Current {
         for (id, record) in records {
             match record {
                 Record::Insert { anchor, head, text } => {
-                    self.apply_insert(anchor, text, head - anchor, id);
+                    self.apply_insert(anchor, text, head - anchor, id)?;
                 }
                 Record::Delete { anchor, head } => {
                     let len = head - anchor;
                     if len > 0 {
-                        self.apply_delete(anchor, len);
+                        self.apply_delete(anchor, len)?;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     fn clear(&mut self) {
@@ -595,11 +628,15 @@ impl Current {
     ///
     /// Так снятие снапшота не трогает аллокатор: пул остаётся тот же самый,
     /// просто всё дерево схлопывается в один лист за O(1) плюс один узел.
-    pub(crate) fn reset_to_single_leaf(&mut self, seg: Segment) {
+    pub(crate) fn reset_to_single_leaf(
+        &mut self,
+        seg: Segment,
+    ) -> Result<(), crate::buffer::Error> {
         self.clear();
-        self.root = self.make_leaf(seg);
+        self.root = self.make_leaf(seg)?;
         self.leaves = 1;
         self.len = seg.len;
+        Ok(())
     }
 
     // ── чтение ────────────────────────────────────────────────────────────

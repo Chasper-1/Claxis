@@ -172,7 +172,7 @@ fn bench_snapshot() {
     let segs = b.segments().len();
     let start = Instant::now();
     for _ in 0..50 {
-        b.snapshot();
+        b.snapshot().unwrap();
     }
     let each = start.elapsed() / 50;
     println!(

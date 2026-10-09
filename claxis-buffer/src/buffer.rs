@@ -59,27 +59,48 @@ pub enum Error {
     InvalidHistoryDepth {
         depth: u32,
     },
+    /// Пул узлов дерева исчерпан.
+    ///
+    /// Случиться не должен: пул рассчитан на предел листьев при выбранной
+    /// глубине истории. Значит либо ошибка в расчёте, либо снапшот не был
+    /// сделан вовремя.
+    TreePoolExhausted {
+        capacity: usize,
+        depth: u32,
+    },
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Error {
+    /// Текст ошибки на языке каталога. По умолчанию — английский.
+    ///
+    /// Буфер отдаёт структуру и передаёт каталогу значения. Как они попадут в
+    /// текст — дело каталога: в конфиге сообщение пишется целиком, с
+    /// подстановками в тех местах, куда их поставил переводчик.
+    pub fn message(&self, messages: &dyn crate::messages::Messages) -> String {
         match self {
             Error::OutOfBounds {
                 anchor,
                 len,
                 doc_len,
-            } => {
-                write!(
-                    f,
-                    "range {anchor}..{} is outside the document of length {doc_len}",
-                    anchor.saturating_add(*len)
-                )
+            } => messages.out_of_bounds(*anchor, anchor.saturating_add(*len), *doc_len),
+            Error::InvalidHistoryDepth { depth } => {
+                messages.invalid_history_depth(*depth, 1, MAX_DEPTH)
             }
-            Error::InvalidHistoryDepth { depth } => write!(
-                f,
-                "глубина истории {depth} недопустима: допустимо от 1 до {MAX_DEPTH} записей"
-            ),
+            Error::TreePoolExhausted { capacity, depth } => {
+                messages.tree_pool_exhausted(*capacity, *depth)
+            }
         }
+    }
+
+    /// Текст ошибки на языке по умолчанию.
+    pub fn text(&self) -> String {
+        self.message(&crate::messages::En)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text())
     }
 }
 
@@ -98,8 +119,12 @@ pub struct Buffer {
 
 impl Buffer {
     /// Буфер с глубиной истории по умолчанию — полный блок в 8192 записи.
+    ///
+    /// Глубина здесь константа, известная корректной, поэтому проверки и
+    /// `Result` нет: паникой было бы сообщать о том, что невозможно.
     pub fn new(original: impl AsRef<[u8]>) -> Self {
-        Self::with_history_depth(original, DEFAULT_DEPTH).expect("глубина по умолчанию корректна")
+        Self::build(original.as_ref(), DEFAULT_DEPTH)
+            .expect("глубина по умолчанию корректна по построению")
     }
 
     /// Буфер с заданной глубиной истории.
@@ -114,12 +139,18 @@ impl Buffer {
         if !(1..=MAX_DEPTH).contains(&depth) {
             return Err(Error::InvalidHistoryDepth { depth });
         }
-        let original = original.as_ref().to_vec();
+        Self::build(original.as_ref(), depth)
+    }
+
+    /// Построить буфер с уже проверенной глубиной.
+    fn build(original: &[u8], depth: u32) -> Result<Self, Error> {
+        let original = original.to_vec();
         let arena = Arena::new(depth);
         let current = Current::from_original(
             original.len() as u32,
             crate::current::pool_capacity_for(depth),
-        );
+            depth,
+        )?;
         Ok(Self {
             original,
             added: Vec::new(),
@@ -215,13 +246,13 @@ impl Buffer {
         if data.is_empty() {
             return Ok(());
         }
-        self.snapshot_if_needed();
+        self.snapshot_if_needed()?;
         self.discard_redo_with_cleanup();
         let text = self.added.len() as u32;
         self.added.extend_from_slice(data);
         let len = data.len() as u32;
         let id = self.arena.push(Record::insert(anchor, len, text));
-        self.current.apply_insert(anchor, text, len, id);
+        self.current.apply_insert(anchor, text, len, id)?;
         Ok(())
     }
 
@@ -231,10 +262,10 @@ impl Buffer {
         if len == 0 {
             return Ok(());
         }
-        self.snapshot_if_needed();
+        self.snapshot_if_needed()?;
         self.discard_redo_with_cleanup();
         let _ = self.arena.push(Record::delete(anchor, len));
-        self.current.apply_delete(anchor, len);
+        self.current.apply_delete(anchor, len)?;
         Ok(())
     }
 
@@ -247,10 +278,11 @@ impl Buffer {
     ///
     /// Так память ограничена сверху: записей не больше глубины, а листьев не
     /// больше `2 · глубина + 1`, и пул узлов выделен ровно под это.
-    fn snapshot_if_needed(&mut self) {
+    fn snapshot_if_needed(&mut self) -> Result<(), Error> {
         if self.arena.remaining_records() == 0 {
-            self.snapshot();
+            self.snapshot()?;
         }
+        Ok(())
     }
 
     /// Замена — удаление и вставка, никакой отдельной модели.
@@ -260,19 +292,23 @@ impl Buffer {
     }
 
     /// Отмена: верхняя запись `undo` уходит в `redo`, `Current` пересобирается.
-    pub fn undo(&mut self) -> Option<RecordId> {
-        let id = self.arena.undo()?;
-        self.rebuild();
-        self.snapshot_if_needed();
-        Some(id)
+    pub fn undo(&mut self) -> Result<Option<RecordId>, Error> {
+        let Some(id) = self.arena.undo() else {
+            return Ok(None);
+        };
+        self.rebuild()?;
+        self.snapshot_if_needed()?;
+        Ok(Some(id))
     }
 
     /// Повтор отменённой правки: запись возвращается из `redo` в `undo`.
-    pub fn redo(&mut self) -> Option<RecordId> {
-        let id = self.arena.redo()?;
-        self.rebuild();
-        self.snapshot_if_needed();
-        Some(id)
+    pub fn redo(&mut self) -> Result<Option<RecordId>, Error> {
+        let Some(id) = self.arena.redo() else {
+            return Ok(None);
+        };
+        self.rebuild()?;
+        self.snapshot_if_needed()?;
+        Ok(Some(id))
     }
 
     /// Сколько раз буфер брал снапшот — для бенчей и диагностики.
@@ -287,7 +323,7 @@ impl Buffer {
     }
 
     /// Снапшот: текст из `Current` становится новым `Original`, всё обнуляется.
-    pub fn snapshot(&mut self) {
+    pub fn snapshot(&mut self) -> Result<(), Error> {
         let text = self.read();
         self.original = text;
         self.added.clear();
@@ -297,18 +333,20 @@ impl Buffer {
             pos: 0,
             len: self.original.len() as u32,
             off: 0,
-        });
+        })?;
         self.snapshots += 1;
+        Ok(())
     }
 
     /// Пересборка `Current` линейным проходом по активным записям `undo`.
-    fn rebuild(&mut self) {
+    fn rebuild(&mut self) -> Result<(), Error> {
         let records = self
             .arena
             .undo_stack()
             .iter()
             .filter_map(|&id| self.arena.get(id).map(|r| (id, *r)));
-        self.current.rebuild(self.original.len() as u32, records);
+        self.current.rebuild(self.original.len() as u32, records)?;
+        Ok(())
     }
 
     /// Новая правка при непустом `redo`: стек отменённых записей очищается.
