@@ -1,5 +1,5 @@
 [workspace]
-members = ["claxis-buffer"]
+members = ["claxis-buffer", "claxis-store"]
 
 [package]
 name = "Claxis"
@@ -8,3 +8,4 @@ edition = "2024"
 
 [dependencies]
 claxis-buffer = { path = "claxis-buffer" }
+claxis-store = { path = "claxis-store" }

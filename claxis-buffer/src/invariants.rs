@@ -460,6 +460,56 @@ fn messages_are_localizable_and_default_to_english() {
     assert!(pool_err.message(&En).contains("exhausted"));
 }
 
+// ── значения по умолчанию ─────────────────────────────────────────────
+
+#[test]
+fn every_default_is_present_and_documented() {
+    use crate::defaults::{buffer, snapshots};
+
+    // Ключ не пустой, комментарий полный — у всех настроек.
+    for (name, key, comment) in [
+        (
+            "Snapshots.keep",
+            snapshots::KEEP.key,
+            snapshots::KEEP.comment,
+        ),
+        (
+            "Snapshots.persist",
+            snapshots::PERSIST.key,
+            snapshots::PERSIST.comment,
+        ),
+        (
+            "Buffer.history_depth",
+            buffer::HISTORY_DEPTH.key,
+            buffer::HISTORY_DEPTH.comment,
+        ),
+    ] {
+        assert!(!key.is_empty(), "{name}: ключ не может быть пустым");
+        assert!(
+            !comment.is_empty(),
+            "{name}: без комментария непонятно, что это"
+        );
+        assert!(
+            comment.contains('.'),
+            "{name}: комментарий должен быть полным"
+        );
+    }
+
+    // Какая настройка подключена, а какая задумана — проверяется при компиляции.
+    const _: () = assert!(snapshots::KEEP.active);
+    const _: () = assert!(!snapshots::PERSIST.active);
+    const _: () = assert!(buffer::HISTORY_DEPTH.active);
+    const _: () = assert!(!buffer::MAX_HISTORY_DEPTH.active);
+
+    // Значения по умолчанию согласованы с настоящими ограничениями.
+    assert_eq!(snapshots::KEEP.value, 3, "по умолчанию три снапшота");
+    assert_eq!(buffer::HISTORY_DEPTH.value, crate::DEFAULT_DEPTH);
+    const _: () = assert!(
+        buffer::HISTORY_DEPTH.value <= crate::MAX_DEPTH,
+        "глубина по умолчанию должна быть в допустимых пределах"
+    );
+}
+
 #[test]
 fn bad_placeholder_names_what_came_and_what_was_expected() {
     use crate::messages::substitute;
