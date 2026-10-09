@@ -127,6 +127,16 @@ impl ReadCtx<'_> {
     }
 }
 
+/// Потолок числа сегментов в дереве. Достигнут — берётся снапшот (§11).
+pub const MAX_LEAVES: u32 = 16 * 1024;
+
+/// Ёмкость пула узлов.
+///
+/// Дерево полное двоичное: при `n` листьях внутренних узлов ровно `n − 1`,
+/// всего `2n − 1`. Плюс запас на несколько узлов, которые успевают появиться
+/// между правкой и проверкой порога.
+const NODE_CAPACITY: usize = 2 * MAX_LEAVES as usize + 8;
+
 /// `Current` — кеш: дерево сегментов в порядке документа.
 ///
 /// Каждый сегмент несёт живой текст в порядке документа. Байтов не хранит:
@@ -137,9 +147,13 @@ impl ReadCtx<'_> {
 /// Дерево сбалансировано по высоте. Вставка и удаление не двигают остальные
 /// сегменты: меняется только путь от корня к точке правки, поэтому обе
 /// операции стоят O(log n) независимо от размера документа.
+///
+/// Пул узлов выделяется **один раз** на весь срок жизни и больше не растёт:
+/// ёмкость известна из потолка листьев, а список свободных узлов хранится в
+/// самих освобождённых узлах. В горячем пути аллокаций нет вообще.
 #[derive(Debug)]
 pub struct Current {
-    /// Пул узлов. Индекс узла — его ссылка.
+    /// Пул узлов фиксированного размера. Индекс узла — его ссылка.
     nodes: Vec<Node>,
     /// Корень дерева.
     root: u32,
@@ -147,19 +161,22 @@ pub struct Current {
     len: u32,
     /// Число живых сегментов (листьев).
     leaves: u32,
-    /// Освобождённые узлы для повторного использования.
-    free: Vec<u32>,
+    /// Голова списка свободных узлов. Список хранится в самих узлах.
+    free_head: u32,
+    /// Следующий слот, который ещё ни разу не выдавался.
+    next_unused: u32,
 }
 
 impl Current {
     /// Единое состояние: один лист на весь исходный текст.
-    pub fn from_original(original_len: u32, node_capacity: usize) -> Self {
+    pub fn from_original(original_len: u32) -> Self {
         let mut cur = Self {
-            nodes: Vec::with_capacity(node_capacity),
+            nodes: vec![DEAD; NODE_CAPACITY],
             root: NIL,
             len: 0,
             leaves: 0,
-            free: Vec::new(),
+            free_head: NIL,
+            next_unused: 0,
         };
         if original_len > 0 {
             let leaf = cur.make_leaf(Segment {
@@ -193,24 +210,36 @@ impl Current {
         self.height_of(self.root)
     }
 
-    /// Узлов в пуле (занятых и свободных).
+    /// Занятых узлов — тех, что сейчас входят в дерево.
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        let mut chained = 0;
+        let mut idx = self.free_head;
+        while idx != NIL {
+            chained += 1;
+            idx = self.nodes[idx as usize].a;
+        }
+        self.next_unused as usize - chained
     }
 
     /// Мест в пуле под узлы.
     pub fn node_capacity(&self) -> usize {
-        self.nodes.capacity()
+        self.nodes.len()
     }
 
     /// Свободных узлов в пуле.
     pub fn free_count(&self) -> usize {
-        self.free.len()
+        let mut n = 0;
+        let mut idx = self.free_head;
+        while idx != NIL {
+            n += 1;
+            idx = self.nodes[idx as usize].a;
+        }
+        self.nodes.len() - self.next_unused as usize + n
     }
 
-    /// Мест в пуле свободных узлов.
-    pub fn free_capacity(&self) -> usize {
-        self.free.capacity()
+    /// Ёмкость пула узлов — она постоянна.
+    pub const fn node_capacity_fixed() -> usize {
+        NODE_CAPACITY
     }
 
     /// Размер узла в байтах.
@@ -225,14 +254,27 @@ impl Current {
 
     // ── пул узлов ────────────────────────────────────────────────────────
 
+    /// Взять узел. Сначала переиспользуем освобождённые, иначе берём
+    /// следующий нетронутый слот. Аллокатор не участвует никогда.
+    ///
+    /// Пул не кончается: занято не больше `2 · MAX_LEAVES − 1` узлов при
+    /// ёмкости `2 · MAX_LEAVES + 8`.
     fn alloc(&mut self, node: Node) -> u32 {
-        if let Some(idx) = self.free.pop() {
-            self.nodes[idx as usize] = node;
+        let idx = if self.free_head != NIL {
+            let idx = self.free_head;
+            self.free_head = self.nodes[idx as usize].a;
             idx
         } else {
-            self.nodes.push(node);
-            (self.nodes.len() - 1) as u32
-        }
+            let idx = self.next_unused;
+            assert!(
+                (idx as usize) < self.nodes.len(),
+                "пул узлов исчерпан: дерево выросло сверх потолка"
+            );
+            self.next_unused += 1;
+            idx
+        };
+        self.nodes[idx as usize] = node;
+        idx
     }
 
     fn make_leaf(&mut self, seg: Segment) -> u32 {
@@ -241,9 +283,27 @@ impl Current {
     }
 
     /// Вернуть один узел в пул. Поддерево не освобождается — только узел.
+    ///
+    /// Список свободных хранится в самих освобождённых узлах: в поле `a`
+    /// лежит индекс следующего. Отдельного векла нет.
     fn release(&mut self, idx: u32) {
-        self.nodes[idx as usize] = DEAD;
-        self.free.push(idx);
+        self.nodes[idx as usize] = Node {
+            a: self.free_head,
+            b: 0,
+            len: 0,
+            c: 0,
+        };
+        self.free_head = idx;
+    }
+
+    /// Вернуть пул в исходное состояние за O(1).
+    ///
+    /// Содержимое узлов переписывать не нужно: нетронутые слоты и так
+    /// свободны, а слоты прежней цепочки будут перезаписаны при выделении.
+    /// Так снятие снапшота не проходит линейно по всему пулу.
+    fn reset_pool(&mut self) {
+        self.free_head = NIL;
+        self.next_unused = 0;
     }
 
     /// Вернуть узел со всем поддеревом в пул.
@@ -521,11 +581,21 @@ impl Current {
     }
 
     fn clear(&mut self) {
-        self.nodes.clear();
-        self.free.clear();
         self.root = NIL;
         self.len = 0;
         self.leaves = 0;
+        self.reset_pool();
+    }
+
+    /// Сбросить дерево до одного листа на весь документ, **не перевыделяя пул**.
+    ///
+    /// Так снятие снапшота не трогает аллокатор: пул остаётся тот же самый,
+    /// просто всё дерево схлопывается в один лист за O(1) плюс один узел.
+    pub(crate) fn reset_to_single_leaf(&mut self, seg: Segment) {
+        self.clear();
+        self.root = self.make_leaf(seg);
+        self.leaves = 1;
+        self.len = seg.len;
     }
 
     // ── чтение ────────────────────────────────────────────────────────────
@@ -603,10 +673,13 @@ impl Current {
 
     /// Отладочная проверка: нет ли в дереве повторных индексов, какова
     /// настоящая глубина и не указывает ли живой узел на освобождённый.
+    #[cfg(test)]
     pub fn debug_walk(&self) -> (usize, usize, Option<u32>) {
         let mut is_free = vec![false; self.nodes.len()];
-        for &idx in &self.free {
-            is_free[idx as usize] = true;
+        let mut free = self.free_head;
+        while free != NIL {
+            is_free[free as usize] = true;
+            free = self.nodes[free as usize].a;
         }
         let mut seen = vec![false; self.nodes.len()];
         let mut count = 0usize;

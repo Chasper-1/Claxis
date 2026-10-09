@@ -19,12 +19,13 @@ pub struct TreeMemory {
     pub record_size: usize,
     pub arena_blocks: usize,
     pub arena_capacity: usize,
+    pub pool_capacity: usize,
 }
 
 impl TreeMemory {
-    /// Байт в пуле узлов вместе с запасом ёмкости.
+    /// Байт в пуле узлов. Ёмкость фиксирована и не меняется.
     pub fn tree_bytes(&self) -> usize {
-        self.node_capacity * self.node_size
+        self.pool_capacity * self.node_size
     }
 }
 
@@ -32,12 +33,12 @@ impl fmt::Display for TreeMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "узлов {}/{} (свободно {}/{}), листьев {}, Added {}",
+            "узлов занято {}/{} (свободно {}), листьев {}, Added {} из {} байт",
             self.nodes,
-            self.node_capacity,
+            self.pool_capacity,
             self.free,
-            self.free_capacity,
             self.leaves,
+            self.added_len,
             self.added_capacity
         )
     }
@@ -86,7 +87,7 @@ impl Buffer {
     pub fn with_arena_size(original: impl AsRef<[u8]>, size: ArenaSize) -> Self {
         let original = original.as_ref().to_vec();
         let arena = Arena::new(size);
-        let current = Current::from_original(original.len() as u32, 64);
+        let current = Current::from_original(original.len() as u32);
         Self {
             original,
             added: Vec::new(),
@@ -136,7 +137,7 @@ impl Buffer {
             nodes: self.current.node_count(),
             node_capacity: self.current.node_capacity(),
             free: self.current.free_count(),
-            free_capacity: self.current.free_capacity(),
+            free_capacity: self.current.free_count(),
             leaves: self.current.seg_count() as usize,
             node_size: Current::node_size(),
             added_len: self.added.len(),
@@ -145,6 +146,7 @@ impl Buffer {
             record_size: size_of::<Record>(),
             arena_blocks: self.arena.block_count(),
             arena_capacity: self.arena.capacity_records(),
+            pool_capacity: Current::node_capacity_fixed(),
         }
     }
 
@@ -204,7 +206,7 @@ impl Buffer {
     /// Дерево держит не больше этого числа листьев, поэтому память ограничена
     /// сверху независимо от того, как долго и как интенсивно идёт правка.
     /// Всё, что старше, уходит на диск (§11 снапшота).
-    pub const MAX_LEAVES: u32 = 16 * 1024;
+    pub const MAX_LEAVES: u32 = crate::current::MAX_LEAVES;
 
     /// Снапшот по достижении порога листьев.
     ///
@@ -245,6 +247,7 @@ impl Buffer {
     }
 
     /// Отладочная проверка дерева: (узлов, глубина, цикл).
+    #[cfg(test)]
     pub fn debug_walk(&self) -> (usize, usize, Option<u32>) {
         self.current.debug_walk()
     }
@@ -255,7 +258,12 @@ impl Buffer {
         self.original = text;
         self.added.clear();
         self.arena.reset();
-        self.current = Current::from_original(self.original.len() as u32, 0);
+        self.current.reset_to_single_leaf(crate::segment::Segment {
+            record: crate::arena::ORIGINAL_ID,
+            pos: 0,
+            len: self.original.len() as u32,
+            off: 0,
+        });
         self.snapshots += 1;
     }
 

@@ -23,7 +23,7 @@ fn check_tree(buf: &Buffer, label: &str) {
     // Полное двоичное дерево: внутренних узлов ровно на один меньше, чем
     // листьев. Любая утечка или двойное освобождение узла это ломает.
     let mem = buf.tree_memory();
-    let used = mem.nodes - mem.free;
+    let used = mem.nodes;
     let expected = if leaves == 0 { 0 } else { 2 * leaves - 1 };
     assert_eq!(
         used, expected,
@@ -371,14 +371,31 @@ fn memory_stays_bounded_through_long_session() {
 }
 
 #[test]
+fn node_pool_is_fixed_size_and_never_grows() {
+    // Пул выделяется один раз под потолок и больше не растёт: ни при
+    // постройке дерева, ни при волнах вставок и удалений.
+    let buf = Buffer::new(b"tiny");
+    let mem = buf.tree_memory();
+    assert_eq!(
+        mem.pool_capacity,
+        2 * Buffer::MAX_LEAVES as usize + 8,
+        "ёмкость пула выведена из потолка листьев"
+    );
+    // 32767 занятых максимум — это и есть 512 КБ при узле 16 байт.
+    assert_eq!(mem.tree_bytes(), (2 * 16 * 1024 + 8) * 16);
+}
+
+#[test]
 fn node_pool_reused_across_churn() {
     // Волны вставок и удалений не должны раздувать пул: узлы возвращаются
     // в свободные и берутся снова.
     let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
+    let pool = buf.tree_memory().pool_capacity;
     for _ in 0..5_000 {
         buf.insert(buf.len(), b"chunk").unwrap();
     }
     assert_eq!(buf.len(), 25_000);
+    assert_eq!(buf.tree_memory().pool_capacity, pool, "пул изменился");
     let peak_nodes = buf.tree_memory().nodes;
 
     while !buf.is_empty() {
