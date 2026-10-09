@@ -1,44 +1,11 @@
-use std::mem::size_of;
-
-/// Размер одного блока арены в байтах. Записи не теряются: когда блок
-/// переполняется, выделяется следующий.
+/// Максимальная глубина истории в записях — 128 КБ, 8192 записей по 16 байт.
 ///
-/// Размеры:
-///
-/// * от 32КБ до 128КБ — шаг 32КБ;
-/// * от 192КБ до 512КБ — шаг 64КБ;
-/// * от 640КБ до 1МБ — шаг 128КБ.
-///
-/// 32КБ — минимальный размер, это 2К записей (запись — 16 байт), для самых
-/// экономных. 1МБ — максимум.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArenaSize {
-    Kb32 = 32 * 1024,
-    Kb64 = 64 * 1024,
-    Kb96 = 96 * 1024,
-    Kb128 = 128 * 1024,
-    Kb192 = 192 * 1024,
-    Kb256 = 256 * 1024,
-    Kb320 = 320 * 1024,
-    Kb384 = 384 * 1024,
-    Kb448 = 448 * 1024,
-    Kb512 = 512 * 1024,
-    Kb640 = 640 * 1024,
-    Kb768 = 768 * 1024,
-    Kb896 = 896 * 1024,
-    Kb1024 = 1024 * 1024,
-}
+/// Выбор размера арены отдельной настройкой не делается: держать больше 8192
+/// записей незачем. Всё, что не помещается, уходит на диск снапшотами (§11).
+pub const MAX_DEPTH: u32 = 8 * 1024;
 
-impl ArenaSize {
-    pub const fn bytes(self) -> usize {
-        self as usize
-    }
-
-    /// Сколько записей помещается в блок этого размера.
-    pub const fn records(self) -> usize {
-        self.bytes() / size_of::<Record>()
-    }
-}
+/// Глубина истории по умолчанию: полный блок, 128 КБ.
+pub const DEFAULT_DEPTH: u32 = MAX_DEPTH;
 
 /// Запись правки. Операция несётся самой записью — отдельного поля типа нет.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -124,13 +91,19 @@ pub struct Arena {
 
 impl Default for Arena {
     fn default() -> Self {
-        Self::new(ArenaSize::Kb128)
+        Self::new(DEFAULT_DEPTH)
     }
 }
 
 impl Arena {
-    pub fn new(size: ArenaSize) -> Self {
-        let capacity = size.records();
+    /// Арена глубиной в `depth` записей.
+    ///
+    /// Глубина — сколько записей живёт в памяти до снапшота. Проверку диапазона
+    /// делает вызывающий: буфер возвращает ошибку, а не паникует, потому что
+    /// значение приходит из конфига.
+    pub fn new(depth: u32) -> Self {
+        debug_assert!((1..=MAX_DEPTH).contains(&depth));
+        let capacity = depth as usize;
         // Первый слот первого блока зарезервирован под Original (ORIGINAL_ID)
         // — под него кладётся пустышка, и он не используется.
         let mut blocks = vec![Vec::with_capacity(capacity)];
@@ -138,9 +111,14 @@ impl Arena {
         Self {
             blocks,
             capacity,
-            undo: Vec::new(),
+            undo: Vec::with_capacity(capacity),
             redo: Vec::new(),
         }
+    }
+
+    /// Глубина истории в записях — сколько записей помещается без снапшота.
+    pub fn depth(&self) -> usize {
+        self.capacity
     }
 
     /// Кладёт запись в текущий блок (новый, если тот полон) и в `undo`.
@@ -226,10 +204,17 @@ impl Arena {
     }
 
     /// Полный сброс после снапшота: блоки и стеки очищаются.
+    ///
+    /// Первый блок **переиспользуется**: он держит в себе буфер на
+    /// `capacity` записей, и выбрасывать его с последующим новым выделением
+    /// незачем — снапшот берётся часто, а лишние `free`/`malloc` на 128КБ
+    /// ничего не дают. Дополнительные блоки освобождаются: держать их память
+    /// после схлопывания незачем.
     pub fn reset(&mut self) {
-        self.blocks.clear();
-        self.blocks.push(Vec::with_capacity(self.capacity));
-        self.blocks[0].push(Record::Delete { anchor: 0, head: 0 });
+        self.blocks.truncate(1);
+        let first = &mut self.blocks[0];
+        first.clear();
+        first.push(Record::Delete { anchor: 0, head: 0 });
         self.undo.clear();
         self.redo.clear();
     }

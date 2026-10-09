@@ -5,7 +5,7 @@
 //! частичного чтения с полным, поведение арены на границах блоков и
 //! соответствие эталону на длинных случайных последовательностях.
 
-use crate::arena::{ArenaSize, Record, RecordId};
+use crate::arena::{MAX_DEPTH, Record, RecordId};
 use crate::buffer::Buffer;
 
 /// Короткий конструктор буфера из строки.
@@ -256,72 +256,66 @@ fn insert_and_delete_at_every_boundary() {
 // ── арена ────────────────────────────────────────────────────────────
 
 #[test]
-fn arena_size_ladder_values_and_records() {
-    let ladder = [
-        (ArenaSize::Kb32, 2_048usize),
-        (ArenaSize::Kb64, 4_096),
-        (ArenaSize::Kb96, 6_144),
-        (ArenaSize::Kb128, 8_192),
-        (ArenaSize::Kb192, 12_288),
-        (ArenaSize::Kb256, 16_384),
-        (ArenaSize::Kb320, 20_480),
-        (ArenaSize::Kb384, 24_576),
-        (ArenaSize::Kb448, 28_672),
-        (ArenaSize::Kb512, 32_768),
-        (ArenaSize::Kb640, 40_960),
-        (ArenaSize::Kb768, 49_152),
-        (ArenaSize::Kb896, 57_344),
-        (ArenaSize::Kb1024, 65_536),
-    ];
-    for (size, records) in ladder {
-        assert_eq!(size.records(), records, "{size:?}: неверное число записей");
-        assert_eq!(size.records() * size_of_record(), size.bytes());
-    }
-    // Лесенка строго возрастает, максимум — 1 МБ.
-    let mut prev = 0;
-    for (size, _) in ladder {
-        assert!(
-            size.bytes() > prev,
-            "{size:?}: должен быть больше предыдущего"
-        );
-        prev = size.bytes();
-    }
-    assert_eq!(prev, 1024 * 1024);
-}
-
-fn size_of_record() -> usize {
-    core::mem::size_of::<Record>()
-}
-
-#[test]
-fn record_ids_are_stable_and_unique_across_blocks() {
-    // Много записей в малой арене: блоков несколько, идентификаторы не
-    // должны ни повторяться, ни уезжать после добавления новых блоков.
-    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb32);
+fn arena_chains_blocks_without_losing_records() {
+    // Арена не теряет записи: блок переполнен — выделяется следующий. Через
+    // буфер этого не увидеть, потому что буфер снимает снапшот ровно тогда,
+    // когда глубина исчерпана, и до второго блока не доходит. Поэтому здесь
+    // арена проверяется напрямую.
+    let mut arena = crate::arena::Arena::new(64);
     let mut ids: Vec<RecordId> = Vec::new();
-    for i in 0..3_000u32 {
-        buf.insert(i, b"x").unwrap();
-        ids.push(*buf.undo_stack().last().unwrap());
+    for i in 0..1_000u32 {
+        ids.push(arena.push(Record::insert(i, 1, i)));
     }
+    assert!(arena.block_count() > 1, "блоков {}", arena.block_count());
+    assert_eq!(arena.len(), 1_000, "записи теряться не должны");
+
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), ids.len(), "идентификаторы повторились");
 
-    let blocks = buf.tree_memory().arena_blocks;
-    assert!(
-        blocks > 1,
-        "арена должна была разбиться на блоки, блоков {blocks}"
-    );
-
-    // Все записи читаются и дают ожидаемые диапазоны.
-    for &id in &ids {
-        let rec = buf.record(id).expect("запись пропала");
-        let _ = rec.anchor();
-        let _ = rec.head();
-        assert_eq!(rec.len(), rec.anchor().abs_diff(rec.head()));
+    // Все записи читаются и адреса согласованы.
+    for (i, &id) in ids.iter().enumerate() {
+        let rec = arena.get(id).expect("запись пропала");
+        assert_eq!(rec.anchor(), i as u32);
+        assert_eq!(rec.len(), 1);
     }
-    check_tree(&buf, "после 3000 вставок через несколько блоков");
+
+    // Сброс возвращает арену к первому блоку, переиспользуя его буфер.
+    arena.reset();
+    assert_eq!(arena.len(), 0);
+    assert!(arena.undo_stack().is_empty());
+    assert_eq!(
+        arena.push(Record::delete(0, 1)),
+        1,
+        "нумерация начинается заново"
+    );
+}
+
+#[test]
+fn record_ids_restart_after_snapshot() {
+    // Снапшот очищает арену, поэтому идентификаторы начинаются заново. Это
+    // безопасно: дерево схлопнуто в новый Original и ссылок на старые
+    // записи не остаётся.
+    let mut buf = Buffer::with_history_depth(b"", 100).unwrap();
+    let mut saw_restart = false;
+    let mut prev = 0u32;
+    for _ in 0..600 {
+        buf.insert(buf.len(), b"x").unwrap();
+        let id = *buf.undo_stack().last().unwrap();
+        if id <= prev {
+            saw_restart = true;
+        }
+        prev = id;
+        assert!(buf.undo_stack().len() <= 100, "глубина превышена");
+    }
+    assert!(
+        saw_restart,
+        "после снапшота нумерация обязана начаться заново"
+    );
+    // Текст при этом цел.
+    assert_eq!(buf.read().len(), 600);
+    check_tree(&buf, "после серии снапшотов");
 }
 
 #[test]
@@ -349,47 +343,88 @@ fn record_len_and_text_accessors() {
 // ── снапшот и память ─────────────────────────────────────────────────
 
 #[test]
-fn memory_stays_bounded_through_long_session() {
-    // Долгая сессия: листья не должны уходить за порог ни разу.
-    let limit = Buffer::MAX_LEAVES as usize;
-    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
-    let mut pos = 0u32;
-    for i in 0..60_000 {
-        pos = (pos + 13) % buf.len().max(1);
-        buf.insert(pos, b"payload").unwrap();
-        if i % 3 == 0 && buf.len() > 20 {
-            buf.delete(pos, 3).unwrap();
+fn history_depth_bounds_records_and_leaves() {
+    // Листья ничем не ограничены, ограничена глубина истории. Записей в
+    // арене не может быть больше глубины, а листьев — больше `2 · depth + 1`.
+    for depth in [1u32, 7, 100, 1_000] {
+        let mut buf = Buffer::with_history_depth(b"", depth).unwrap();
+        let mut pos = 0u32;
+        for i in 0..(depth as usize * 5) {
+            pos = (pos + 13) % buf.len().max(1);
+            buf.insert(pos, b"payload").unwrap();
+            if i % 3 == 0 && buf.len() > 20 {
+                buf.delete(pos, 3).unwrap();
+            }
+            assert!(
+                buf.undo_stack().len() <= depth as usize,
+                "глубина {depth}: записей {} при глубине {depth}",
+                buf.undo_stack().len()
+            );
+            assert!(
+                buf.segments().len() <= 2 * depth as usize + 1,
+                "глубина {depth}: листьев {} при пределе {}",
+                buf.segments().len(),
+                2 * depth as usize + 1
+            );
         }
-        let leaves = buf.segments().len();
-        assert!(
-            leaves <= limit,
-            "на шаге {i} листьев {leaves} при пороге {limit}"
-        );
+        assert!(buf.snapshots_taken() > 0, "снапшот обязан был сработать");
+        check_tree(&buf, &format!("глубина {depth}"));
     }
-    assert!(buf.snapshots_taken() > 0, "снапшот обязан был сработать");
-    check_tree(&buf, "после длинной сессии");
+}
+
+#[test]
+fn invalid_history_depth_gives_clear_error() {
+    // Ноль бессмыслен: ни одна правка не поместилась бы. Ошибка, а не паника:
+    // значение приходит из конфига, и редактор должен сказать почему.
+    let err = Buffer::with_history_depth(b"", 0).expect_err("глубина 0 обязана отвергаться");
+    assert_eq!(err, crate::buffer::Error::InvalidHistoryDepth { depth: 0 });
+    let text = err.to_string();
+    assert!(
+        text.contains('0'),
+        "в сообщении должно быть само значение: {text}"
+    );
+    assert!(
+        text.contains('1'),
+        "в сообщении должен быть диапазон: {text}"
+    );
+
+    // Выше предела — тоже ошибка, а не паника.
+    let over = MAX_DEPTH + 1;
+    let err = Buffer::with_history_depth(b"", over).expect_err("слишком глубокая история");
+    assert_eq!(
+        err,
+        crate::buffer::Error::InvalidHistoryDepth { depth: over }
+    );
+
+    // Границы диапазона принимаются.
+    assert!(Buffer::with_history_depth(b"", 1).is_ok());
+    assert!(Buffer::with_history_depth(b"", MAX_DEPTH).is_ok());
 }
 
 #[test]
 fn node_pool_is_fixed_size_and_never_grows() {
-    // Пул выделяется один раз под потолок и больше не растёт: ни при
-    // постройке дерева, ни при волнах вставок и удалений.
-    let buf = Buffer::new(b"tiny");
-    let mem = buf.tree_memory();
-    assert_eq!(
-        mem.pool_capacity,
-        2 * Buffer::MAX_LEAVES as usize + 8,
-        "ёмкость пула выведена из потолка листьев"
-    );
-    // 32767 занятых максимум — это и есть 512 КБ при узле 16 байт.
-    assert_eq!(mem.tree_bytes(), (2 * 16 * 1024 + 8) * 16);
+    // Пул выделяется один раз под глубину и больше не растёт. Ёмкость выведена
+    // из неё: одна запись даёт максимум два листа, полное двоичное дерево на
+    // столько листьев занимает `4 · depth + 1` узлов.
+    for depth in [1u32, 100, 1_000, 8_192] {
+        let buf = Buffer::with_history_depth(b"tiny", depth).unwrap();
+        let mem = buf.tree_memory();
+        assert_eq!(
+            mem.pool_capacity,
+            4 * depth as usize + 8,
+            "глубина {depth}: неверная ёмкость пула"
+        );
+        assert_eq!(buf.history_depth(), depth);
+    }
+    // На пределе: 32776 узлов по 16 байт — это 512 КБ.
+    assert_eq!(Buffer::new(b"x").tree_memory().tree_bytes(), 32_776 * 16);
 }
 
 #[test]
 fn node_pool_reused_across_churn() {
     // Волны вставок и удалений не должны раздувать пул: узлы возвращаются
     // в свободные и берутся снова.
-    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
+    let mut buf = Buffer::with_history_depth(b"", 8_192).unwrap();
     let pool = buf.tree_memory().pool_capacity;
     for _ in 0..5_000 {
         buf.insert(buf.len(), b"chunk").unwrap();

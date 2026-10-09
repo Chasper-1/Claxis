@@ -1,4 +1,3 @@
-use crate::arena::ArenaSize;
 use crate::buffer::Buffer;
 
 fn b(text: &str) -> Buffer {
@@ -218,7 +217,7 @@ fn segments_hold_record_and_text_refs() {
 #[test]
 fn tree_stays_balanced_under_many_inserts() {
     // Дерево не должно вырождаться в список: высота обязана расти логарифмом.
-    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
+    let mut buf = Buffer::with_history_depth(b"", 8_192).unwrap();
     for i in 0..5_000u32 {
         buf.insert(i, b"x").unwrap();
     }
@@ -238,7 +237,7 @@ fn tree_stays_balanced_under_many_inserts() {
 
 #[test]
 fn tree_stays_balanced_under_deletes() {
-    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
+    let mut buf = Buffer::with_history_depth(b"", 8_192).unwrap();
     for _ in 0..5_000 {
         buf.insert(buf.len(), b"xy").unwrap();
     }
@@ -268,7 +267,7 @@ fn tree_stays_balanced_under_deletes() {
 fn node_pool_does_not_grow_without_bound() {
     // Освобождённые узлы идут в пул повторного использования: после волны
     // вставок и удалений размер пула заметно меньше суммарного числа операций.
-    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
+    let mut buf = Buffer::with_history_depth(b"", 8_192).unwrap();
     for _ in 0..4_000 {
         buf.insert(buf.len(), b"ab").unwrap();
     }
@@ -308,29 +307,38 @@ fn snapshot_moves_current_into_new_original() {
 
 #[test]
 fn snapshot_keeps_document_bounded_in_memory() {
-    // Деревья больше MAX_LEAVES листьев в памяти не живут: снапшот схлопывает
-    // их в новый Original. Текст при этом не теряется.
-    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
-    let limit = Buffer::MAX_LEAVES as usize;
-    let mut peak = 0usize;
-    for _ in 0..(limit * 3) {
+    // Листья ничем не ограничены — ограничено число записей. Когда арена
+    // исчерпала глубину, снапшот схлопывает дерево в новый Original. Текст при
+    // этом не теряется.
+    const DEPTH: u32 = 1_000;
+    let mut buf = Buffer::with_history_depth(b"", DEPTH).unwrap();
+    let mut peak_records = 0usize;
+    for _ in 0..(DEPTH as usize * 3) {
         buf.insert(buf.len(), b"xy").unwrap();
-        peak = peak.max(buf.segments().len());
+        peak_records = peak_records.max(buf.undo_stack().len());
     }
-    assert!(peak <= limit, "листьев дошло до {peak}, порог {limit}");
     assert!(
-        peak > limit / 2,
-        "дерево должно было дорасти до порога: {peak}"
+        peak_records <= DEPTH as usize,
+        "записей не должно стать больше глубины"
     );
-    assert_eq!(buf.read().len(), limit * 6);
+    assert_eq!(
+        peak_records,
+        DEPTH as usize - 1,
+        "снапшот берётся перед записью, поэтому в арене на одну запись меньше"
+    );
+    assert!(buf.snapshots_taken() > 0, "снапшот обязан был сработать");
+    assert_eq!(buf.read().len(), DEPTH as usize * 6);
 
     // Правки продолжаются от нового исходного текста.
     buf.insert(buf.len(), b"!").unwrap();
     let text = buf.read();
     assert_eq!(text[text.len() - 1], b'!');
-    assert_eq!(text.len(), limit * 6 + 1);
-    // Текст целиком совпадает с ожидаемым.
-    assert!(text[..limit * 6].iter().all(|&b| b == b'x' || b == b'y'));
+    assert_eq!(text.len(), DEPTH as usize * 6 + 1);
+    assert!(
+        text[..DEPTH as usize * 6]
+            .iter()
+            .all(|&b| b == b'x' || b == b'y')
+    );
 }
 
 #[test]
@@ -402,36 +410,52 @@ fn redo_text_reuse_shrinks_added_back() {
 
 #[test]
 fn arena_blocks_keep_all_records() {
-    // Арена 32КБ = 2048 записей в блоке. Ни одна запись не теряется при
-    // переполнении блока: выделяется следующий, записи идут дальше.
-    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb32);
+    // Глубина ограничивает историю: записей не больше заданного, лишнее
+    // сворачивается снапшотом, текст при этом цел. Цепочка блоков арены
+    // проверяется отдельно, напрямую на арене — через буфер до неё не дойти.
+    const DEPTH: u32 = 2_048;
+    let mut buf = Buffer::with_history_depth(b"", DEPTH).unwrap();
     for _ in 0..3000 {
         buf.insert(0, b"X").unwrap();
+        assert!(buf.undo_stack().len() <= DEPTH as usize);
+        for &id in buf.undo_stack() {
+            assert!(buf.record(id).is_some(), "запись пропала");
+        }
     }
-    assert_eq!(buf.undo_stack().len(), 3000);
-    let ids = buf.undo_stack();
-    for id in ids {
-        assert!(buf.record(*id).is_some());
-    }
-    // Undo до самого дна: все записи возвращают исходный пустой документ.
-    for _ in 0..3000 {
-        buf.undo().unwrap();
-    }
-    assert!(buf.is_empty());
+    assert_eq!(buf.read().len(), 3_000);
+    assert!(buf.snapshots_taken() > 0);
+    // Отменить можно только до последнего снапшота: дальше история уже стёрта,
+    // поэтому исходный пустой документ недостижим.
+    while buf.undo().is_some() {}
+    assert!(
+        !buf.is_empty(),
+        "откат должен упереться в снапшот, не в ноль"
+    );
+    assert!(
+        buf.undo_stack().is_empty(),
+        "откатились до конца своей истории"
+    );
 }
 
 #[test]
-fn arena_size_ladder() {
-    assert_eq!(ArenaSize::Kb32.records(), 2_048);
-    assert_eq!(ArenaSize::Kb64.records(), 4_096);
-    assert_eq!(ArenaSize::Kb128.records(), 8_192);
-    assert_eq!(ArenaSize::Kb1024.records(), 65_536);
-    assert_eq!(ArenaSize::Kb32.bytes() + 32 * 1024, ArenaSize::Kb64.bytes());
+fn history_depth_boundaries() {
+    // Глубина задаётся числом записей, отдельного выбора размера арены нет.
+    assert_eq!(Buffer::new(b"x").history_depth(), 8_192);
+    assert_eq!(
+        Buffer::with_history_depth(b"x", 1).unwrap().history_depth(),
+        1
+    );
+    assert_eq!(
+        Buffer::with_history_depth(b"x", 500)
+            .unwrap()
+            .history_depth(),
+        500
+    );
 }
 
 #[test]
 fn delete_physically_removes_segments() {
-    let mut buf = Buffer::with_arena_size(b"0123456789", ArenaSize::Kb32);
+    let mut buf = Buffer::with_history_depth(b"0123456789", 2_048).unwrap();
     buf.delete(2, 4).unwrap();
     // Из чтения ушёл диапазон, сегментов больше нет — только живые куски.
     let segs = buf.segments();
@@ -445,7 +469,7 @@ fn delete_physically_removes_segments() {
 #[test]
 fn delete_cuts_middle_of_single_segment() {
     // Удаление из середины исходника: сегмент разрезается на два живых куска.
-    let mut buf = Buffer::with_arena_size(b"0123456789", ArenaSize::Kb32);
+    let mut buf = Buffer::with_history_depth(b"0123456789", 2_048).unwrap();
     buf.delete(3, 3).unwrap();
     let segs = buf.segments();
     assert_eq!(segs.len(), 2);
@@ -456,7 +480,7 @@ fn delete_cuts_middle_of_single_segment() {
 
 #[test]
 fn delete_whole_document() {
-    let mut buf = Buffer::with_arena_size(b"abc", ArenaSize::Kb32);
+    let mut buf = Buffer::with_history_depth(b"abc", 2_048).unwrap();
     buf.delete(0, 3).unwrap();
     assert!(buf.segments().is_empty());
     assert!(buf.is_empty());

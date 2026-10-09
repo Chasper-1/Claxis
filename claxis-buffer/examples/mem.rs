@@ -1,6 +1,6 @@
 use std::mem::size_of;
 
-use claxis_buffer::{ArenaSize, Buffer};
+use claxis_buffer::Buffer;
 
 /// Текущий Resident Set Size из `/proc/self/status`, в килобайтах.
 fn rss_kb() -> usize {
@@ -122,19 +122,11 @@ fn main() {
     println!();
 
     println!("=== арена записей ===");
-    for size in [
-        ArenaSize::Kb32,
-        ArenaSize::Kb128,
-        ArenaSize::Kb512,
-        ArenaSize::Kb1024,
-    ] {
-        println!(
-            "{:?}: блок {} записей ({} байт)",
-            size,
-            size.records(),
-            size.bytes()
-        );
-    }
+    println!(
+        "глубина по умолчанию: {} записей",
+        claxis_buffer::DEFAULT_DEPTH
+    );
+    println!("предел глубины: {} записей", claxis_buffer::MAX_DEPTH);
     println!("{}", build(1000).tree_memory());
 }
 

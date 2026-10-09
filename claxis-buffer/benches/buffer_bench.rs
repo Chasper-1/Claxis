@@ -194,7 +194,10 @@ fn fmt(d: std::time::Duration) -> String {
 }
 
 fn main() {
-    println!("порог снапшота: {} сегментов", Buffer::MAX_LEAVES);
+    println!(
+        "глубина истории: {} записей (снапшот по исчерпании)",
+        claxis_buffer::DEFAULT_DEPTH
+    );
     println!(
         "размер узла: {} байт, сегмента: {} байт",
         Buffer::node_size(),

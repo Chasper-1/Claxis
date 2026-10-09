@@ -1,7 +1,7 @@
 use std::fmt;
 use std::mem::size_of;
 
-use crate::arena::{Arena, ArenaSize, Record, RecordId};
+use crate::arena::{Arena, DEFAULT_DEPTH, MAX_DEPTH, Record, RecordId};
 use crate::current::Current;
 
 /// Снимок памяти буфера — для диагностики и тестов.
@@ -46,7 +46,19 @@ impl fmt::Display for TreeMemory {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
-    OutOfBounds { anchor: u32, len: u32, doc_len: u32 },
+    OutOfBounds {
+        anchor: u32,
+        len: u32,
+        doc_len: u32,
+    },
+    /// Глубина истории вне диапазона `1..=MAX_DEPTH`.
+    ///
+    /// Ноль бессмыслен: ни одна правка не поместилась бы, история обнулялась
+    /// бы на каждом шаге. Больше `MAX_DEPTH` тоже незачем — всё, что не
+    /// помещается, уходит на диск снапшотами.
+    InvalidHistoryDepth {
+        depth: u32,
+    },
 }
 
 impl fmt::Display for Error {
@@ -63,6 +75,10 @@ impl fmt::Display for Error {
                     anchor.saturating_add(*len)
                 )
             }
+            Error::InvalidHistoryDepth { depth } => write!(
+                f,
+                "глубина истории {depth} недопустима: допустимо от 1 до {MAX_DEPTH} записей"
+            ),
         }
     }
 }
@@ -70,6 +86,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Буфер Claxis: `Original`, `Added`, арена с двумя стеками и `Current`.
+#[derive(Debug)]
 pub struct Buffer {
     original: Vec<u8>,
     added: Vec<u8>,
@@ -80,21 +97,41 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// Буфер с глубиной истории по умолчанию — полный блок в 8192 записи.
     pub fn new(original: impl AsRef<[u8]>) -> Self {
-        Self::with_arena_size(original, ArenaSize::Kb128)
+        Self::with_history_depth(original, DEFAULT_DEPTH).expect("глубина по умолчанию корректна")
     }
 
-    pub fn with_arena_size(original: impl AsRef<[u8]>, size: ArenaSize) -> Self {
+    /// Буфер с заданной глубиной истории.
+    ///
+    /// Глубина — сколько записей правки живёт в памяти до снапшота. Это
+    /// единственная настройка размера: отдельного выбора размера арены нет.
+    /// Чем меньше глубина, тем меньше и пул узлов дерева.
+    ///
+    /// Ноль отвергается: история не пережила бы ни одной правки. Больше
+    /// `MAX_DEPTH` тоже — держать столько записей незачем.
+    pub fn with_history_depth(original: impl AsRef<[u8]>, depth: u32) -> Result<Self, Error> {
+        if !(1..=MAX_DEPTH).contains(&depth) {
+            return Err(Error::InvalidHistoryDepth { depth });
+        }
         let original = original.as_ref().to_vec();
-        let arena = Arena::new(size);
-        let current = Current::from_original(original.len() as u32);
-        Self {
+        let arena = Arena::new(depth);
+        let current = Current::from_original(
+            original.len() as u32,
+            crate::current::pool_capacity_for(depth),
+        );
+        Ok(Self {
             original,
             added: Vec::new(),
             arena,
             current,
             snapshots: 0,
-        }
+        })
+    }
+
+    /// Глубина истории в записях.
+    pub fn history_depth(&self) -> u32 {
+        self.arena.depth() as u32
     }
 
     pub fn original(&self) -> &[u8] {
@@ -146,7 +183,7 @@ impl Buffer {
             record_size: size_of::<Record>(),
             arena_blocks: self.arena.block_count(),
             arena_capacity: self.arena.capacity_records(),
-            pool_capacity: Current::node_capacity_fixed(),
+            pool_capacity: self.current.node_capacity_fixed(),
         }
     }
 
@@ -178,13 +215,13 @@ impl Buffer {
         if data.is_empty() {
             return Ok(());
         }
+        self.snapshot_if_needed();
         self.discard_redo_with_cleanup();
         let text = self.added.len() as u32;
         self.added.extend_from_slice(data);
         let len = data.len() as u32;
         let id = self.arena.push(Record::insert(anchor, len, text));
         self.current.apply_insert(anchor, text, len, id);
-        self.snapshot_if_needed();
         Ok(())
     }
 
@@ -194,27 +231,24 @@ impl Buffer {
         if len == 0 {
             return Ok(());
         }
+        self.snapshot_if_needed();
         self.discard_redo_with_cleanup();
         let _ = self.arena.push(Record::delete(anchor, len));
         self.current.apply_delete(anchor, len);
-        self.snapshot_if_needed();
         Ok(())
     }
 
-    /// Порог числа сегментов, после которого берётся снапшот.
+    /// Снапшот, когда история исчерпала свою глубину.
     ///
-    /// Дерево держит не больше этого числа листьев, поэтому память ограничена
-    /// сверху независимо от того, как долго и как интенсивно идёт правка.
-    /// Всё, что старше, уходит на диск (§11 снапшота).
-    pub const MAX_LEAVES: u32 = crate::current::MAX_LEAVES;
-
-    /// Снапшот по достижении порога листьев.
+    /// Листья дерева ничем не ограничены: сколько их набралось, столько и
+    /// живёт. Ограничение одно — **число записей**. Арена решила, сколько их
+    /// помещается, и когда место кончилось, дерево схлопывается в новый
+    /// `Original`, арена и `Added` очищаются, история уходит на диск (§11).
     ///
-    /// Деревья больше `MAX_LEAVES` листьев в памяти не живут: лишнее схлопывается
-    /// в новый `Original`, дерево возвращается к одному листу, арена и `Added`
-    /// очищаются. История до этого момента выгружена на диск.
+    /// Так память ограничена сверху: записей не больше глубины, а листьев не
+    /// больше `2 · глубина + 1`, и пул узлов выделен ровно под это.
     fn snapshot_if_needed(&mut self) {
-        if self.current.seg_count() > Self::MAX_LEAVES {
+        if self.arena.remaining_records() == 0 {
             self.snapshot();
         }
     }

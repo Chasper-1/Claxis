@@ -3,7 +3,7 @@ mod buffer;
 mod current;
 mod segment;
 
-pub use arena::{Arena, ArenaSize, ORIGINAL_ID, Record, RecordId};
+pub use arena::{Arena, DEFAULT_DEPTH, MAX_DEPTH, ORIGINAL_ID, Record, RecordId};
 pub use buffer::{Buffer, Error};
 pub use current::Current;
 pub use segment::{ADDED, ORIGINAL, Segment, TextRef};
