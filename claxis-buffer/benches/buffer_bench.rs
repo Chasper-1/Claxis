@@ -2,15 +2,12 @@ use std::time::Instant;
 
 use claxis_buffer::Buffer;
 
-/// Меряем то, что редактор делает каждый день: вставка, удаление, чтение и
-/// движение курсора. Пересборка — восстановление потерянного кеша, вызовов в
-/// редакторе нет, поэтому в горячие замеры не входит.
 const SEGMENTS: [u32; 3] = [1_000, 8_000, 16_000];
 const ROUNDS: u32 = 20_000;
 
 /// Документ из `n` сегментов: рассеянные вставки, каждая разрезает исходник.
 fn document(n: u32) -> Buffer {
-    let mut b = Buffer::new(&vec![b'a'; 500_000]);
+    let mut b = Buffer::new(vec![b'a'; 500_000]);
     for i in 0..n {
         b.insert((i * 37) % (b.len() + 1), b"xx").unwrap();
     }
@@ -27,14 +24,13 @@ fn bench_insert() {
             b.insert(mid, b"y").unwrap();
             b.delete(mid, 1).unwrap();
         }
-        let each = start.elapsed() / (ROUNDS * 2) as u32;
-        // Вставка в конец ничего не двигает — отдельная точка.
+        let each = start.elapsed() / (ROUNDS * 2);
         let start = Instant::now();
         for _ in 0..ROUNDS {
             b.insert(b.len(), b"y").unwrap();
             b.delete(b.len() - 1, 1).unwrap();
         }
-        let end = start.elapsed() / (ROUNDS * 2) as u32;
+        let end = start.elapsed() / (ROUNDS * 2);
         println!("insert: середина {each:?}, конец {end:?}  ({segs} сегментов)");
     }
 }
@@ -56,8 +52,6 @@ fn bench_read() {
     }
 }
 
-/// Курсор ходит по документу туда и обратно. Позиционирование вызывается самой
-/// правкой, поэтому движение проверяется вставкой и удалением по ходу.
 fn bench_cursor() {
     for target in SEGMENTS {
         let mut b = document(target);
@@ -66,7 +60,6 @@ fn bench_cursor() {
         let start = Instant::now();
         let mut pos = len / 2;
         for i in 0..ROUNDS {
-            // Вперёд и назад: разница между позициями определяет направление.
             pos = if i % 2 == 0 {
                 (pos + 7) % len
             } else {
@@ -76,13 +69,12 @@ fn bench_cursor() {
             b.delete(pos, 1).unwrap();
         }
         println!(
-            "cursor: {:?}  ({segs} сегментов, шаг 7 байт туда и обратно)",
-            start.elapsed() / (ROUNDS * 2) as u32
+            "cursor: {:?}  ({segs} сегментов, шаг 7 байт)",
+            start.elapsed() / (ROUNDS * 2)
         );
     }
 }
 
-/// Удаление широкого диапазона: откладывает много сегментов сразу.
 fn bench_wide_delete() {
     for target in SEGMENTS {
         let mut b = document(target);
@@ -95,7 +87,7 @@ fn bench_wide_delete() {
         }
         println!(
             "wide_delete: {:?}  ({segs} сегментов, половина документа)",
-            start.elapsed() / 2_000 as u32
+            start.elapsed() / 2_000_u32
         );
     }
 }

@@ -1,16 +1,12 @@
 mod arena;
 mod buffer;
 mod current;
-mod edit;
-mod history;
 mod segment;
 
-pub use arena::{ARENA_CAPACITY, AddArena, ArenaSize, Kind, Record, RecordId};
-pub use buffer::Buffer;
+pub use arena::{Arena, ArenaSize, ORIGINAL_ID, Record, RecordId};
+pub use buffer::{Buffer, Error};
 pub use current::Current;
-pub use edit::{Edit, Error};
-pub use history::History;
-pub use segment::{ADDED, ORIGINAL, Segment};
+pub use segment::{ADDED, ORIGINAL, Segment, TextRef};
 
 #[cfg(test)]
 mod tests;

@@ -1,868 +1,473 @@
-use crate::*;
+use crate::arena::ArenaSize;
+use crate::buffer::Buffer;
 
-#[cfg(test)]
-fn segments(buffer: &Buffer) -> Vec<Segment> {
-    buffer.segments().to_vec()
-}
-
-fn check_invariants(buffer: &Buffer) {
-    let mut total: u32 = 0;
-    for segment in buffer.segments() {
-        assert!(!segment.is_empty(), "пустой сегмент: {segment:?}");
-        if segment.is_original() {
-            assert!(
-                segment.end() <= buffer.original().len() as u32,
-                "сегмент выходит за границы исходного текста: {segment:?}"
-            );
-        } else {
-            assert!(
-                segment.end() <= buffer.added_len(),
-                "сегмент выходит за границы вставленного текста: {segment:?}"
-            );
-        }
-        total += segment.len();
-    }
-    assert_eq!(total, buffer.len(), "сумма сегментов != длине документа");
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn below_u32(&mut self, n: u32) -> u32 {
-        (self.next() % n as u64) as u32
-    }
-}
-
-fn random_data(rng: &mut Rng) -> Vec<u8> {
-    let len = 1 + rng.below(6);
-    (0..len).map(|_| b'a' + rng.below(26) as u8).collect()
-}
-
-#[derive(Default)]
-struct Reference {
-    current: String,
-    undo: Vec<String>,
-    redo: Vec<String>,
-}
-
-impl Reference {
-    fn edit(&mut self, edit: impl FnOnce(&mut String)) {
-        self.undo.push(self.current.clone());
-        edit(&mut self.current);
-        self.redo.clear();
-    }
-
-    fn undo(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            self.redo.push(self.current.clone());
-            self.current = prev;
-        }
-    }
-
-    fn redo(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(self.current.clone());
-            self.current = next;
-        }
-    }
+fn b(text: &str) -> Buffer {
+    Buffer::new(text.as_bytes())
 }
 
 #[test]
 fn insert_splits_original_and_reads_back() {
-    let mut b = Buffer::new("abcdefghijklmnopqrstuvwxyz");
-    b.insert(10, b"HELLO").unwrap();
-
-    assert_eq!(b.len(), 31);
-    assert_eq!(b.read(), b"abcdefghijHELLOklmnopqrstuvwxyz");
-    assert_eq!(
-        segments(&b),
-        [
-            Segment::original(0, 10),
-            Segment::added(0, 5),
-            Segment::original(10, 16),
-        ]
-    );
+    let orig = b"abcdefghij";
+    let mut buf = Buffer::new(&orig[..]);
+    let ins = b"XXXXXXXXXXXXXXXXXXXX";
+    buf.insert(5, ins).unwrap();
+    let mut want = orig[..5].to_vec();
+    want.extend_from_slice(&ins[..]);
+    want.extend_from_slice(&orig[5..]);
+    assert_eq!(buf.read(), want);
 }
 
 #[test]
 fn insert_at_end_appends() {
-    let mut b = Buffer::new("ab");
-    b.insert(2, b"cd").unwrap();
-    b.insert(4, b"ef").unwrap();
-
-    assert_eq!(b.read(), b"abcdef");
-    assert_eq!(b.add_count(), 2);
+    let mut buf = b("hello");
+    buf.insert(5, b" world").unwrap();
+    assert_eq!(buf.read(), b"hello world");
 }
 
 #[test]
-fn delete_excludes_range_from_current() {
-    let mut b = Buffer::new("abcdefghij");
-    b.delete(3, 4).unwrap();
-
-    assert_eq!(b.len(), 6);
-    assert_eq!(b.read(), b"abchij");
-    assert_eq!(
-        segments(&b),
-        [Segment::original(0, 3), Segment::original(7, 3)]
-    );
-    assert_eq!(b.original(), b"abcdefghij");
+fn insert_at_zero_prepends() {
+    let mut buf = b("world");
+    buf.insert(0, b"hello ").unwrap();
+    assert_eq!(buf.read(), b"hello world");
 }
 
 #[test]
-fn delete_part_of_original_keeps_bytes() {
-    let mut b = Buffer::new("0123456789");
-    b.delete(4, 4).unwrap();
-
-    assert_eq!(b.read(), b"012389");
-    assert_eq!(
-        segments(&b),
-        [Segment::original(0, 4), Segment::original(8, 2)]
-    );
-    assert_eq!(b.original(), b"0123456789");
-}
-
-#[test]
-fn replace_is_delete_then_insert() {
-    let mut b = Buffer::new("hello world");
-    b.replace(6, 5, b"there").unwrap();
-
-    assert_eq!(b.read(), b"hello there");
-    assert_eq!(b.undo_stack().len(), 2);
-
-    b.undo().unwrap();
-    assert_eq!(b.read(), b"hello ");
-    b.undo().unwrap();
-    assert_eq!(b.read(), b"hello world");
-    assert!(b.undo().is_none());
-}
-
-#[test]
-fn undo_and_redo_walk_history_linearly() {
-    let mut b = Buffer::new("hello");
-    b.insert(5, b" world").unwrap();
-    b.delete(0, 5).unwrap();
-    assert_eq!(b.read(), b" world");
-
-    assert_eq!(b.undo(), Some(Edit::Delete { pos: 0, len: 5 }));
-    assert_eq!(b.read(), b"hello world");
-
-    assert_eq!(b.undo(), Some(Edit::Insert { pos: 5, add: 0 }));
-    assert_eq!(b.read(), b"hello");
-    assert!(b.undo().is_none());
-
-    b.redo().unwrap();
-    assert_eq!(b.read(), b"hello world");
-    b.redo().unwrap();
-    assert_eq!(b.read(), b" world");
-    assert!(b.redo().is_none());
-}
-
-#[test]
-fn new_edit_after_undo_clears_redo() {
-    let mut b = Buffer::new("abc");
-    b.insert(3, b"d").unwrap();
-    b.undo().unwrap();
-    assert_eq!(b.redo_stack().len(), 1);
-
-    b.insert(1, b"x").unwrap();
-    assert!(b.redo_stack().is_empty());
-    assert_eq!(b.read(), b"axbc");
-}
-
-#[test]
-fn new_delete_after_undo_also_clears_redo() {
-    let mut b = Buffer::new("abcd");
-    b.insert(4, b"e").unwrap();
-    b.undo().unwrap();
-    assert_eq!(b.redo_stack().len(), 1);
-
-    b.delete(0, 1).unwrap();
-    assert!(b.redo_stack().is_empty());
-    assert_eq!(b.read(), b"bcd");
-}
-
-#[test]
-fn nested_insert_resolves_to_flat_segments() {
-    let mut b = Buffer::new("ab");
-    b.insert(1, b"ABCDEFGHIJ").unwrap();
-    b.insert(6, b"XXXX").unwrap();
-
-    assert_eq!(b.read(), b"aABCDEXXXXFGHIJb");
-    assert_eq!(
-        segments(&b),
-        [
-            Segment::original(0, 1),
-            Segment::added(0, 5),
-            Segment::added(10, 4),
-            Segment::added(5, 5),
-            Segment::original(1, 1),
-        ]
-    );
-}
-
-#[test]
-fn nested_delete_cuts_inside_add() {
-    let mut b = Buffer::new("ab");
-    b.insert(1, b"ABCDEFGHIJ").unwrap();
-    b.insert(6, b"XXXX").unwrap();
-    b.delete(2, 3).unwrap();
-
-    assert_eq!(b.read(), b"aAEXXXXFGHIJb");
-    assert_eq!(
-        segments(&b),
-        [
-            Segment::original(0, 1),
-            Segment::added(0, 1),
-            Segment::added(4, 1),
-            Segment::added(10, 4),
-            Segment::added(5, 5),
-            Segment::original(1, 1),
-        ]
-    );
+fn delete_excludes_range_and_undo_restores_exactly() {
+    let mut buf = b("0123456789");
+    buf.delete(3, 3).unwrap();
+    assert_eq!(buf.read(), b"0126789");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"0123456789");
 }
 
 #[test]
 fn delete_across_segment_boundaries() {
-    let mut b = Buffer::new("aaaabbbbcccc");
-    b.insert(4, b"xx").unwrap();
-    b.insert(8, b"yy").unwrap();
-    assert_eq!(b.read(), b"aaaaxxbbyybbcccc");
-
-    b.delete(4, 8).unwrap();
-
-    assert_eq!(b.read(), b"aaaacccc");
-    assert_eq!(
-        segments(&b),
-        [Segment::original(0, 4), Segment::original(8, 4)]
-    );
-}
-
-#[test]
-fn delete_splitting_two_segments_independently() {
-    let mut b = Buffer::new("0123456789");
-    b.insert(5, b"abc").unwrap();
-    assert_eq!(b.read(), b"01234abc56789");
-
-    b.delete(2, 8).unwrap();
-
-    assert_eq!(b.read(), b"01789");
-    assert_eq!(
-        segments(&b),
-        [Segment::original(0, 2), Segment::original(7, 3)]
-    );
-}
-
-#[test]
-fn delete_over_whole_add_removes_it() {
-    let mut b = Buffer::new("ab");
-    b.insert(1, b"XX").unwrap();
-    b.delete(1, 2).unwrap();
-
-    assert_eq!(b.read(), b"ab");
-    assert_eq!(
-        segments(&b),
-        [Segment::original(0, 1), Segment::original(1, 1)]
-    );
-    assert_eq!(b.added(0, 2), Some(b"XX".as_ref()));
+    let mut buf = b("0123456789");
+    buf.insert(5, b"abc").unwrap();
+    assert_eq!(buf.read(), b"01234abc56789");
+    buf.delete(2, 6).unwrap();
+    assert_eq!(buf.read(), b"0156789");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"01234abc56789");
 }
 
 #[test]
 fn delete_to_the_end_of_document() {
-    let mut b = Buffer::new("abcd");
-    b.insert(2, b"XY").unwrap();
-    b.delete(3, 3).unwrap();
-
-    assert_eq!(b.read(), b"abX");
-    check_invariants(&b);
-
-    b.delete(0, 3).unwrap();
-    assert!(b.is_empty());
-    assert!(b.segments().is_empty());
-    check_invariants(&b);
+    let mut buf = b("0123456789");
+    buf.delete(7, 3).unwrap();
+    assert_eq!(buf.read(), b"0123456");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"0123456789");
 }
 
 #[test]
-fn undo_restores_state_after_delete_to_end() {
-    let mut b = Buffer::new("abcd");
-    b.delete(1, 3).unwrap();
-    assert_eq!(b.read(), b"a");
-
-    b.undo().unwrap();
-    assert_eq!(b.read(), b"abcd");
-    check_invariants(&b);
+fn delete_never_touches_deleted_again() {
+    // Диапазон удаляется один раз. Повторный delete по тем же координатам
+    // оригинала в live-координатах не существует: удаляется то, что на них.
+    let mut buf = b("0123456789");
+    buf.delete(2, 4).unwrap();
+    assert_eq!(buf.read(), b"016789");
+    buf.delete(2, 4).unwrap();
+    assert_eq!(buf.read(), b"01");
 }
 
 #[test]
-fn rebuild_reproduces_current() {
-    let mut b = Buffer::new("some text here");
-    b.insert(4, b"XXX").unwrap();
-    b.delete(2, 9).unwrap();
-    b.insert(0, b"start ").unwrap();
-    b.insert(b.len(), b" end").unwrap();
-    b.undo().unwrap();
-    b.redo().unwrap();
-    b.undo().unwrap();
-    b.undo().unwrap();
-
-    let segments_before = segments(&b);
-    let text_before = b.read();
-
-    b.rebuild();
-
-    assert_eq!(segments(&b), segments_before);
-    assert_eq!(b.read(), text_before);
+fn undo_insert_removes_text_and_redo_restores() {
+    let mut buf = b("hello");
+    buf.insert(5, b" world").unwrap();
+    assert_eq!(buf.read(), b"hello world");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"hello");
+    buf.redo().unwrap();
+    assert_eq!(buf.read(), b"hello world");
 }
 
 #[test]
-fn rebuild_after_every_edit_matches_incremental_state() {
-    let mut b = Buffer::new("abc");
-    b.insert(1, b"12").unwrap();
-    b.delete(0, 2).unwrap();
-    b.insert(0, b"zz").unwrap();
-
-    let text = b.read();
-    b.rebuild();
-    assert_eq!(b.read(), text);
-    assert_eq!(b.len(), text.len() as u32);
+fn undo_redo_walk_history_linearly() {
+    let mut buf = b("");
+    buf.insert(0, b"A").unwrap();
+    buf.insert(1, b"B").unwrap();
+    buf.insert(2, b"C").unwrap();
+    assert_eq!(buf.read(), b"ABC");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"AB");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"A");
+    buf.redo().unwrap();
+    assert_eq!(buf.read(), b"AB");
+    buf.redo().unwrap();
+    assert_eq!(buf.read(), b"ABC");
 }
 
 #[test]
-fn rebuild_on_fresh_buffer_changes_nothing() {
-    let b0 = Buffer::new("fresh document");
-    let mut b = Buffer::new("fresh document");
-
-    b.rebuild();
-
-    assert_eq!(b.read(), b0.read());
-    assert_eq!(segments(&b), segments(&b0));
-    assert_eq!(b.len(), b0.len());
-    assert!(b.undo_stack().is_empty());
+fn new_edit_after_undo_clears_redo() {
+    let mut buf = b("");
+    buf.insert(0, b"A").unwrap();
+    buf.insert(1, b"B").unwrap();
+    buf.undo().unwrap();
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"");
+    assert!(!buf.redo_stack().is_empty());
+    buf.insert(0, b"X").unwrap();
+    assert!(buf.redo_stack().is_empty());
+    assert_eq!(buf.read(), b"X");
 }
 
 #[test]
-fn rebuild_after_full_undo_restores_original() {
-    let original = b"the original text";
-    let mut b = Buffer::new(original);
-    b.insert(3, b"XXX").unwrap();
-    b.delete(0, 5).unwrap();
-    b.insert(b.len(), b"tail").unwrap();
-
-    while b.undo().is_some() {}
-
-    let text_before = b.read();
-    b.rebuild();
-
-    assert_eq!(text_before, original);
-    assert_eq!(b.read(), original);
-    assert_eq!(b.len(), original.len() as u32);
-    check_invariants(&b);
+fn replace_is_delete_then_insert() {
+    let mut buf = b("Hello, world!");
+    buf.replace(7, 5, b"Claxis").unwrap();
+    assert_eq!(buf.read(), b"Hello, Claxis!");
+    // replace = delete + insert: первая отмена убирает вставку.
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"Hello, !");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"Hello, world!");
 }
 
 #[test]
-fn arena_entries_survive_undo() {
-    let mut b = Buffer::new("ab");
-    b.insert(1, b"XX").unwrap();
-    b.insert(2, b"YY").unwrap();
-    assert_eq!(b.add_count(), 2);
-
-    b.undo().unwrap();
-    b.undo().unwrap();
-
-    assert_eq!(b.add_count(), 2);
-    assert_eq!(b.added(0, 2), Some(b"XX".as_ref()));
-    assert_eq!(b.added(2, 2), Some(b"YY".as_ref()));
-    assert_eq!(b.arena_record(2), None);
-    assert!(b.arena_record(0).is_some(), "запись вставки пережила undo");
-    assert!(b.arena_record(1).is_some(), "запись вставки пережила undo");
+fn nested_inserts_resolve_to_flat_document() {
+    let mut buf = b("");
+    buf.insert(0, b"ace").unwrap();
+    buf.insert(1, b"b").unwrap();
+    buf.insert(3, b"d").unwrap();
+    assert_eq!(buf.read(), b"abcde");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"abce");
 }
 
 #[test]
-fn original_never_changes() {
-    let original = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-    let mut b = Buffer::new(&original);
-
-    b.insert(0, b"12345 ").unwrap();
-    b.delete(10, 8).unwrap();
-    b.replace(2, 4, b"ZZZZ").unwrap();
-    while b.undo().is_some() {}
-
-    assert_eq!(b.original(), original);
-    assert_eq!(b.read(), original);
+fn delete_undo_preserves_state_when_deleted_was_inserted_earlier() {
+    let mut buf = b("0123456789");
+    buf.insert(5, b"abc").unwrap();
+    buf.delete(6, 1).unwrap();
+    assert_eq!(buf.read(), b"01234ac56789");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"01234abc56789");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"0123456789");
 }
 
 #[test]
-fn empty_document_operations() {
-    let mut b = Buffer::new("");
-    assert!(b.is_empty());
-    assert!(b.segments().is_empty());
+fn read_range_is_substring_of_full_read() {
+    let mut buf = b("");
+    for i in 0..100u8 {
+        buf.insert(buf.len(), &[b'a' + (i % 26)]).unwrap();
+    }
+    let full = buf.read();
+    assert_eq!(buf.read_range(20, 60), full[20..60]);
+    assert!(buf.read_range(0, 0).is_empty());
+    assert_eq!(buf.read_range(90, 200), full[90..]);
+    assert_eq!(buf.read_range(0, 100), full);
+}
 
-    b.insert(0, b"abc").unwrap();
-    assert_eq!(b.read(), b"abc");
-
-    b.delete(0, 3).unwrap();
-    assert!(b.is_empty());
-    assert!(b.segments().is_empty());
-
-    b.undo().unwrap();
-    assert_eq!(b.read(), b"abc");
+#[test]
+fn read_range_after_deletes_and_inserts() {
+    let mut buf = b("0123456789");
+    buf.insert(5, b"abc").unwrap();
+    buf.delete(2, 3).unwrap();
+    let full = buf.read();
+    assert_eq!(buf.read_range(1, 8), full[1..8]);
 }
 
 #[test]
 fn out_of_bounds_is_an_error() {
-    let mut b = Buffer::new("abc");
-
-    assert_eq!(
-        b.insert(4, b"x"),
-        Err(Error::OutOfBounds {
-            pos: 4,
-            len: 0,
-            doc_len: 3
-        })
-    );
-    assert_eq!(
-        b.delete(1, 3),
-        Err(Error::OutOfBounds {
-            pos: 1,
-            len: 3,
-            doc_len: 3
-        })
-    );
-    assert_eq!(
-        b.delete(9, 0),
-        Err(Error::OutOfBounds {
-            pos: 9,
-            len: 0,
-            doc_len: 3
-        })
-    );
-    assert_eq!(
-        b.replace(2, 2, b"x"),
-        Err(Error::OutOfBounds {
-            pos: 2,
-            len: 2,
-            doc_len: 3
-        })
-    );
-    assert_eq!(b.read(), b"abc");
-    assert!(b.undo_stack().is_empty());
+    let mut buf = b("abc");
+    assert!(buf.insert(4, b"x").is_err());
+    assert!(buf.delete(3, 1).is_err());
+    assert!(buf.delete(100, 1).is_err());
 }
 
 #[test]
 fn zero_length_ops_add_no_history() {
-    let mut b = Buffer::new("abc");
-    b.insert(1, b"").unwrap();
-    b.delete(1, 0).unwrap();
-
-    assert!(b.undo_stack().is_empty());
-    assert_eq!(b.read(), b"abc");
+    let mut buf = b("abc");
+    buf.insert(1, b"").unwrap();
+    buf.delete(1, 0).unwrap();
+    assert!(buf.undo_stack().is_empty());
 }
 
 #[test]
-fn read_into_matches_read() {
-    let mut b = Buffer::new("abc");
-    b.insert(1, b"12").unwrap();
-
-    let mut out = Vec::new();
-    b.read_into(&mut out);
-    assert_eq!(out, b.read());
+fn undo_and_redo_are_lifo_stacks() {
+    let mut buf = b("");
+    buf.insert(0, b"A").unwrap();
+    buf.insert(1, b"B").unwrap();
+    buf.insert(2, b"C").unwrap();
+    assert_eq!(buf.undo_stack().len(), 3);
+    let id = buf.undo().unwrap();
+    assert_eq!(buf.redo_stack().len(), 1);
+    assert_eq!(buf.record(id).unwrap().anchor(), 2);
+    assert_eq!(buf.record(id).unwrap().head(), 3);
 }
 
 #[test]
-fn undo_redo_are_lifo_stacks() {
-    let mut b = Buffer::new("base");
-    let e1 = Edit::Insert { pos: 4, add: 0 };
-    let e2 = Edit::Insert { pos: 5, add: 1 };
-    let e3 = Edit::Delete { pos: 0, len: 2 };
-    b.insert(4, b"1").unwrap();
-    b.insert(5, b"2").unwrap();
-    b.delete(0, 2).unwrap();
-
-    let undo_edits = b.undo_edits();
-    assert_eq!(undo_edits, [e1, e2, e3]);
-
-    b.undo().unwrap();
-    b.undo().unwrap();
-    let redo_edits = b.redo_edits();
-    let undo_edits = b.undo_edits();
-    assert_eq!(redo_edits, [e3, e2]);
-    assert_eq!(undo_edits, [e1]);
-
-    b.redo().unwrap();
-    assert_eq!(b.undo_edits(), [e1, e2]);
-    assert_eq!(b.redo_edits(), [e3]);
-
-    b.redo().unwrap();
-    assert_eq!(b.undo_edits(), [e1, e2, e3]);
-    assert!(b.redo_stack().is_empty());
+fn segments_hold_record_and_text_refs() {
+    let mut buf = b("abcde");
+    buf.insert(2, b"XY").unwrap();
+    let segs = buf.segments();
+    assert_eq!(segs.len(), 3);
+    // Исходный текст без записи.
+    assert_eq!(segs[0].record, crate::arena::ORIGINAL_ID);
+    assert_eq!(segs[0].len, 2);
+    // Вставка — своя запись, текст из Added.
+    let insert = segs[1];
+    assert_ne!(insert.record, crate::arena::ORIGINAL_ID);
+    assert_eq!(insert.len, 2);
+    assert_eq!(segs[2].len, 3);
 }
 
-/// Сегменты — материализованное состояние, а не write-once арена: их число
-/// меняется при undo и redo. Инвариант из документации другой — `Current`
-/// пересобирается из `Original`, Arena и активной истории, и повторная
-/// пересборка не меняет ни текст, ни разбиение на сегменты.
-
 #[test]
-fn rebuild_is_stable_across_repeats_undo_and_redo() {
-    let mut b = Buffer::new("0123456789abcdef");
-    for i in 0..20u32 {
-        let pos = i * 3 % (b.len() + 1);
-        b.insert(pos, b"inserted").unwrap();
-        let len = b.len();
-        if len > 4 {
-            b.delete(len / 2, 3).unwrap();
-        }
+fn tree_stays_balanced_under_many_inserts() {
+    // Дерево не должно вырождаться в список: высота обязана расти логарифмом.
+    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
+    for i in 0..5_000u32 {
+        buf.insert(i, b"x").unwrap();
     }
-
-    let text = b.read();
-
-    for _ in 0..5 {
-        b.rebuild();
-        assert_eq!(b.read(), text, "rebuild изменил текст");
-        check_invariants(&b);
-    }
-
-    while b.undo().is_some() {}
-    assert_eq!(
-        b.read(),
-        b"0123456789abcdef",
-        "полный undo не вернул оригинал"
-    );
-    check_invariants(&b);
-
-    while b.redo().is_some() {}
-    assert_eq!(b.read(), text, "полный redo не вернул состояние");
-    check_invariants(&b);
-}
-
-#[test]
-fn discarding_redo_keeps_data_and_correct_state() {
-    let mut b = Buffer::new("abc");
-    b.insert(3, b"DEF").unwrap();
-    b.undo().unwrap();
-    assert_eq!(b.read(), b"abc");
-
-    b.insert(0, b"xy").unwrap();
-    assert!(b.redo_stack().is_empty());
-    assert_eq!(b.add_count(), 2);
-    assert_eq!(b.read(), b"xyabc");
-
-    b.rebuild();
-    assert_eq!(b.read(), b"xyabc");
-    assert_eq!(b.add_count(), 2);
-    assert_eq!(b.added(0, 3), Some(b"DEF".as_ref()));
-    assert_eq!(b.added(3, 2), Some(b"xy".as_ref()));
-}
-
-/// Заполняет арену записями, перенося её через границу.
-fn fill_arena() -> (Buffer, Vec<u8>) {
-    let mut b = Buffer::new("base");
-    // Мест в арене меньше, чем записей: цикл обязан сработать.
-    for _ in 0..ARENA_CAPACITY / size_of::<Record>() as usize + 10 {
-        b.insert(b.len(), b"x").unwrap();
-    }
-    let text = b.read();
-    (b, text)
-}
-
-#[test]
-fn arena_cycle_moves_current_into_new_original() {
-    let (b, text) = fill_arena();
-
-    let capacity = (ARENA_CAPACITY / size_of::<Record>()) as u32;
-    assert_eq!(b.read(), text);
+    let height = buf.tree_height();
+    let leaves = buf.segments().len();
     assert!(
-        b.add_count() < capacity + 10,
-        "арена не была переиспользована"
+        leaves >= 5_000,
+        "листьев должно быть не меньше 5000, got {leaves}"
     );
-    assert_ne!(b.original(), b"base", "Original не сменился на новый");
-    // Цикл сработал на последней вставке: текст, бывший в `Original` до
-    // переноса, лежит в нём целиком, а вставки после цикла — в `added`.
-    // Цикл сработал до последних вставок: `Original` — это текст на момент
-    // переноса, то есть весь текущий минус то, что легло в `added` после.
-    let cut = text.len() - b.added_len() as usize;
-    assert_eq!(
-        b.original(),
-        &text[..cut],
-        "Original не равен тексту на момент переноса"
+    // AVL-дерево из n листьев: высота <= 1.44*log2(n+2).
+    let bound = 1.45 * (leaves as f64 + 2.0).log2();
+    assert!(
+        height as f64 <= bound,
+        "высота {height} превышает границу {bound:.1} при {leaves} листьях"
     );
-    assert_eq!(b.add_count(), 10, "в арене записи только после цикла");
-    check_invariants(&b);
 }
 
 #[test]
-fn arena_cycle_keeps_text_across_boundary() {
-    let (mut b, _) = fill_arena();
-    let text = b.read();
-
-    // Вставка после переноса идёт в чистую арену и не теряется.
-    b.insert(b.len(), b"tail").unwrap();
-    let mut expected = text.clone();
-    expected.extend_from_slice(b"tail");
-    assert_eq!(b.read(), expected);
-
-    b.undo().unwrap();
-    assert_eq!(b.read(), text);
-    b.redo().unwrap();
-    assert_eq!(b.read(), expected);
-    check_invariants(&b);
-}
-
-#[test]
-fn arena_cycle_survives_rebuild() {
-    let (mut b, _) = fill_arena();
-    let before = segments(&b);
-
-    b.rebuild();
-
-    assert_eq!(
-        segments(&b),
-        before,
-        "rebuild разошёлся после границы арены"
-    );
-    check_invariants(&b);
-}
-
-#[test]
-fn delete_across_arena_boundary() {
-    let mut b = Buffer::new("abcdefghij");
-    let chunk = vec![b'X'; 64 * 1024];
-    for _ in 0..20 {
-        b.insert(b.len(), &chunk).unwrap();
+fn tree_stays_balanced_under_deletes() {
+    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
+    for _ in 0..5_000 {
+        buf.insert(buf.len(), b"xy").unwrap();
     }
-    let text = b.read();
+    // Удаляем каждый второй байт с начала — листья тают, баланс должен остаться.
+    while !buf.is_empty() {
+        buf.delete(0, 1).unwrap();
+    }
+    assert!(buf.is_empty());
+    assert_eq!(buf.segments().len(), 0);
+    assert_eq!(buf.tree_height(), 0);
 
-    // Удаление через границу арены: затрагивает и Original, и новую арену.
-    b.delete(5, text.len() as u32 - 15).unwrap();
+    // Снова наполняем — высота обязана быть логарифмической.
+    for _ in 0..5_000 {
+        buf.insert(buf.len(), b"xy").unwrap();
+    }
+    let leaves = buf.segments().len();
+    let height = buf.tree_height();
+    let bound = 1.45 * (leaves as f64 + 2.0).log2();
+    assert!(
+        height as f64 <= bound,
+        "высота {height} превышает границу {bound:.1} при {leaves} листьях"
+    );
+    assert_eq!(buf.read().len(), 10_000);
+}
 
-    let mut expected = text[..5].to_vec();
-    expected.extend_from_slice(&text[text.len() - 10..]);
-    assert_eq!(b.read(), expected);
-    check_invariants(&b);
+#[test]
+fn node_pool_does_not_grow_without_bound() {
+    // Освобождённые узлы идут в пул повторного использования: после волны
+    // вставок и удалений размер пула заметно меньше суммарного числа операций.
+    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
+    for _ in 0..4_000 {
+        buf.insert(buf.len(), b"ab").unwrap();
+    }
+    assert_eq!(buf.read().len(), 8_000);
+    let after_inserts = buf.segments().len();
 
-    b.undo().unwrap();
-    assert_eq!(b.read(), text);
+    // Удаляем всё, потом наполняем заново — пул переиспользуется, листья
+    // не растут бесконечно.
+    while !buf.is_empty() {
+        buf.delete(0, 1).unwrap();
+    }
+    assert!(buf.segments().is_empty());
+    for _ in 0..4_000 {
+        buf.insert(buf.len(), b"ab").unwrap();
+    }
+    assert_eq!(buf.read().len(), 8_000);
+    assert!(
+        buf.segments().len() <= after_inserts,
+        "листьев снова выросло: {} против {after_inserts}",
+        buf.segments().len()
+    );
 }
 
 #[test]
 fn snapshot_moves_current_into_new_original() {
-    let mut b = Buffer::new("base");
-    b.insert(4, b"ZZ").unwrap();
-    let text = b.read();
-
-    b.snapshot();
-
-    assert_eq!(b.original(), text);
-    assert_eq!(b.original(), text);
-    assert_eq!(b.read(), text);
-    assert_eq!(b.add_count(), 0);
-    assert!(b.undo_stack().is_empty());
-    assert!(b.redo_stack().is_empty());
-
-    b.insert(b.len(), b"-end").unwrap();
-    let mut expected = text;
-    expected.extend_from_slice(b"-end");
-    assert_eq!(b.read(), expected);
-    assert_eq!(b.add_count(), 1);
-    b.undo().unwrap();
-    assert_eq!(b.read(), expected[..expected.len() - 4].to_vec());
-    b.redo().unwrap();
-    assert_eq!(b.read(), expected);
-    check_invariants(&b);
+    let mut buf = b("hello");
+    buf.insert(5, b" world").unwrap();
+    buf.snapshot();
+    assert_eq!(buf.original(), b"hello world");
+    assert_eq!(buf.read(), b"hello world");
+    assert!(buf.undo_stack().is_empty());
+    buf.insert(11, b"!").unwrap();
+    assert_eq!(buf.read(), b"hello world!");
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"hello world");
 }
 
-/// В арене лежат только метаданные, поэтому объём вставки не ограничен:
-/// текст уходит в растущий буфер и масштабируется свободно.
+#[test]
+fn snapshot_keeps_document_bounded_in_memory() {
+    // Деревья больше MAX_LEAVES листьев в памяти не живут: снапшот схлопывает
+    // их в новый Original. Текст при этом не теряется.
+    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb128);
+    let limit = Buffer::MAX_LEAVES as usize;
+    let mut peak = 0usize;
+    for _ in 0..(limit * 3) {
+        buf.insert(buf.len(), b"xy").unwrap();
+        peak = peak.max(buf.segments().len());
+    }
+    assert!(peak <= limit, "листьев дошло до {peak}, порог {limit}");
+    assert!(
+        peak > limit / 2,
+        "дерево должно было дорасти до порога: {peak}"
+    );
+    assert_eq!(buf.read().len(), limit * 6);
+
+    // Правки продолжаются от нового исходного текста.
+    buf.insert(buf.len(), b"!").unwrap();
+    let text = buf.read();
+    assert_eq!(text[text.len() - 1], b'!');
+    assert_eq!(text.len(), limit * 6 + 1);
+    // Текст целиком совпадает с ожидаемым.
+    assert!(text[..limit * 6].iter().all(|&b| b == b'x' || b == b'y'));
+}
+
+#[test]
+fn segments_are_sixteen_bytes() {
+    // Упаковка ради памяти: сегмент — ровно четыре u32, без хвоста выравнивания.
+    assert_eq!(Buffer::segment_size(), 16);
+    // Узел — тоже 16 байт: вид узла в старшем бите, дискриминант не нужен.
+    assert_eq!(Buffer::node_size(), 16);
+}
+
+#[test]
+fn arena_blocks_keep_all_records() {
+    // Арена 32КБ = 2048 записей в блоке. Ни одна запись не теряется при
+    // переполнении блока: выделяется следующий, записи идут дальше.
+    let mut buf = Buffer::with_arena_size(b"", ArenaSize::Kb32);
+    for _ in 0..3000 {
+        buf.insert(0, b"X").unwrap();
+    }
+    assert_eq!(buf.undo_stack().len(), 3000);
+    let ids = buf.undo_stack();
+    for id in ids {
+        assert!(buf.record(*id).is_some());
+    }
+    // Undo до самого дна: все записи возвращают исходный пустой документ.
+    for _ in 0..3000 {
+        buf.undo().unwrap();
+    }
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn arena_size_ladder() {
+    assert_eq!(ArenaSize::Kb32.records(), 2_048);
+    assert_eq!(ArenaSize::Kb64.records(), 4_096);
+    assert_eq!(ArenaSize::Kb128.records(), 8_192);
+    assert_eq!(ArenaSize::Kb1024.records(), 65_536);
+    assert_eq!(ArenaSize::Kb32.bytes() + 32 * 1024, ArenaSize::Kb64.bytes());
+}
+
+#[test]
+fn delete_physically_removes_segments() {
+    let mut buf = Buffer::with_arena_size(b"0123456789", ArenaSize::Kb32);
+    buf.delete(2, 4).unwrap();
+    // Из чтения ушёл диапазон, сегментов больше нет — только живые куски.
+    let segs = buf.segments();
+    assert_eq!(segs.len(), 2);
+    assert_eq!(segs[0].src(), crate::ORIGINAL);
+    assert_eq!((segs[0].off, segs[0].len), (0, 2));
+    assert_eq!((segs[1].off, segs[1].len), (6, 4));
+    assert_eq!(buf.read(), b"016789");
+}
+
+#[test]
+fn delete_cuts_middle_of_single_segment() {
+    // Удаление из середины исходника: сегмент разрезается на два живых куска.
+    let mut buf = Buffer::with_arena_size(b"0123456789", ArenaSize::Kb32);
+    buf.delete(3, 3).unwrap();
+    let segs = buf.segments();
+    assert_eq!(segs.len(), 2);
+    assert_eq!((segs[0].off, segs[0].len), (0, 3));
+    assert_eq!((segs[1].off, segs[1].len), (6, 4));
+    assert_eq!(buf.read(), b"0126789");
+}
+
+#[test]
+fn delete_whole_document() {
+    let mut buf = Buffer::with_arena_size(b"abc", ArenaSize::Kb32);
+    buf.delete(0, 3).unwrap();
+    assert!(buf.segments().is_empty());
+    assert!(buf.is_empty());
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"abc");
+}
+
 #[test]
 fn huge_insert_is_not_limited_by_arena() {
-    let mut b = Buffer::new("base");
-    let huge = vec![b'y'; ARENA_CAPACITY * 4];
-    b.insert(4, &huge).unwrap();
-    let mut expected = b"base".to_vec();
-    expected.extend_from_slice(&huge);
-    assert_eq!(b.read(), expected);
-    check_invariants(&b);
+    let mut buf = b("start|end");
+    let big = vec![b'x'; 1_000_000];
+    buf.insert(5, &big).unwrap();
+    assert_eq!(buf.len(), 1_000_009);
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"start|end");
 }
 
 #[test]
-fn replace_across_arena_boundary() {
-    let mut b = Buffer::new("head");
-    let chunk = vec![b'Z'; 64 * 1024];
-    for _ in 0..20 {
-        b.insert(b.len(), &chunk).unwrap();
-    }
-    b.insert(0, b"TAIL").unwrap();
-    let text = b.read();
-
-    b.replace(0, 4, b"HEAD").unwrap();
-
-    let mut expected = b"HEAD".to_vec();
-    expected.extend_from_slice(&text[4..]);
-    assert_eq!(b.read(), expected);
-    check_invariants(&b);
+fn discarded_redo_texts_removed_from_arena() {
+    let mut buf = b("");
+    buf.insert(0, b"A").unwrap();
+    buf.insert(1, b"B").unwrap();
+    buf.undo().unwrap();
+    assert_eq!(buf.read(), b"A");
+    let before = buf.undo_stack().len();
+    buf.insert(1, b"C").unwrap();
+    assert_eq!(buf.read(), b"AC");
+    assert_eq!(buf.undo_stack().len(), before + 1);
+    assert!(buf.redo_stack().is_empty());
 }
 
 #[test]
 fn differential_against_reference_string() {
-    for initial in ["", "hello", "aaaabbbbcccc"] {
-        for seed in 0..6u64 {
-            let mut rng = Rng::new(seed);
-            let mut buffer = Buffer::new(initial);
-            let mut reference = Reference {
-                current: initial.to_string(),
-                ..Default::default()
-            };
-            let mut adds = 0;
-
-            for step in 0..300 {
-                match rng.below(100) {
-                    0..=34 => {
-                        let pos = rng.below_u32(buffer.len() + 1);
-                        let data = if rng.below(8) == 0 {
-                            Vec::new()
-                        } else {
-                            random_data(&mut rng)
-                        };
-                        buffer.insert(pos, &data).unwrap();
-                        if !data.is_empty() {
-                            let text = String::from_utf8(data).unwrap();
-                            let at = pos as usize;
-                            reference.edit(|s| s.insert_str(at, &text));
-                        }
-                    }
-                    35..=59 => {
-                        let len = buffer.len();
-                        if len > 0 {
-                            let pos = rng.below_u32(len);
-                            let del = 1 + rng.below_u32(len - pos);
-                            buffer.delete(pos, del).unwrap();
-                            let (at, upto) = (pos as usize, (pos + del) as usize);
-                            reference.edit(|s| {
-                                s.replace_range(at..upto, "");
-                            });
-                        }
-                    }
-                    60..=69 => {
-                        let len = buffer.len();
-                        let pos = rng.below_u32(len + 1);
-                        let del = rng.below_u32(len - pos + 1);
-                        let data = if rng.below(5) == 0 {
-                            Vec::new()
-                        } else {
-                            random_data(&mut rng)
-                        };
-                        buffer.replace(pos, del, &data).unwrap();
-                        if del > 0 {
-                            let (at, upto) = (pos as usize, (pos + del) as usize);
-                            reference.edit(|s| {
-                                s.replace_range(at..upto, "");
-                            });
-                        }
-                        if !data.is_empty() {
-                            let text = String::from_utf8(data).unwrap();
-                            let at = pos as usize;
-                            reference.edit(|s| s.insert_str(at, &text));
-                        }
-                    }
-                    70..=84 => {
-                        buffer.undo();
-                        reference.undo();
-                    }
-                    _ => {
-                        buffer.redo();
-                        reference.redo();
-                    }
-                }
-
-                let context = format!("initial={initial:?} seed={seed} step={step}");
-                assert_eq!(
-                    buffer.read(),
-                    reference.current.as_bytes(),
-                    "текст разошёлся: {context}"
-                );
-                assert_eq!(
-                    buffer.len(),
-                    reference.current.len() as u32,
-                    "длина: {context}"
-                );
-                assert_eq!(buffer.original(), initial.as_bytes(), "original: {context}");
-                assert!(buffer.add_count() >= adds, "arena уменьшилась: {context}");
-                adds = buffer.add_count();
-                check_invariants(&buffer);
-
-                let before = buffer.read();
-                buffer.rebuild();
-                assert_eq!(
-                    buffer.read(),
-                    reference.current.as_bytes(),
-                    "текст после rebuild: {context}"
-                );
-                assert_eq!(buffer.read(), before, "rebuild изменил текст: {context}");
-                check_invariants(&buffer);
-            }
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
         }
     }
-}
 
-/// Буфер сегментов выделяется один раз и больше не перевыделяется: пересборка
-/// и работа с историей не трогают кучу.
-#[test]
-fn segment_buffer_is_allocated_once() {
-    let mut b = Buffer::new("0123456789abcdef");
-    for i in 0..500u32 {
-        let pos = (i * 13) % (b.len() + 1);
-        b.insert(pos, b"xyz").unwrap();
-        let len = b.len();
-        if len > 8 {
-            b.delete(len / 3, 5).unwrap();
+    let mut rng = Rng(0x7f4a7c15);
+    let mut buf = Buffer::new(b"");
+    let mut ref_text = String::new();
+
+    for _ in 0..3000 {
+        let data = [b'a' + (rng.below(26) as u8)];
+        if ref_text.is_empty() {
+            buf.insert(0, &data).unwrap();
+            ref_text.insert(0, data[0] as char);
+            continue;
         }
+        if rng.below(3) == 0 {
+            // Удаление.
+            let anchor = rng.below(ref_text.len());
+            let len = rng.below(ref_text.len() - anchor);
+            buf.delete(anchor as u32, len as u32).unwrap();
+            ref_text.drain(anchor..anchor + len);
+        } else {
+            // Вставка.
+            let anchor = rng.below(ref_text.len() + 1);
+            buf.insert(anchor as u32, &data).unwrap();
+            ref_text.insert(anchor, data[0] as char);
+        }
+        assert_eq!(buf.read(), ref_text.as_bytes(), "состояния разошлись");
     }
-    for _ in 0..10 {
-        b.rebuild();
-        check_invariants(&b);
-    }
-    while b.undo().is_some() {}
-    assert_eq!(b.read(), b"0123456789abcdef");
-    check_invariants(&b);
-}
-
-/// Повтор удаления не откладывает сегменты заново: копия от исходного
-/// удаления уже лежит в отложенной области. Без этого отложенная область
-/// росла бы на сегмент за цикл и переполняла буфер за ~16 000 циклов.
-#[test]
-fn redo_of_delete_does_not_grow_parked_area() {
-    let mut b = Buffer::new("0123456789abcdef");
-    b.delete(4, 6).unwrap();
-    let deleted = b.parked_count();
-    assert!(deleted > 0, "удаление ничего не отложило");
-
-    for _ in 0..20_000 {
-        b.undo().unwrap();
-        assert_eq!(b.read(), b"0123456789abcdef", "откат вернул не тот текст");
-        b.redo().unwrap();
-        assert_eq!(b.read(), b"0123abcdef", "повтор удаления испортил текст");
-    }
-
-    assert_eq!(
-        b.parked_count(),
-        deleted,
-        "отложенная область выросла при повторе удаления"
-    );
-    check_invariants(&b);
 }

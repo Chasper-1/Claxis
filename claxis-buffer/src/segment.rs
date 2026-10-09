@@ -1,59 +1,49 @@
-/// Источник сегмента: `0` — исходный текст, `1` — растущий буфер вставок.
-pub const ORIGINAL: u32 = 0;
-pub const ADDED: u32 = 1;
+use crate::arena::{ORIGINAL_ID, RecordId};
 
-/// Сегмент — описание одного непрерывного участка документа.
+/// Источник текста сегмента.
+pub mod source {
+    /// Исходный текст при загрузке.
+    pub const ORIGINAL: u8 = 0;
+    /// Растущий вектор вставленного текста.
+    pub const ADDED: u8 = 1;
+}
+
+pub use source::{ADDED, ORIGINAL};
+
+/// Сегмент: ссылка на запись, ссылка на текст и позиция. Байтов в себе не хранит.
 ///
-/// Байтов не содержит. Указывает, из какого источника (`src`) взять участок,
-/// с какого смещения (`off`) и сколько байт (`len`). Три `u32`, 12 байт.
+/// Четыре `u32` подряд — ровно 16 байт, без выравнивания и без хвоста.
+///
+/// Источник текста отдельным полем не хранится: он однозначно следует из
+/// записи. `record == ORIGINAL_ID` — это текст `Original`, любая другая
+/// запись — это `Insert`, и её текст лежит в `Added`. Дублировать это в
+/// сегменте незачем, а именно это поле раздувало сегмент с 16 до 20 байт.
+///
+/// Каждый сегмент несёт живой текст: чтение идёт по нему без пропусков.
+/// Удаление вырезает сегменты из `Current` физически — мёртвых сегментов
+/// не существует. Диапазоны удаления в сегмент не дублируются: они в записи.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Segment {
-    pub(crate) src: u32,
-    pub(crate) off: u32,
-    pub(crate) len: u32,
+    /// Запись, из которой взят текст. `ORIGINAL_ID` — текст `Original`.
+    pub record: RecordId,
+    /// Позиция, куда текст был вставлен или удалён.
+    pub pos: u32,
+    /// Смещение в источнике: где начинается этот кусок текста.
+    pub off: u32,
+    /// Сколько байт текста в сегменте.
+    pub len: u32,
 }
 
 impl Segment {
-    /// Сегмент из произвольного источника: разрез исходного сегмента даёт
-    /// тот же `src`.
-    pub(crate) fn new(src: u32, off: u32, len: u32) -> Self {
-        Self { src, off, len }
-    }
-
-    pub fn original(off: u32, len: u32) -> Self {
-        Self {
-            src: ORIGINAL,
-            off,
-            len,
+    /// Откуда читать текст сегмента — выводится из записи.
+    pub fn src(&self) -> u8 {
+        if self.record == ORIGINAL_ID {
+            ORIGINAL
+        } else {
+            ADDED
         }
-    }
-
-    pub fn added(off: u32, len: u32) -> Self {
-        Self {
-            src: ADDED,
-            off,
-            len,
-        }
-    }
-
-    pub fn is_original(&self) -> bool {
-        self.src == ORIGINAL
-    }
-
-    /// Смещение участка внутри источника.
-    pub fn offset(&self) -> u32 {
-        self.off
-    }
-
-    pub fn len(&self) -> u32 {
-        self.len
-    }
-
-    pub fn end(&self) -> u32 {
-        self.off + self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 }
+
+/// Ссылка на диапазон текста внутри источника.
+pub type TextRef = Segment;

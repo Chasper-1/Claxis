@@ -1,86 +1,178 @@
-use crate::arena::{ARENA_CAPACITY, Kind};
-use crate::segment::{ADDED, Segment};
+use std::mem::size_of;
 
-/// Сколько сегментов помещается в арену записей.
-pub const ARENA_RECORDS: usize = ARENA_CAPACITY / size_of::<crate::arena::Record>();
+use crate::arena::ORIGINAL_ID;
+use crate::arena::Record;
+use crate::segment::{ORIGINAL, Segment};
 
-/// Каждая запись арены добавляет в буфер не больше двух сегментов: вставка
-/// разрезает один на три, удаление откладывает края. Плюс один сегмент на
-/// исходный текст. Буфер выделяется на это количество один раз и больше не
-/// растёт: арена ограничена, значит и сегментов ограничено.
-pub const SEG_CAPACITY: usize = 1 + 2 * ARENA_RECORDS;
-
-/// Материализованное состояние документа: последовательность сегментов.
+/// Узел дерева сегментов: лист-сегмент или ветка с двумя детьми.
 ///
-/// Сегменты лежат в буфере по порядку документа, поэтому шаг — это индекс
-/// плюс или минус один.
+/// Ровно 16 байт. Обычный `enum` стоил бы 24: восемь байт уходили бы на
+/// дискриминант, который здесь не нужен — вид узла и так определяется по
+/// старшему биту поля `a`. Индексы узлов и записи меньше `2^31`, поэтому бит
+/// свободен.
 ///
-/// Позиция курсора — байтовая. Чтобы дойти до новой позиции, считается разница
-/// между новой и старой: вперёд длины прибавляются, назад вычитаются. Никакого
-/// поиска от начала не происходит.
-///
-/// Память под буфер выделена целиком при создании и дальше не перевыделяется.
-/// Читаются сегменты `0..count`. Удалённые сегменты не уничтожаются: они
-/// откладываются за живой областью, и отмена возвращает их в чтение. Смещение
-/// отложенного — относительное, поэтому переезд отложенной области не ломает
-/// сохранённые ссылки.
-#[derive(Debug)]
-pub struct Current {
-    segs: Vec<Segment>,
-    /// Сколько сегментов читается.
-    count: usize,
-    /// Сколько сегментов отложено в хвосте буфера: `segs[parked_from..]`.
-    parked: usize,
-    /// Начало отложенной области. Значимо только при `parked > 0`.
-    parked_from: usize,
-    /// Длина документа в байтах.
+/// У ветки кэшируются длина поддерева и высота — по ним идёт спуск к позиции
+/// за O(log n), без обхода сегментов.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Node {
+    /// Ветка: индекс левого ребёнка. Лист: `LEAF | record`.
+    a: u32,
+    /// Ветка: индекс правого ребёнка. Лист: позиция.
+    b: u32,
+    /// Ветка: длина поддерева. Лист: длина текста.
     len: u32,
-    /// Длина исходного текста: с неё начинается пересборка.
-    original_len: u32,
-    /// Позиция курсора: байт в документе, а также сегмент и смещение в нём.
-    cur_pos: u32,
-    cur_idx: usize,
-    cur_off: u32,
-    /// Временные буферы для собираемых последовательностей сегментов. Память
-    /// выделена один раз и переиспользуется: буферы не отдаются и не удаляются,
-    /// поэтому в горячем пути аллокаций нет.
-    scratch: Vec<Segment>,
-    /// Что остаётся в чтении при удалении.
-    kept: Vec<Segment>,
-    /// Что уходит из чтения при удалении.
-    removed: Vec<Segment>,
+    /// Ветка: высота поддерева. Лист: смещение в источнике.
+    c: u32,
 }
 
-impl Default for Current {
-    fn default() -> Self {
-        Self::from_original(&[])
+/// Старший бит `a`: узел-лист. Узлы-ветки держат в `a` индекс ребёнка.
+const LEAF: u32 = 1 << 31;
+
+/// Узел свободен: поле листа обнулено, чтобы не держать старый текст.
+const DEAD: Node = Node {
+    a: LEAF,
+    b: 0,
+    len: 0,
+    c: 0,
+};
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_leaf() {
+            write!(f, "Leaf {:?}", self.leaf_seg())
+        } else {
+            write!(
+                f,
+                "Branch {{ left: {}, right: {}, len: {}, height: {} }}",
+                self.left(),
+                self.right(),
+                self.len,
+                self.height()
+            )
+        }
     }
 }
 
-impl Current {
-    pub fn from_original(original: &[u8]) -> Self {
-        let len = original.len() as u32;
-        // Память выделяется один раз на весь срок жизни арены и больше не
-        // трогается: `segs` только заполняется.
-        let mut segs = Vec::with_capacity(SEG_CAPACITY);
-        if len > 0 {
-            segs.push(Segment::original(0, len));
+impl Node {
+    #[inline]
+    fn is_leaf(&self) -> bool {
+        self.a & LEAF != 0
+    }
+
+    #[inline]
+    fn leaf_seg(&self) -> Segment {
+        Segment {
+            record: self.a & !LEAF,
+            pos: self.b,
+            len: self.len,
+            off: self.c,
         }
-        let count = segs.len();
-        Self {
-            parked: 0,
-            parked_from: segs.len(),
-            segs,
-            count,
+    }
+
+    #[inline]
+    fn left(&self) -> u32 {
+        self.a
+    }
+
+    #[inline]
+    fn right(&self) -> u32 {
+        self.b
+    }
+
+    #[inline]
+    fn height(&self) -> u16 {
+        self.c as u16
+    }
+
+    fn leaf(seg: Segment) -> Node {
+        Node {
+            a: LEAF | seg.record,
+            b: seg.pos,
+            len: seg.len,
+            c: seg.off,
+        }
+    }
+
+    fn branch(left: u32, right: u32, len: u32, height: u16) -> Node {
+        Node {
+            a: left,
+            b: right,
             len,
-            original_len: len,
-            cur_pos: 0,
-            cur_idx: 0,
-            cur_off: 0,
-            scratch: Vec::with_capacity(SEG_CAPACITY),
-            kept: Vec::with_capacity(SEG_CAPACITY),
-            removed: Vec::with_capacity(SEG_CAPACITY),
+            c: height as u32,
         }
+    }
+}
+
+/// Пустое поддерево — пустой документ.
+const NIL: u32 = u32::MAX;
+
+/// Источники байт на время чтения.
+struct ReadCtx<'a> {
+    original: &'a [u8],
+    added: &'a [u8],
+}
+
+impl ReadCtx<'_> {
+    /// Срез источника: `src` — `ORIGINAL` или `ADDED`.
+    fn slice(&self, src: u8, off: u32, len: u32) -> &[u8] {
+        let off = off as usize;
+        let len = len as usize;
+        let source = if src == ORIGINAL {
+            self.original
+        } else {
+            self.added
+        };
+        source.get(off..off + len).unwrap_or_default()
+    }
+}
+
+/// `Current` — кеш: дерево сегментов в порядке документа.
+///
+/// Каждый сегмент несёт живой текст в порядке документа. Байтов не хранит:
+/// текст лежит в `Original` и `Added`, сегменты описывают, откуда и сколько
+/// взять. Удаление вырезает сегменты из дерева — мёртвых сегментов не бывает,
+/// при чтении смотреть на метки не надо.
+///
+/// Дерево сбалансировано по высоте. Вставка и удаление не двигают остальные
+/// сегменты: меняется только путь от корня к точке правки, поэтому обе
+/// операции стоят O(log n) независимо от размера документа.
+#[derive(Debug)]
+pub struct Current {
+    /// Пул узлов. Индекс узла — его ссылка.
+    nodes: Vec<Node>,
+    /// Корень дерева.
+    root: u32,
+    /// Длина документа в байтах.
+    len: u32,
+    /// Число живых сегментов (листьев).
+    leaves: u32,
+    /// Освобождённые узлы для повторного использования.
+    free: Vec<u32>,
+}
+
+impl Current {
+    /// Единое состояние: один лист на весь исходный текст.
+    pub fn from_original(original_len: u32, node_capacity: usize) -> Self {
+        let mut cur = Self {
+            nodes: Vec::with_capacity(node_capacity),
+            root: NIL,
+            len: 0,
+            leaves: 0,
+            free: Vec::new(),
+        };
+        if original_len > 0 {
+            let leaf = cur.make_leaf(Segment {
+                record: ORIGINAL_ID,
+                pos: 0,
+                len: original_len,
+                off: 0,
+            });
+            cur.root = leaf;
+            cur.leaves = 1;
+            cur.len = original_len;
+        }
+        cur
     }
 
     pub fn len(&self) -> u32 {
@@ -91,76 +183,341 @@ impl Current {
         self.len == 0
     }
 
-    /// Сегмент и смещение внутри него для байта `pos`.
-    ///
-    /// Идём от курсора на разницу между новой и старой позицией: вперёд индекс
-    /// растёт и длины прибавляются, назад индекс убывает и длины вычитаются.
-    fn locate(&mut self, pos: u32) -> (usize, u32) {
-        debug_assert!(pos <= self.len, "позиция за концом документа");
-        let delta = pos as i64 - self.cur_pos as i64;
-        let (idx, off) = if delta >= 0 {
-            self.walk_forward(self.cur_idx, self.cur_off, delta as u32)
+    /// Число сегментов в дереве.
+    pub fn seg_count(&self) -> u32 {
+        self.leaves
+    }
+
+    /// Высота дерева: 0 — пусто, 1 — один лист.
+    pub fn height(&self) -> usize {
+        self.height_of(self.root)
+    }
+
+    /// Узлов в пуле (занятых и свободных).
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Мест в пуле под узлы.
+    pub fn node_capacity(&self) -> usize {
+        self.nodes.capacity()
+    }
+
+    /// Свободных узлов в пуле.
+    pub fn free_count(&self) -> usize {
+        self.free.len()
+    }
+
+    /// Мест в пуле свободных узлов.
+    pub fn free_capacity(&self) -> usize {
+        self.free.capacity()
+    }
+
+    /// Размер узла в байтах.
+    pub const fn node_size() -> usize {
+        size_of::<Node>()
+    }
+
+    /// Размер сегмента в байтах.
+    pub const fn segment_size() -> usize {
+        size_of::<Segment>()
+    }
+
+    // ── пул узлов ────────────────────────────────────────────────────────
+
+    fn alloc(&mut self, node: Node) -> u32 {
+        if let Some(idx) = self.free.pop() {
+            self.nodes[idx as usize] = node;
+            idx
         } else {
-            self.walk_back(self.cur_idx, self.cur_off, (-delta) as u32)
-        };
-        debug_assert!(
-            self.count == 0 || idx < self.count,
-            "курсор ушёл за живые сегменты"
-        );
-        self.cur_pos = pos;
-        self.cur_idx = idx;
-        self.cur_off = off;
-        (idx, off)
-    }
-
-    fn walk_forward(&self, mut idx: usize, mut off: u32, mut left: u32) -> (usize, u32) {
-        while left > 0 {
-            let room = self.segs[idx].len() - off;
-            if left < room {
-                off += left;
-                break;
-            }
-            off += room;
-            left -= room;
-            if left == 0 {
-                break;
-            }
-            idx += 1;
-            debug_assert!(idx < self.count, "позиция за концом документа");
-            off = 0;
+            self.nodes.push(node);
+            (self.nodes.len() - 1) as u32
         }
-        (idx, off)
     }
 
-    fn walk_back(&self, mut idx: usize, mut off: u32, mut left: u32) -> (usize, u32) {
-        while left > 0 {
-            if off >= left {
-                off -= left;
-                break;
-            }
-            left -= off;
-            debug_assert!(idx > 0, "позиция до начала документа");
-            idx -= 1;
-            off = self.segs[idx].len();
+    fn make_leaf(&mut self, seg: Segment) -> u32 {
+        self.leaves += 1;
+        self.alloc(Node::leaf(seg))
+    }
+
+    /// Вернуть один узел в пул. Поддерево не освобождается — только узел.
+    fn release(&mut self, idx: u32) {
+        self.nodes[idx as usize] = DEAD;
+        self.free.push(idx);
+    }
+
+    /// Вернуть узел со всем поддеревом в пул.
+    fn release_tree(&mut self, idx: u32) {
+        if idx == NIL {
+            return;
         }
-        (idx, off)
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            self.leaves -= 1;
+        } else {
+            self.release_tree(node.left());
+            self.release_tree(node.right());
+        }
+        self.release(idx);
     }
 
-    /// Ставит курсор в известную точку: сегмент, смещение, позиция.
-    fn place_cursor(&mut self, idx: usize, off: u32, pos: u32) {
-        self.cur_idx = idx;
-        self.cur_off = off;
-        self.cur_pos = pos;
+    // ── свойства узла ─────────────────────────────────────────────────────
+
+    fn len_of(&self, idx: u32) -> u32 {
+        if idx == NIL {
+            return 0;
+        }
+        self.nodes[idx as usize].len
     }
 
-    pub fn segments(&self) -> &[Segment] {
-        &self.segs[..self.count]
+    fn height_of(&self, idx: u32) -> usize {
+        if idx == NIL {
+            return 0;
+        }
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            1
+        } else {
+            node.height() as usize
+        }
     }
 
-    #[cfg(test)]
-    pub(crate) fn parked_count(&self) -> usize {
-        self.parked
+    fn new_branch(&mut self, left: u32, right: u32) -> u32 {
+        let len = self.len_of(left) + self.len_of(right);
+        let height = 1 + self.height_of(left).max(self.height_of(right)) as u16;
+        self.alloc(Node::branch(left, right, len, height))
     }
+
+    /// Склеить два поддерева в одно сбалансированное.
+    ///
+    /// Если высоты разошлись больше чем на единицу — поворот. Инвариант
+    /// высот держится, поэтому спуск остаётся логарифмическим.
+    fn join(&mut self, left: u32, right: u32) -> u32 {
+        if left == NIL {
+            return right;
+        }
+        if right == NIL {
+            return left;
+        }
+        let (hl, hr) = (self.height_of(left), self.height_of(right));
+        if hl > hr + 1 {
+            let l = self.nodes[left as usize];
+            debug_assert!(!l.is_leaf());
+            let (ll, lr) = (l.left(), l.right());
+            if self.height_of(ll) >= self.height_of(lr) {
+                // Одиночный поворот вправо.
+                let mid = self.new_branch(lr, right);
+                let out = self.new_branch(ll, mid);
+                self.release(left);
+                return out;
+            }
+            // Двойной поворот: сначала влево по правому ребёнку.
+            let lr_node = self.nodes[lr as usize];
+            debug_assert!(!lr_node.is_leaf());
+            let (lrl, lrr) = (lr_node.left(), lr_node.right());
+            let new_left = self.new_branch(ll, lrl);
+            let new_right = self.new_branch(lrr, right);
+            let out = self.new_branch(new_left, new_right);
+            self.release(lr);
+            self.release(left);
+            return out;
+        }
+        if hr > hl + 1 {
+            let r = self.nodes[right as usize];
+            debug_assert!(!r.is_leaf());
+            let (rl, rr) = (r.left(), r.right());
+            if self.height_of(rr) >= self.height_of(rl) {
+                let mid = self.new_branch(left, rl);
+                let out = self.new_branch(mid, rr);
+                self.release(right);
+                return out;
+            }
+            let rl_node = self.nodes[rl as usize];
+            debug_assert!(!rl_node.is_leaf());
+            let (rll, rlr) = (rl_node.left(), rl_node.right());
+            let new_left = self.new_branch(left, rll);
+            let new_right = self.new_branch(rlr, rr);
+            let out = self.new_branch(new_left, new_right);
+            self.release(rl);
+            self.release(right);
+            return out;
+        }
+        self.new_branch(left, right)
+    }
+
+    // ── вставка ───────────────────────────────────────────────────────────
+
+    /// Вставка `ins_len` байт из `Added` начиная с `text_off` на позицию `pos`.
+    pub(crate) fn apply_insert(&mut self, pos: u32, text_off: u32, ins_len: u32, id: u32) {
+        let leaf = self.make_leaf(Segment {
+            record: id,
+            pos,
+            len: ins_len,
+            off: text_off,
+        });
+        self.root = self.insert_rec(self.root, 0, pos, leaf);
+        self.len += ins_len;
+    }
+
+    /// Лист `new_leaf` вставляется на позицию `pos` внутри поддерева `idx`,
+    /// лежащего от документа от `base`. Возвращает новое поддерево.
+    fn insert_rec(&mut self, idx: u32, base: u32, pos: u32, new_leaf: u32) -> u32 {
+        if idx == NIL {
+            return new_leaf;
+        }
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            let seg = node.leaf_seg();
+            let off = pos - base;
+            if off == 0 {
+                return self.join(new_leaf, idx);
+            }
+            if off >= seg.len {
+                return self.join(idx, new_leaf);
+            }
+            // Разрез листа: голова | вставка | хвост.
+            let head = self.make_leaf(Segment {
+                record: seg.record,
+                pos: seg.pos,
+                len: off,
+                off: seg.off,
+            });
+            let tail = self.make_leaf(Segment {
+                record: seg.record,
+                pos: seg.pos + off,
+                len: seg.len - off,
+                off: seg.off + off,
+            });
+            self.leaves -= 1; // старый лист разрезан на два
+            self.release(idx);
+            let mid = self.join(new_leaf, tail);
+            self.join(head, mid)
+        } else {
+            let (left, right) = (node.left(), node.right());
+            let left_len = self.len_of(left);
+            let (nl, nr) = if pos < base + left_len {
+                (self.insert_rec(left, base, pos, new_leaf), right)
+            } else {
+                (left, self.insert_rec(right, base + left_len, pos, new_leaf))
+            };
+            self.release(idx);
+            self.join(nl, nr)
+        }
+    }
+
+    // ── удаление ──────────────────────────────────────────────────────────
+
+    /// Физическое удаление диапазона `pos..pos+len` из дерева.
+    ///
+    /// Граничные листья обрезаются по границе диапазона, полностью покрытые
+    /// поддеревья уходят в пул. Байты никуда не исчезают: они остаются в
+    /// `Original` и `Added`, из `Current` уходит только ссылка.
+    pub(crate) fn apply_delete(&mut self, pos: u32, len: u32) {
+        if len == 0 || self.root == NIL {
+            return;
+        }
+        self.root = self.delete_rec(self.root, 0, pos, pos + len);
+        self.len -= len;
+    }
+
+    /// Вырезает `start..end` из поддерева `idx`, лежащего от `base`.
+    fn delete_rec(&mut self, idx: u32, base: u32, start: u32, end: u32) -> u32 {
+        if idx == NIL {
+            return NIL;
+        }
+        let node_end = base + self.len_of(idx);
+        // Нет пересечения — поддерево остаётся как есть.
+        if end <= base || start >= node_end {
+            return idx;
+        }
+        // Полное покрытие — поддерево уходит целиком.
+        if start <= base && end >= node_end {
+            self.release_tree(idx);
+            return NIL;
+        }
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            let seg = node.leaf_seg();
+            // Частичное покрытие листа: остаётся то, что вне диапазона.
+            let off_start = start.saturating_sub(base);
+            let off_end = (end - base).min(seg.len);
+            let head = if off_start > 0 {
+                self.make_leaf(Segment {
+                    record: seg.record,
+                    pos: seg.pos,
+                    len: off_start,
+                    off: seg.off,
+                })
+            } else {
+                NIL
+            };
+            let tail = if off_end < seg.len {
+                self.make_leaf(Segment {
+                    record: seg.record,
+                    pos: seg.pos + off_end,
+                    len: seg.len - off_end,
+                    off: seg.off + off_end,
+                })
+            } else {
+                NIL
+            };
+            self.leaves -= 1;
+            self.release(idx);
+            self.join(head, tail)
+        } else {
+            let (left, right) = (node.left(), node.right());
+            // База правого ребёнка — конец левого. Считаем до рекурсии:
+            // после спуска `left` может быть уже освобождён.
+            let right_base = base + self.len_of(left);
+            let nl = self.delete_rec(left, base, start, end);
+            let nr = self.delete_rec(right, right_base, start, end);
+            self.release(idx);
+            self.join(nl, nr)
+        }
+    }
+
+    /// Пересборка с нуля: один лист на `Original`, затем записи по порядку.
+    pub(crate) fn rebuild(
+        &mut self,
+        original_len: u32,
+        records: impl Iterator<Item = (u32, Record)>,
+    ) {
+        self.clear();
+        if original_len > 0 {
+            let leaf = self.make_leaf(Segment {
+                record: ORIGINAL_ID,
+                pos: 0,
+                len: original_len,
+                off: 0,
+            });
+            self.root = leaf;
+            self.leaves = 1;
+            self.len = original_len;
+        }
+        for (id, record) in records {
+            match record {
+                Record::Insert { anchor, head, text } => {
+                    self.apply_insert(anchor, text, head - anchor, id);
+                }
+                Record::Delete { anchor, head } => {
+                    let len = head - anchor;
+                    if len > 0 {
+                        self.apply_delete(anchor, len);
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.free.clear();
+        self.root = NIL;
+        self.len = 0;
+        self.leaves = 0;
+    }
+
+    // ── чтение ────────────────────────────────────────────────────────────
 
     pub fn read(&self, original: &[u8], added: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len as usize);
@@ -169,301 +526,86 @@ impl Current {
     }
 
     pub fn read_into(&self, out: &mut Vec<u8>, original: &[u8], added: &[u8]) {
-        let bases = [original.as_ptr(), added.as_ptr()];
-        // Сегменты подряд, читаем подряд: промахов кэша нет.
-        for seg in &self.segs[..self.count] {
-            debug_assert!(seg.len() > 0, "нулевой сегмент: {seg:?}");
-            let base = unsafe { *bases.get_unchecked((seg.src == ADDED) as usize) };
-            let bytes = unsafe {
-                std::slice::from_raw_parts(base.add(seg.off as usize), seg.len() as usize)
-            };
-            out.extend_from_slice(bytes);
+        let ctx = ReadCtx { original, added };
+        self.read_all_rec(self.root, &ctx, out);
+    }
+
+    fn read_all_rec(&self, idx: u32, ctx: &ReadCtx<'_>, out: &mut Vec<u8>) {
+        if idx == NIL {
+            return;
         }
-    }
-
-    /// Вставка `len` байт из растущего буфера, начиная с `text_off`.
-    pub(crate) fn apply_insert(&mut self, pos: u32, text_off: u32, len: u32) {
-        debug_assert!(len > 0, "нулевая вставка");
-        self.insert_segments(pos, &[Segment::added(text_off, len)]);
-        self.set_len(self.len as i64 + len as i64);
-    }
-
-    /// Возврат отложенных сегментов в чтение: отмена удаления.
-    pub(crate) fn restore_deleted(&mut self, pos: u32, parked: u32, len: u32) {
-        let restored = self.take_parked(parked, len);
-        let total: u32 = restored.iter().map(|seg| seg.len()).sum();
-        debug_assert_eq!(total, len, "отложенные сегменты не покрывают диапазон");
-        self.insert_segments(pos, &restored);
-        self.set_len(self.len as i64 + len as i64);
-    }
-
-    /// Исключение диапазона из чтения. Байты остаются на месте: отложенные
-    /// сегменты описывают ровно удалённый диапазон и ни байтом больше.
-    /// Возвращает их относительное смещение в отложенной области.
-    pub(crate) fn apply_delete(&mut self, pos: u32, len: u32) -> u32 {
-        self.cut(pos, len, true)
-    }
-
-    /// Повторное исключение диапазона из чтения: повтор удаления.
-    ///
-    /// Откладывать нечего: копия от исходного удаления уже лежит в
-    /// отложенной области, и её относительное смещение в записи осталось
-    /// тем же. Повторное откладывание только раздувало бы буфер.
-    pub(crate) fn redo_delete(&mut self, pos: u32, len: u32) {
-        self.cut(pos, len, false);
-    }
-
-    /// Убирает диапазон из чтения. При `park_removed` удалённые сегменты
-    /// кладутся в отложенную область и возвращается их относительное
-    /// смещение, иначе считается, что они там уже лежат.
-    fn cut(&mut self, pos: u32, len: u32, park_removed: bool) -> u32 {
-        debug_assert!(len > 0, "нулевое удаление");
-        debug_assert!(pos + len <= self.len, "удаление за концом документа");
-        let (first, start_off) = self.locate(pos);
-        let (last, end_off) = self.locate(pos + len);
-        let head = self.segs[first];
-        let tail = self.segs[last];
-
-        // Что остаётся в чтении: неразрезанные края диапазона.
-        self.kept.clear();
-        if start_off > 0 {
-            self.kept.push(Segment::new(head.src, head.off, start_off));
-        }
-        if end_off < tail.len() {
-            self.kept.push(Segment::new(
-                tail.src,
-                tail.off + end_off,
-                tail.len() - end_off,
-            ));
-        }
-        let put_len = self.kept.len();
-
-        // Что уходит из чтения: ровно удалённые байты.
-        self.removed.clear();
-        if first == last {
-            self.removed.push(Segment::new(
-                head.src,
-                head.off + start_off,
-                end_off - start_off,
-            ));
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            let seg = node.leaf_seg();
+            out.extend_from_slice(ctx.slice(seg.src(), seg.off, seg.len));
         } else {
-            if start_off < head.len() {
-                self.removed.push(Segment::new(
-                    head.src,
-                    head.off + start_off,
-                    head.len() - start_off,
-                ));
-            }
-            for i in first + 1..last {
-                self.removed.push(self.segs[i]);
-            }
-            if end_off > 0 {
-                self.removed.push(Segment::new(tail.src, tail.off, end_off));
-            }
-        }
-        let parked = if park_removed {
-            park(
-                &mut self.segs,
-                &mut self.parked,
-                &mut self.parked_from,
-                &self.removed,
-            )
-        } else {
-            0
-        };
-
-        let taken = last - first + 1;
-        splice(
-            &mut self.segs,
-            &mut self.count,
-            self.parked,
-            &mut self.parked_from,
-            first,
-            taken,
-            &self.kept,
-        );
-        self.set_len(self.len as i64 - len as i64);
-        // Позиция `pos` — это начало того, что осталось. Если не осталось ничего,
-        // это конец предыдущего сегмента, а если и его нет — начало документа.
-        match (self.count, put_len, start_off) {
-            (0, _, _) => self.place_cursor(0, 0, pos),
-            (_, 0, _) if first > 0 => {
-                let idx = first - 1;
-                self.place_cursor(idx, self.segs[idx].len(), pos);
-            }
-            (_, _, 0) => self.place_cursor(first, 0, pos),
-            _ => self.place_cursor(first, start_off, pos),
-        }
-        parked
-    }
-
-    /// Ставит готовую последовательность сегментов на позицию `pos`.
-    fn insert_segments(&mut self, pos: u32, segs: &[Segment]) {
-        let end = pos + segs.iter().map(|seg| seg.len()).sum::<u32>();
-        let (idx, mut off) = self.locate(pos);
-        if idx < self.count {
-            off = off.min(self.segs[idx].len());
-        }
-
-        // Позиция может попасть ровно на конец сегмента — это обычное разбиение,
-        // хвост при этом пустой и в последовательность не входит.
-        self.scratch.clear();
-        let mut taken = 0usize;
-        if off > 0 {
-            taken = 1;
-            let host = self.segs[idx];
-            self.scratch.push(Segment::new(host.src, host.off, off));
-        }
-        let inserted = segs.len();
-        self.scratch.extend_from_slice(segs);
-        if taken == 1 {
-            let host = self.segs[idx];
-            if off < host.len() {
-                self.scratch
-                    .push(Segment::new(host.src, host.off + off, host.len() - off));
-            }
-        }
-        splice(
-            &mut self.segs,
-            &mut self.count,
-            self.parked,
-            &mut self.parked_from,
-            idx,
-            taken,
-            &self.scratch,
-        );
-        // Курсор встаёт на конец вставленного: конец документа при вставке в
-        // конец, сама позиция — иначе.
-        if self.count == 0 {
-            self.place_cursor(0, 0, end);
-        } else {
-            let last = idx + taken + inserted - 1;
-            self.place_cursor(last, self.segs[last].len(), end);
+            self.read_all_rec(node.left(), ctx, out);
+            self.read_all_rec(node.right(), ctx, out);
         }
     }
 
-    /// Забирает отложенные сегменты общей длиной `bytes`, начиная со смещения.
-    fn take_parked(&self, parked: u32, bytes: u32) -> Vec<Segment> {
-        let mut at = self.parked_from + parked as usize;
+    /// Частичное чтение диапазона: обход с отсечением по длине, O(log n + ответ).
+    pub fn read_range(&self, start: u32, end: u32, original: &[u8], added: &[u8]) -> Vec<u8> {
+        let start = start.min(self.len);
+        let end = end.min(self.len).max(start);
         let mut out = Vec::new();
-        let mut total = 0u32;
-        while total < bytes {
-            debug_assert!(at < self.segs.len(), "отложенные сегменты кончились");
-            let seg = self.segs[at];
-            total += seg.len();
-            out.push(seg);
-            at += 1;
+        if start < end {
+            let ctx = ReadCtx { original, added };
+            self.read_range_rec(self.root, 0, start, end, &ctx, &mut out);
         }
         out
     }
 
-    /// Пересборка из исходного текста и активной истории, по порядку.
-    pub(crate) fn rebuild<'a>(&mut self, active: impl Iterator<Item = (Kind, u32, u32, u32)>) {
-        self.segs.clear();
-        self.count = 0;
-        self.parked = 0;
-        if self.original_len > 0 {
-            self.segs.push(Segment::original(0, self.original_len));
-            self.count = 1;
+    fn read_range_rec(
+        &self,
+        idx: u32,
+        base: u32,
+        start: u32,
+        end: u32,
+        ctx: &ReadCtx<'_>,
+        out: &mut Vec<u8>,
+    ) {
+        if idx == NIL {
+            return;
         }
-        self.parked_from = self.segs.len();
-        self.len = self.original_len;
-        self.place_cursor(0, 0, 0);
-        for (kind, pos, len, data) in active {
-            match kind {
-                Kind::Insert => self.apply_insert(pos, data, len),
-                // Смещение отложенных сегментов записанной правки здесь не
-                // годится: пересборка откладывает заново и получает своё.
-                Kind::Delete => {
-                    self.apply_delete(pos, len);
-                }
+        let node_end = base + self.len_of(idx);
+        if node_end <= start || base >= end {
+            return;
+        }
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            let seg = node.leaf_seg();
+            let a = start.saturating_sub(base).min(seg.len);
+            let b = (end - base).min(seg.len);
+            if b > a {
+                out.extend_from_slice(ctx.slice(seg.src(), seg.off + a, b - a));
             }
+        } else {
+            let (left, right) = (node.left(), node.right());
+            // База правого ребёнка — конец левого, а не конец всего
+            // поддерева: иначе рекурсия уйдёт вправо слишком далеко.
+            let right_base = base + self.len_of(left);
+            self.read_range_rec(left, base, start, end, ctx, out);
+            self.read_range_rec(right, right_base, start, end, ctx, out);
         }
     }
 
-    fn set_len(&mut self, next: i64) {
-        debug_assert!(next >= 0, "длина документа стала отрицательной");
-        debug_assert!(next <= u32::MAX as i64, "документ длиннее 4 ГиБ");
-        self.len = next as u32;
+    /// Все сегменты в порядке документа — для тестов и отладки.
+    pub fn segments(&self, out: &mut Vec<Segment>) {
+        out.clear();
+        self.collect(self.root, out);
     }
-}
 
-/// Живая область помещается до отложенной, иначе отложенная область переезжает
-/// целиком. Относительные смещения переживают переезд.
-fn ensure_live_room(
-    segs: &mut Vec<Segment>,
-    parked: usize,
-    parked_from: &mut usize,
-    needed: usize,
-) {
-    if needed > segs.len() {
-        debug_assert!(
-            needed <= SEG_CAPACITY,
-            "буфер сегментов переполнен: {needed} при ёмкости {SEG_CAPACITY}"
-        );
-        segs.resize(needed, Segment::original(0, 0));
+    fn collect(&self, idx: u32, out: &mut Vec<Segment>) {
+        if idx == NIL {
+            return;
+        }
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            out.push(node.leaf_seg());
+        } else {
+            self.collect(node.left(), out);
+            self.collect(node.right(), out);
+        }
     }
-    if parked == 0 || needed <= *parked_from {
-        return;
-    }
-    let size = parked;
-    let fit = needed + size;
-    debug_assert!(
-        fit <= SEG_CAPACITY,
-        "буфер сегментов переполнен: {fit} при ёмкости {SEG_CAPACITY}"
-    );
-    segs.resize(fit, Segment::original(0, 0));
-    segs.copy_within(*parked_from..*parked_from + size, needed);
-    *parked_from = needed;
-}
-
-/// Заменяет `taken` сегментов с индекса `at` на `put`.
-fn splice(
-    segs: &mut Vec<Segment>,
-    count: &mut usize,
-    parked: usize,
-    parked_from: &mut usize,
-    at: usize,
-    taken: usize,
-    put: &[Segment],
-) {
-    debug_assert!(at + taken <= *count, "диапазон за пределами документа");
-    let live = *count;
-    let grown = live - taken + put.len();
-    // Нужная длина — `grown`, а не `at + grown`: старший индекс, который
-    // трогает splice, равен `grown - 1`. Передача с лишним `at` заставляла
-    // resize заполнять нулями область за живыми сегментами на каждой правке.
-    ensure_live_room(segs, parked, parked_from, grown);
-    let src = at + taken;
-    let dst = at + put.len();
-    if src < live {
-        segs.copy_within(src..live, dst);
-    }
-    segs[at..dst].copy_from_slice(put);
-    *count = grown;
-}
-
-/// Кладёт сегменты в отложенную область. Смещение относительное к началу
-/// отложенной, поэтому переезд области не ломает сохранённую ссылку.
-fn park(
-    segs: &mut Vec<Segment>,
-    parked: &mut usize,
-    parked_from: &mut usize,
-    items: &[Segment],
-) -> u32 {
-    let n = items.len();
-    let dest = segs.len();
-    debug_assert!(
-        dest + n <= SEG_CAPACITY,
-        "буфер сегментов переполнен: {} при ёмкости {SEG_CAPACITY}",
-        dest + n
-    );
-    segs.resize(dest + n, Segment::original(0, 0));
-    segs[dest..dest + n].copy_from_slice(items);
-    let rel = if *parked == 0 { 0 } else { dest - *parked_from };
-    if *parked == 0 {
-        *parked_from = dest;
-    }
-    *parked += n;
-    rel as u32
 }

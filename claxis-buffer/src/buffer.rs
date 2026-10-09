@@ -1,16 +1,77 @@
-use crate::arena::{self, AddArena, ArenaSize, Kind, RecordId};
-use crate::current::Current;
-use crate::edit::{Edit, Error};
-use crate::history::History;
-use crate::segment::Segment;
+use std::fmt;
+use std::mem::size_of;
 
+use crate::arena::{Arena, ArenaSize, Record, RecordId};
+use crate::current::Current;
+
+/// Снимок памяти буфера — для диагностики и тестов.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeMemory {
+    pub nodes: usize,
+    pub node_capacity: usize,
+    pub free: usize,
+    pub free_capacity: usize,
+    pub leaves: usize,
+    pub node_size: usize,
+    pub added_capacity: usize,
+    pub original_capacity: usize,
+    pub record_size: usize,
+    pub arena_blocks: usize,
+    pub arena_capacity: usize,
+}
+
+impl TreeMemory {
+    /// Байт в пуле узлов вместе с запасом ёмкости.
+    pub fn tree_bytes(&self) -> usize {
+        self.node_capacity * self.node_size
+    }
+}
+
+impl fmt::Display for TreeMemory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "узлов {}/{} (свободно {}/{}), листьев {}, Added {}",
+            self.nodes,
+            self.node_capacity,
+            self.free,
+            self.free_capacity,
+            self.leaves,
+            self.added_capacity
+        )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Error {
+    OutOfBounds { anchor: u32, len: u32, doc_len: u32 },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::OutOfBounds {
+                anchor,
+                len,
+                doc_len,
+            } => {
+                write!(
+                    f,
+                    "range {anchor}..{} is outside the document of length {doc_len}",
+                    anchor.saturating_add(*len)
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Буфер Claxis: `Original`, `Added`, арена с двумя стеками и `Current`.
 pub struct Buffer {
     original: Vec<u8>,
-    /// Растущий буфер всего вставленного текста. Арена метаданных сюда не
-    /// пишет: текст масштабируется свободно, ограничены только записи.
     added: Vec<u8>,
-    arena: AddArena,
-    history: History,
+    arena: Arena,
     current: Current,
 }
 
@@ -21,52 +82,18 @@ impl Buffer {
 
     pub fn with_arena_size(original: impl AsRef<[u8]>, size: ArenaSize) -> Self {
         let original = original.as_ref().to_vec();
-        let current = Current::from_original(&original);
+        let arena = Arena::new(size);
+        let current = Current::from_original(original.len() as u32, 64);
         Self {
             original,
             added: Vec::new(),
-            arena: AddArena::new(size),
-            history: History::default(),
+            arena,
             current,
         }
     }
 
     pub fn original(&self) -> &[u8] {
         &self.original
-    }
-
-    pub fn arena_record(&self, id: RecordId) -> Option<&arena::Record> {
-        self.arena.get(id)
-    }
-
-    /// Участок растущего буфера вставленного текста.
-    pub fn added(&self, off: u32, len: u32) -> Option<&[u8]> {
-        self.added.get(off as usize..(off + len) as usize)
-    }
-
-    pub fn added_len(&self) -> u32 {
-        self.added.len() as u32
-    }
-
-    pub fn add_count(&self) -> u32 {
-        self.arena.len()
-    }
-
-    pub fn arena_remaining_records(&self) -> usize {
-        self.arena.remaining_records()
-    }
-
-    pub fn arena_remaining_bytes(&self) -> usize {
-        self.arena.remaining_bytes()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn parked_count(&self) -> usize {
-        self.current.parked_count()
-    }
-
-    pub fn segments(&self) -> &[Segment] {
-        self.current.segments()
     }
 
     pub fn len(&self) -> u32 {
@@ -77,150 +104,166 @@ impl Buffer {
         self.current.is_empty()
     }
 
+    /// Сегменты в порядке документа — для тестов и отладки.
+    pub fn segments(&self) -> Vec<crate::segment::Segment> {
+        let mut out = Vec::with_capacity(self.current.seg_count() as usize);
+        self.current.segments(&mut out);
+        out
+    }
+
+    /// Высота дерева сегментов — для тестов и диагностики.
+    pub fn tree_height(&self) -> usize {
+        self.current.height()
+    }
+
+    /// Размер узла дерева в байтах.
+    pub fn node_size() -> usize {
+        Current::node_size()
+    }
+
+    /// Размер сегмента в байтах.
+    pub fn segment_size() -> usize {
+        Current::segment_size()
+    }
+
+    /// Статистика памяти: узлы дерева, их ёмкость и свободные.
+    pub fn tree_memory(&self) -> TreeMemory {
+        TreeMemory {
+            nodes: self.current.node_count(),
+            node_capacity: self.current.node_capacity(),
+            free: self.current.free_count(),
+            free_capacity: self.current.free_capacity(),
+            leaves: self.current.seg_count() as usize,
+            node_size: Current::node_size(),
+            added_capacity: self.added.capacity(),
+            original_capacity: self.original.capacity(),
+            record_size: size_of::<Record>(),
+            arena_blocks: self.arena.block_count(),
+            arena_capacity: self.arena.capacity_records(),
+        }
+    }
+
     pub fn undo_stack(&self) -> &[RecordId] {
-        self.history.undo_stack()
+        self.arena.undo_stack()
     }
 
     pub fn redo_stack(&self) -> &[RecordId] {
-        self.history.redo_stack()
+        self.arena.redo_stack()
     }
 
-    /// Правки в порядке отмены: вершина undo — последняя.
-    pub fn undo_edits(&self) -> Vec<Edit> {
-        self.history
-            .undo_stack()
-            .iter()
-            .filter_map(|id| {
-                self.arena
-                    .get(*id)
-                    .map(|record| Edit::from_record(record, *id))
-            })
-            .collect()
+    pub fn record(&self, id: RecordId) -> Option<&Record> {
+        self.arena.get(id)
     }
 
-    pub fn redo_edits(&self) -> Vec<Edit> {
-        self.history
-            .redo_stack()
-            .iter()
-            .filter_map(|id| {
-                self.arena
-                    .get(*id)
-                    .map(|record| Edit::from_record(record, *id))
-            })
-            .collect()
+    pub fn remaining_records(&self) -> usize {
+        self.arena.remaining_records()
     }
 
-    pub fn insert(&mut self, pos: u32, data: &[u8]) -> Result<(), Error> {
-        self.check(pos, 0)?;
+    /// Вставка: текст дописывается в `Added`, запись — в `undo`, затем сегмент.
+    pub fn insert(&mut self, anchor: u32, data: &[u8]) -> Result<(), Error> {
+        if anchor > self.len() {
+            return Err(Error::OutOfBounds {
+                anchor,
+                len: 0,
+                doc_len: self.len(),
+            });
+        }
         if data.is_empty() {
             return Ok(());
         }
-        if self.arena.remaining() == 0 {
-            self.snapshot();
-        }
-        self.history.discard_redo();
-        let text_off = self.push_text(data);
+        self.discard_redo_with_cleanup();
+        let text = self.added.len() as u32;
+        self.added.extend_from_slice(data);
         let len = data.len() as u32;
-        let id = self
-            .arena
-            .push(arena::Record::insert(pos, len, text_off))
-            .ok_or(Error::ArenaFull)?;
-        self.current.apply_insert(pos, text_off, len);
-        self.history.push(id);
+        let id = self.arena.push(Record::insert(anchor, len, text));
+        self.current.apply_insert(anchor, text, len, id);
+        self.snapshot_if_needed();
         Ok(())
     }
 
-    pub fn delete(&mut self, pos: u32, len: u32) -> Result<(), Error> {
-        self.check(pos, len)?;
+    /// Удаление: запись в `undo`, диапазон физически вырезается из `Current`.
+    pub fn delete(&mut self, anchor: u32, len: u32) -> Result<(), Error> {
+        self.check(anchor, len)?;
         if len == 0 {
             return Ok(());
         }
-        if self.arena.remaining() == 0 {
-            self.snapshot();
-        }
-        self.history.discard_redo();
-        // Удаление сначала применяется к документу: отложенные сегменты
-        // известны только после него, а в запись они пишутся сразу.
-        let parked = self.current.apply_delete(pos, len);
-        let id = self
-            .arena
-            .push(arena::Record::delete(pos, len, parked))
-            .ok_or(Error::ArenaFull)?;
-        self.history.push(id);
+        self.discard_redo_with_cleanup();
+        let _ = self.arena.push(Record::delete(anchor, len));
+        self.current.apply_delete(anchor, len);
+        self.snapshot_if_needed();
         Ok(())
     }
 
-    pub fn replace(&mut self, pos: u32, len: u32, data: &[u8]) -> Result<(), Error> {
-        self.check(pos, len)?;
-        if !data.is_empty() && data.len() as u32 > self.arena.remaining() {
+    /// Порог числа сегментов, после которого берётся снапшот.
+    ///
+    /// Дерево держит не больше этого числа листьев, поэтому память ограничена
+    /// сверху независимо от того, как долго и как интенсивно идёт правка.
+    /// Всё, что старше, уходит на диск (§11 снапшота).
+    pub const MAX_LEAVES: u32 = 16 * 1024;
+
+    /// Снапшот по достижении порога листьев.
+    ///
+    /// Деревья больше `MAX_LEAVES` листьев в памяти не живут: лишнее схлопывается
+    /// в новый `Original`, дерево возвращается к одному листу, арена и `Added`
+    /// очищаются. История до этого момента выгружена на диск.
+    fn snapshot_if_needed(&mut self) {
+        if self.current.seg_count() > Self::MAX_LEAVES {
             self.snapshot();
         }
-        self.delete(pos, len)?;
-        self.insert(pos, data)
     }
 
-    /// Снапшот: документ собирается в текст, текст становится новым исходным,
-    /// арена переиспользуется.
+    /// Замена — удаление и вставка, никакой отдельной модели.
+    pub fn replace(&mut self, anchor: u32, len: u32, data: &[u8]) -> Result<(), Error> {
+        self.delete(anchor, len)?;
+        self.insert(anchor, data)
+    }
+
+    /// Отмена: верхняя запись `undo` уходит в `redo`, `Current` пересобирается.
+    pub fn undo(&mut self) -> Option<RecordId> {
+        let id = self.arena.undo()?;
+        self.rebuild();
+        Some(id)
+    }
+
+    /// Повтор отменённой правки: запись возвращается из `redo` в `undo`.
+    pub fn redo(&mut self) -> Option<RecordId> {
+        let id = self.arena.redo()?;
+        self.rebuild();
+        Some(id)
+    }
+
+    /// Снапшот: текст из `Current` становится новым `Original`, всё обнуляется.
     pub fn snapshot(&mut self) {
         let text = self.read();
         self.original = text;
         self.added.clear();
         self.arena.reset();
-        self.current = Current::from_original(&self.original);
-        // TODO: переезд истории на новый исходный текст — см. отчёт.
-        self.history = History::default();
+        self.current = Current::from_original(self.original.len() as u32, 0);
     }
 
-    pub fn undo(&mut self) -> Option<Edit> {
-        let id = self.history.undo()?;
-        let record = *self.arena.get(id)?;
-        let edit = Edit::from_record(&record, id);
-        match record.kind() {
-            // Вставка отменяется удалением: сегменты уходят из чтения.
-            Kind::Insert => {
-                self.current.apply_delete(record.pos(), record.len());
-            }
-            // Удаление отменяется возвратом отложенных сегментов в чтение.
-            Kind::Delete => {
-                self.current
-                    .restore_deleted(record.pos(), record.data(), record.len());
-            }
+    /// Пересборка `Current` линейным проходом по активным записям `undo`.
+    fn rebuild(&mut self) {
+        let records = self
+            .arena
+            .undo_stack()
+            .iter()
+            .filter_map(|&id| self.arena.get(id).map(|r| (id, *r)));
+        self.current.rebuild(self.original.len() as u32, records);
+    }
+
+    fn discard_redo_with_cleanup(&mut self) {
+        if self.arena.redo_stack().is_empty() {
+            return;
         }
-        Some(edit)
-    }
-
-    pub fn redo(&mut self) -> Option<Edit> {
-        let id = self.history.redo()?;
-        let record = *self.arena.get(id)?;
-        let edit = Edit::from_record(&record, id);
-        match record.kind() {
-            Kind::Insert => self
-                .current
-                .apply_insert(record.pos(), record.data(), record.len()),
-            Kind::Delete => {
-                self.current.redo_delete(record.pos(), record.len());
-            }
+        let cleared = self.arena.discard_redo();
+        let tail = cleared
+            .iter()
+            .filter_map(|&id| self.arena.get(id))
+            .filter_map(Record::text)
+            .min();
+        if let Some(off) = tail {
+            self.added.truncate(off as usize);
         }
-        Some(edit)
-    }
-
-    /// Пересборка из исходного текста и активной истории, по порядку.
-    pub fn rebuild(&mut self) {
-        // Поля берутся раздельно: записи отдаются по одному, без сбора в
-        // промежуточный вектор — пересборка не выделяет память.
-        let Buffer {
-            arena,
-            history,
-            current,
-            ..
-        } = self;
-        current.rebuild(
-            history
-                .undo_stack()
-                .iter()
-                .filter_map(|id| arena.get(*id))
-                .map(|r| (r.kind(), r.pos(), r.len(), r.data())),
-        );
     }
 
     pub fn read(&self) -> Vec<u8> {
@@ -231,18 +274,17 @@ impl Buffer {
         self.current.read_into(out, &self.original, &self.added);
     }
 
-    /// Текст вставки уходит в растущий буфер — он ничем не ограничен.
-    fn push_text(&mut self, data: &[u8]) -> u32 {
-        let text_off = self.added.len() as u32;
-        self.added.extend_from_slice(data);
-        text_off
+    /// Частичное чтение диапазона документа.
+    pub fn read_range(&self, start: u32, end: u32) -> Vec<u8> {
+        self.current
+            .read_range(start, end, &self.original, &self.added)
     }
 
-    fn check(&self, pos: u32, len: u32) -> Result<(), Error> {
-        match pos.checked_add(len) {
+    fn check(&self, anchor: u32, len: u32) -> Result<(), Error> {
+        match anchor.checked_add(len) {
             Some(end) if end <= self.len() => Ok(()),
             _ => Err(Error::OutOfBounds {
-                pos,
+                anchor,
                 len,
                 doc_len: self.len(),
             }),
