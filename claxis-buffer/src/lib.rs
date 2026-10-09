@@ -5,7 +5,7 @@ mod edit;
 mod history;
 mod segment;
 
-pub use arena::{ARENA_CAPACITY, AddArena, Kind, Record, RecordId};
+pub use arena::{ARENA_CAPACITY, AddArena, ArenaSize, Kind, Record, RecordId};
 pub use buffer::Buffer;
 pub use current::Current;
 pub use edit::{Edit, Error};

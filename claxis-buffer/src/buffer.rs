@@ -1,4 +1,4 @@
-use crate::arena::{self, AddArena, Kind, RecordId};
+use crate::arena::{self, AddArena, ArenaSize, Kind, RecordId};
 use crate::current::Current;
 use crate::edit::{Edit, Error};
 use crate::history::History;
@@ -16,12 +16,16 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn new(original: impl AsRef<[u8]>) -> Self {
+        Self::with_arena_size(original, ArenaSize::Kb128)
+    }
+
+    pub fn with_arena_size(original: impl AsRef<[u8]>, size: ArenaSize) -> Self {
         let original = original.as_ref().to_vec();
         let current = Current::from_original(&original);
         Self {
             original,
             added: Vec::new(),
-            arena: AddArena::default(),
+            arena: AddArena::new(size),
             history: History::default(),
             current,
         }
@@ -46,6 +50,14 @@ impl Buffer {
 
     pub fn add_count(&self) -> u32 {
         self.arena.len()
+    }
+
+    pub fn arena_remaining_records(&self) -> usize {
+        self.arena.remaining_records()
+    }
+
+    pub fn arena_remaining_bytes(&self) -> usize {
+        self.arena.remaining_bytes()
     }
 
     #[cfg(test)]
