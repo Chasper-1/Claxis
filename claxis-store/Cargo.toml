@@ -1,0 +1,8 @@
+[package]
+name = "claxis-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# bundled: SQLite собирается из исходников, системный пакет не нужен.
+rusqlite = { version = "0.37", features = ["bundled"] }

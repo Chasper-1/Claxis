@@ -6,6 +6,12 @@ name = "Claxis"
 version = "0.1.1"
 edition = "2024"
 
+# Бинарная цель остаётся `Claxis`, библиотечная — `claxis`: слой API и
+# маршрутизатор публичны и должны называться по правилам Rust.
+[lib]
+name = "claxis"
+path = "src/lib.rs"
+
 [dependencies]
 claxis-buffer = { path = "claxis-buffer" }
 claxis-store = { path = "claxis-store" }
