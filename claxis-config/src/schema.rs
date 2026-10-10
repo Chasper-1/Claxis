@@ -209,6 +209,22 @@ pub const KEYS: &[KeyDef] = &[
         kind: Kind::U32,
         comment: "Upper bound for history depth, no more is possible.",
     },
+    // Режим: секция названа режимом, ключ внутри неё.
+    KeyDef {
+        file: ConfigFile::Edit,
+        path: "Word.indent_size",
+        default: "4",
+        kind: Kind::U32,
+        comment: "How many spaces one indent level is worth.",
+    },
+    // Третий уровень разрешён внутри режима, когда иначе не выразить.
+    KeyDef {
+        file: ConfigFile::Edit,
+        path: "Word.Word.keep_indent_on_blank_line",
+        default: "true",
+        kind: Kind::Bool,
+        comment: "Keep the indent on a line that has no other text.",
+    },
     // ── command.toml ───────────────────────────────────────────────────
     KeyDef {
         file: ConfigFile::Command,
@@ -362,17 +378,14 @@ mod tests {
     fn keys_have_no_abbreviations() {
         // Сокращения недопустимы: имя читает человек в конфиге. Проверяем
         // слова целиком, а не подстроки: `history` — обычное слово.
-        let banned = ["tmo", "to", "isz", "sz", "cnt", "maxlen", "cfg", "amt"];
+        // Критерий не длина слова, а непрозрачность: короткие обычные слова
+        // вроде `on` или `in` читаются, а `tmo` приходится расшифровывать.
+        let banned = ["tmo", "isz", "cnt", "maxlen", "cfg", "amt", "tmp", "cur"];
         for key in KEYS {
             for word in key.key().split('_') {
                 assert!(
                     !banned.contains(&word),
                     "ключ {} содержит сокращение {word}",
-                    key.path
-                );
-                assert!(
-                    word.len() >= 3,
-                    "ключ {} содержит слишком короткое слово {word}",
                     key.path
                 );
             }

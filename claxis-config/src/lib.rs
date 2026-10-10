@@ -8,16 +8,18 @@
 //! локализации, но не наоборот.
 
 pub mod error;
+pub mod load;
 pub mod schema;
 
 pub use error::{Error, Result};
+pub use load::{Issue, Loaded, Problem};
 pub use schema::{ConfigFile, GENERAL, KEYS, KeyDef, Kind};
 
 /// Конфиг целиком: по файлу на состояние.
 ///
 /// Каждое состояние открыто отдельно: так комментарии и порядок ключей внутри
 /// файла не зависят от того, что происходит в соседнем.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Config {
     files: Vec<(ConfigFile, toml_edit::DocumentMut)>,
 }
@@ -81,6 +83,11 @@ impl Config {
         self.get(def)
             .and_then(|i| i.as_bool())
             .unwrap_or(def.default == "true")
+    }
+
+    /// Ключ есть в файле и не отключён плохой секцией.
+    pub fn has(&self, def: &'static KeyDef) -> bool {
+        self.get(def).is_some()
     }
 
     /// Ключи, которые встречаются в файле, но в схеме не значатся.
