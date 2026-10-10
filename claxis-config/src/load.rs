@@ -162,8 +162,33 @@ fn walk(
 
         let section = prefix.to_string();
         let path = here(prefix, name);
+        let mut issue_key = path.clone();
         let problem = match super::schema::find(file, &path) {
-            None => Some(Problem::UnknownKey),
+            None => {
+                // Табличная настройка: путь есть в TABLES, а не в KEYS.
+                // Внутри неё любые ключи — это данные, проверяем значения.
+                match super::schema::find_table(file, &path) {
+                    Some(table) => {
+                        if let Some(inner) = item.as_table_like() {
+                            let mut problem = None;
+                            for (key, value) in inner.iter() {
+                                if let Err(p) = check_kind(table.kind, value) {
+                                    issue_key = table.path_of(key);
+                                    problem = Some(p);
+                                    break;
+                                }
+                            }
+                            problem
+                        } else {
+                            Some(Problem::BadType {
+                                expected: table.kind.expected(),
+                                got: item.to_string().trim().to_string(),
+                            })
+                        }
+                    }
+                    None => Some(Problem::UnknownKey),
+                }
+            }
             Some(def) => check(def, item).err(),
         };
         if let Some(problem) = problem {
@@ -172,7 +197,7 @@ fn walk(
             issues.push(Issue {
                 file: file.file_name(),
                 line: line_of(text, &section, name).unwrap_or(0),
-                key: path,
+                key: issue_key,
                 problem,
             });
         }
@@ -192,6 +217,22 @@ pub fn parse_all(files: impl IntoIterator<Item = (ConfigFile, String)>) -> Loade
     }
     all.config = Config::from_documents(docs);
     all
+}
+
+/// Значение соответствует типу внутри табличной настройки?
+fn check_kind(
+    kind: super::schema::Kind,
+    item: &toml_edit::Item,
+) -> std::result::Result<(), Problem> {
+    let placeholder = KeyDef {
+        file: super::schema::ConfigFile::Global,
+        path: "",
+        default: "0",
+        kind,
+        comment: "",
+        active: true,
+    };
+    check(&placeholder, item)
 }
 
 /// Значение соответствует типу ключа?

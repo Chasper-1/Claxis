@@ -91,7 +91,26 @@ pub fn render(file: ConfigFile, catalog: &claxis_i18n::Catalog) -> String {
         if key.section() != section {
             section = key.section();
             out.push_str(&format!("\n[{section}]\n\n"));
+            out.push_str(&table_body(key.file, section, catalog));
         }
+        // Табличная настройка: значение само является таблицей.
+        if let Some(table) = schema::find_table(key.file, key.path) {
+            let name = key.key();
+            out.push_str(&format!("# {}\n", tr(catalog, table.comment)));
+            out.push_str(&format!(
+                "# Value: {}.\n",
+                tr(catalog, kind_hint(table.kind))
+            ));
+            let pairs: Vec<String> = table
+                .default
+                .iter()
+                .map(|(k, v)| format!("{k} = {v}"))
+                .collect();
+            let inner = pairs.join(",\n    ");
+            out.push_str(&format!("{name} = {{\n    {inner},\n}}\n\n"));
+            continue;
+        }
+
         // Комментарий — тоже текст для пользователя, значит тоже переводится.
         // Ключом служит английская фраза: каталог ищет её как есть.
         out.push_str(&format!("# {}\n", tr(catalog, key.comment)));
@@ -112,12 +131,59 @@ pub fn render(file: ConfigFile, catalog: &claxis_i18n::Catalog) -> String {
     out
 }
 
+/// Тело табличной настройки, если она есть в этой секции.
+///
+/// Значение само является таблицей, а имена её ключей — данные, которые задаёт
+/// пользователь: сколько клавиш настроить, решает он.
+fn table_body(file: schema::ConfigFile, section: &str, catalog: &claxis_i18n::Catalog) -> String {
+    let Some(table) = schema::TABLES
+        .iter()
+        .find(|t| t.file == file && section_prefix(t) == section)
+    else {
+        return String::new();
+    };
+    let pairs: Vec<String> = table
+        .default
+        .iter()
+        .map(|(k, v)| format!("{k} = {v}"))
+        .collect();
+    // Inline table обязана быть в одну строку: многострочная невалидна по
+    // спецификации TOML, и разбор её отвергнет.
+    format!(
+        "# {}\n# Value: {}.\n{} = {{ {} }}\n\n",
+        tr(catalog, table.comment),
+        tr(catalog, kind_hint(table.kind)),
+        table_name(table),
+        pairs.join(", "),
+    )
+}
+
+/// Секция, в которой живёт табличная настройка: `General.hold` → `General`.
+fn section_prefix(table: &schema::TableDef) -> &str {
+    table.path.rsplit_once('.').map_or("", |(s, _)| s)
+}
+
+/// Имя настройки, значение которой таблица: `General.hold` → `hold`.
+fn table_name(table: &schema::TableDef) -> &str {
+    table.path.rsplit('.').next().unwrap_or(table.path)
+}
+
 /// Простое: ключ перевода — английская фраза, как её писал переводчик.
 pub const NOT_SET: &str = "Not set: no value is assigned to this key.";
 
 /// Перевод английской фразы. Без перевода остаётся английский.
 fn tr<'a>(catalog: &'a claxis_i18n::Catalog, text: &'a str) -> &'a str {
     catalog.get(text).unwrap_or(text)
+}
+
+/// Подсказка о типе значения для каталога.
+fn kind_hint(kind: schema::Kind) -> &'static str {
+    match kind {
+        schema::Kind::Bool => "true or false",
+        schema::Kind::U32 => "a whole number",
+        schema::Kind::U8 => "a number from 0 to 255",
+        schema::Kind::Str => "a string",
+    }
 }
 
 /// Значение ключа так, как оно записывается в TOML.
@@ -263,10 +329,15 @@ mod tests {
         claxis_i18n::Catalog::from_entries(
             [
                 (
+                    "Keys that mean two things, and how long a press counts as held. The key is the key itself, the value is the window in milliseconds. Add as many keys as you like.",
+                    "Клавиши со значением, и окно удержания для каждой.",
+                ),
+                (
                     "Not set: no value is assigned to this key.",
                     "Не задано: ключу не назначено значение.",
                 ),
                 ("Value: a whole number.", "Значение: целое число."),
+                ("a whole number", "целое число"),
             ]
             .map(|(k, v)| (k.to_string(), v.to_string())),
         )
@@ -312,6 +383,7 @@ mod tests {
         // Комментарий виден и понятен с момента создания файла.
         for &file in ConfigFile::ALL {
             let text = render(file, &plain());
+
             for key in KEYS.iter().filter(|k| k.file == file) {
                 assert!(
                     text.contains(key.comment),
@@ -540,5 +612,21 @@ mod tests {
         assert!(loaded.is_ok(), "проблемы: {:?}", loaded.issues);
         let keep = schema::find(ConfigFile::Files, "General.snapshots_persist").unwrap();
         assert!(!loaded.config.bool_or_default(keep));
+    }
+}
+
+#[cfg(test)]
+mod sn9 {
+    #[test]
+    fn show_parsed() {
+        let c = claxis_i18n::Catalog::new();
+        let text = crate::generate::render(crate::ConfigFile::Global, &c);
+        println!("T>>>\n{text}");
+        let loaded = crate::load::parse(crate::ConfigFile::Global, &text);
+        println!("P>>> issues={:?}", loaded.issues);
+        println!(
+            "P>>> table={:?}",
+            loaded.config.table(&crate::schema::TABLES[0])
+        );
     }
 }

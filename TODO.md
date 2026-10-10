@@ -176,7 +176,7 @@
 
 * [x] `claxis-buffer` — только `history_depth`.
 * [x] `claxis-store` — `keep`, `persist`. Перенесено из буфера.
-* [x] `claxis-input` — `tap_hold_ms`. Крейт создан заранее, чтобы настройка
+* [x] `claxis-input` — `General.hold`. Крейт создан заранее, чтобы настройка
       не потерялась и не лежала не в том крейте.
 * [x] `claxis-text` — общее форматирование в одном месте: `substitute` и
       `group_digits`. Правило: правится здесь, а не в каждом крейте.

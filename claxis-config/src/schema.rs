@@ -13,7 +13,7 @@
 //! ```toml
 //! # config.toml — настройки всего редактора
 //! [General]
-//! tap_hold_milliseconds = 200
+//! hold = { alt = 200, ctrl = 200 }
 //!
 //! # edit.toml — состояние правки
 //! [General]
@@ -175,6 +175,47 @@ impl KeyDef {
     }
 }
 
+/// Настройка, значение которой — таблица со свободными ключами.
+///
+/// Обычная настройка это «один ключ — одно значение», и все такие ключи
+/// перечислены в [`KEYS`]. А здесь наоборот: значение само является таблицей, и
+/// **имена её ключей — это данные**. Сколько записей настроить, решает
+/// пользователь, поэтому перечислить их в схеме нельзя.
+#[derive(Clone, Copy, Debug)]
+pub struct TableDef {
+    /// Файл и путь настройки: `General.hold`.
+    pub file: ConfigFile,
+    /// Путь настройки внутри файла.
+    pub path: &'static str,
+    /// Тип значения каждого ключа внутри таблицы.
+    pub kind: Kind,
+    /// Значения по умолчанию: имя ключа и его значение.
+    pub default: &'static [(&'static str, &'static str)],
+    /// Комментарий к настройке. Он же ключ в каталоге перевода.
+    pub comment: &'static str,
+}
+
+impl TableDef {
+    /// Путь одного ключа внутри таблицы: `General.hold.alt`.
+    pub fn path_of(&self, key: &str) -> String {
+        format!("{}.{key}", self.path)
+    }
+}
+
+/// Настройки, значение которых — таблица.
+pub const TABLES: &[TableDef] = &[TableDef {
+    file: ConfigFile::Global,
+    path: "General.hold",
+    kind: Kind::U32,
+    default: &[("alt", "200"), ("ctrl", "200")],
+    comment: "Keys that mean two things, and how long a press counts as held. The key is the key itself, the value is the window in milliseconds. Add as many keys as you like.",
+}];
+
+/// Найти табличную настройку по файлу и пути.
+pub fn find_table(file: ConfigFile, path: &str) -> Option<&'static TableDef> {
+    TABLES.iter().find(|t| t.file == file && t.path == path)
+}
+
 /// Все ключи конфига.
 ///
 /// Один список — источник правды. Генератор берёт отсюда и значения, и
@@ -182,14 +223,6 @@ impl KeyDef {
 /// невозможно, потому что список один.
 pub const KEYS: &[KeyDef] = &[
     // ── config.toml — настройки всего редактора ────────────────────────
-    KeyDef {
-        file: ConfigFile::Global,
-        path: "General.tap_hold_milliseconds",
-        default: "200",
-        kind: Kind::U32,
-        comment: "How long a key is held before it counts as held, in milliseconds.",
-        active: false,
-    },
     KeyDef {
         file: ConfigFile::Global,
         path: "General.language",
@@ -300,13 +333,13 @@ mod tests {
         // Общие настройки всего редактора — в `config.toml`, а не в состоянии.
         assert_eq!(ConfigFile::Global.file_name(), "config.toml");
         assert!(!ConfigFile::Global.is_state());
-        let key = find(ConfigFile::Global, "General.tap_hold_milliseconds").unwrap();
-        assert!(key.is_general());
-        // Ключа общего файла нет ни в одном состоянии.
+        let table = find_table(ConfigFile::Global, "General.hold").unwrap();
+        assert_eq!(table.path, "General.hold");
+        // Табличной настройки нет ни в одном состоянии.
         for file in ConfigFile::STATES {
             assert!(
-                find(*file, "General.tap_hold_milliseconds").is_none(),
-                "ключ всего редактора попал в {:?}",
+                find_table(*file, "General.hold").is_none(),
+                "настройка всего редактора попала в {:?}",
                 file.file_name()
             );
         }

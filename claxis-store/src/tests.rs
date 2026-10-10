@@ -257,11 +257,11 @@ fn last_good_config_round_trip() {
 
     let mut store = store;
     store
-        .save_last_good("config", "tap_hold_milliseconds = 200")
+        .save_last_good("config", "hold = { alt = 200, ctrl = 200 }")
         .unwrap();
     assert_eq!(
         store.last_good("config").unwrap().as_deref(),
-        Some("tap_hold_milliseconds = 200")
+        Some("hold = { alt = 200, ctrl = 200 }")
     );
 }
 

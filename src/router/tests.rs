@@ -417,21 +417,32 @@ fn common_settings_are_read_from_the_editor_file() {
     // Общие настройки редактора лежат в config.toml, а не в состоянии.
     let config = crate::api::config::Config::from_documents([(
         crate::api::config::ConfigFile::Global,
-        "[General]\ntap_hold_milliseconds = 350\n".parse().unwrap(),
+        "[General]\nhold = { alt = 350, ctrl = 200 }\n"
+            .parse()
+            .unwrap(),
     )]);
-    let key = crate::api::config::schema::find(
+    let table = crate::api::config::schema::find_table(
         crate::api::config::ConfigFile::Global,
-        "General.tap_hold_milliseconds",
+        "General.hold",
     )
     .unwrap();
-    assert_eq!(config.u32_or_default(key), 350);
+    let pairs = config.table(table);
+    assert_eq!(
+        pairs,
+        vec![
+            ("alt".to_string(), "350".to_string()),
+            ("ctrl".to_string(), "200".to_string())
+        ]
+    );
 
     // Тот же ключ в файле состояния ничего не делает.
     let leaked = crate::api::config::Config::from_documents([(
         crate::api::config::ConfigFile::Edit,
-        "[General]\ntap_hold_milliseconds = 350\n".parse().unwrap(),
+        "[General]\nhold = { alt = 350, ctrl = 200 }\n"
+            .parse()
+            .unwrap(),
     )]);
-    assert_eq!(leaked.u32_or_default(key), 200);
+    assert!(leaked.table(table).is_empty());
 }
 
 #[test]

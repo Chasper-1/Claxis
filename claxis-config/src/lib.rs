@@ -18,6 +18,7 @@ pub mod watch;
 pub use error::{Error, Result};
 pub use load::{Issue, Loaded, Problem};
 pub use messages::{En, Messages};
+pub use schema::TableDef;
 pub use schema::{ConfigFile, GENERAL, KEYS, KeyDef, Kind};
 pub use watch::Watch;
 
@@ -82,6 +83,38 @@ impl Config {
             .and_then(|i| i.as_integer())
             .map(|n| n as u32)
             .unwrap_or_else(|| def.default.parse().unwrap_or(0))
+    }
+
+    /// Значение табличной настройки: пары «ключ, значение» как они записаны.
+    ///
+    /// Пусто, если настройки нет или она не разобралась.
+    pub fn table(&self, def: &'static TableDef) -> Vec<(String, String)> {
+        let Some(document) = self.doc(def.file) else {
+            return Vec::new();
+        };
+        let mut cursor: &dyn toml_edit::TableLike = document.as_table();
+        for part in def
+            .path
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or("")
+            .split('.')
+        {
+            match cursor.get(part).and_then(|next| next.as_table_like()) {
+                Some(table) => cursor = table,
+                None => return Vec::new(),
+            }
+        }
+        let Some(value) = cursor
+            .get(def.path.rsplit('.').next().unwrap_or(""))
+            .and_then(|v| v.as_table_like())
+        else {
+            return Vec::new();
+        };
+        value
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string().trim().to_string()))
+            .collect()
     }
 
     /// Значение от 0 до 255 из конфига, иначе значение по умолчанию.
