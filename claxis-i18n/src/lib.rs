@@ -110,3 +110,34 @@ impl Catalog {
         dups
     }
 }
+
+/// Все сообщения крейте с примерами значений.
+pub fn samples() -> Vec<(&'static str, String)> {
+    let m = crate::Error::UnknownLang {
+        lang: "klingon".to_string(),
+    };
+    let read = crate::Error::Read {
+        path: "/home/u/.config/claxis/lang/ru.toml".to_string(),
+        reason: "permission denied".to_string(),
+    };
+    let parse = crate::Error::Parse {
+        path: "/home/u/.config/claxis/lang/ru.toml".to_string(),
+        reason: "line 4: unclosed quote".to_string(),
+    };
+    let incomplete = crate::Error::Incomplete {
+        lang: "ru".to_string(),
+        count: 12,
+        total: 340,
+    };
+    let duplicate = crate::Error::DuplicateKey {
+        lang: "ru".to_string(),
+        key: "Open file".to_string(),
+    };
+    vec![
+        ("unknown_lang", m.to_string()),
+        ("read_failed", read.to_string()),
+        ("parse_failed", parse.to_string()),
+        ("incomplete", incomplete.to_string()),
+        ("duplicate_key", duplicate.to_string()),
+    ]
+}

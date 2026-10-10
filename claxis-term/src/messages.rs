@@ -21,3 +21,8 @@ impl Messages for En {
             .to_string()
     }
 }
+/// Все сообщения крейте с примерами значений.
+pub fn samples() -> Vec<(&'static str, String)> {
+    let m = En;
+    vec![("no_kitty_protocol", m.no_kitty_protocol())]
+}

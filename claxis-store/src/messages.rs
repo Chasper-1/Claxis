@@ -52,3 +52,19 @@ impl Messages for En {
         )
     }
 }
+/// Все сообщения крейте с примерами значений.
+pub fn samples() -> Vec<(&'static str, String)> {
+    let m = En;
+    vec![
+        (
+            "open_failed",
+            m.open_failed("/home/u/.cache/claxis/store.db", "disk is read-only"),
+        ),
+        (
+            "prepare_dir_failed",
+            m.prepare_dir_failed("/home/u/.cache/claxis", "no space left on device"),
+        ),
+        ("query_failed", m.query_failed("database is locked")),
+        ("no_snapshot", m.no_snapshot("/home/u/project/src/main.rs")),
+    ]
+}

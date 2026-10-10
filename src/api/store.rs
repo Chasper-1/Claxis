@@ -5,4 +5,5 @@
 //! крейтов делает маршрутизатор `crate::router`.
 
 pub use claxis_store::defaults::{KEEP, PERSIST};
+pub use claxis_store::messages;
 pub use claxis_store::{Error, SnapshotStore, StorePaths};

@@ -2,7 +2,7 @@ mod arena;
 mod buffer;
 mod current;
 pub mod defaults;
-mod messages;
+pub mod messages;
 mod segment;
 pub mod snapshot;
 

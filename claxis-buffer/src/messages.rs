@@ -125,3 +125,24 @@ impl Messages for En {
         substitute("unclosed brace at \"{at}\"", &[("at", at.to_string())])
     }
 }
+/// Все сообщения крейте с примерами значений.
+///
+/// Нужны для отладочного вывода и для переводчика: он видит не ключ, а то,
+/// как сообщение выглядит на самом деле, с настоящими числами вместо
+/// имён в фигурных скобках.
+pub fn samples() -> Vec<(&'static str, String)> {
+    let m = En;
+    vec![
+        ("out_of_bounds", m.out_of_bounds(1_000, 2_000, 1_500)),
+        (
+            "invalid_history_depth",
+            m.invalid_history_depth(90_000, 1, 8192),
+        ),
+        ("tree_pool_exhausted", m.tree_pool_exhausted(32_776, 8192)),
+        (
+            "bad_placeholder",
+            m.bad_placeholder("capasity", &["capacity", "depth"]),
+        ),
+        ("unclosed_brace", m.unclosed_brace("{capacity")),
+    ]
+}

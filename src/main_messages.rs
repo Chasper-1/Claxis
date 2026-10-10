@@ -35,3 +35,13 @@ impl Messages for En {
         claxis_text::substitute("{event}", &[("event", event.to_string())])
     }
 }
+
+/// Все сообщения бинарника с примерами значений.
+pub fn samples() -> Vec<(&'static str, String)> {
+    let m = En;
+    vec![
+        ("terminal_failed", m.terminal_failed("terminal closed")),
+        ("session_failed", m.session_failed("cannot open store")),
+        ("event_line", m.event_line("KeyPressed { key: Char('a') }")),
+    ]
+}
