@@ -10,3 +10,7 @@ pub mod i18n;
 pub mod input;
 pub mod store;
 pub mod term;
+pub mod text;
+
+#[cfg(test)]
+mod tests;

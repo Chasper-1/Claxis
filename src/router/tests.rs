@@ -194,7 +194,7 @@ fn unreadable_file_reports_error() {
 fn buffer_and_store_do_not_know_each_other() {
     // Стык сделан в роутере: крейты не зависят друг от друга.
     // Проверяем, что буфер работает и без приёмника вообще.
-    let mut buf = claxis_buffer::Buffer::new("начало".as_bytes());
+    let mut buf = crate::api::buffer::Buffer::new("начало".as_bytes());
     for _ in 0..9000 {
         buf.insert(buf.len(), b"x").unwrap();
     }
@@ -231,7 +231,7 @@ fn bad_history_depth_reports_error() {
 #[test]
 fn session_opens_in_standard_cache_path() {
     // Путь по умолчанию — кеш ОС, а не рабочий каталог.
-    let paths = claxis_store::StorePaths::from_env();
+    let paths = crate::api::store::StorePaths::from_env();
     let dir = paths.dir.display().to_string();
     assert!(
         dir.ends_with("claxis"),
@@ -290,7 +290,7 @@ fn gigabytes_are_decimal_not_binary() {
 
 #[test]
 fn big_numbers_are_split_into_readable_parts() {
-    use claxis_text::group_digits;
+    use crate::api::text::group_digits;
 
     // Без разделителей длинное число не читается.
     assert_eq!(group_digits(4_294_967_295), "4 294 967 295");
@@ -349,12 +349,14 @@ fn defaults_come_from_crate_settings() {
 fn defaults_come_from_the_schema() {
     // Настройки без конфига берутся из схемы, а не из зашитых чисел.
     let settings = crate::router::Settings::defaults();
-    let depth =
-        claxis_config::schema::find(claxis_config::ConfigFile::Edit, "General.history_depth")
-            .unwrap()
-            .default
-            .parse::<u32>()
-            .unwrap();
+    let depth = crate::api::config::schema::find(
+        crate::api::config::ConfigFile::Edit,
+        "General.history_depth",
+    )
+    .unwrap()
+    .default
+    .parse::<u32>()
+    .unwrap();
     assert_eq!(settings.history_depth, depth);
     assert_eq!(settings.snapshots_keep, 3);
     assert!(settings.snapshots_persist);
@@ -364,13 +366,13 @@ fn defaults_come_from_the_schema() {
 #[test]
 fn each_file_owns_its_keys() {
     // Глубина истории живёт в edit.toml, снапшоты — в files.toml.
-    let config = claxis_config::Config::from_documents([
+    let config = crate::api::config::Config::from_documents([
         (
-            claxis_config::ConfigFile::Edit,
+            crate::api::config::ConfigFile::Edit,
             "[General]\nhistory_depth = 64\n".parse().unwrap(),
         ),
         (
-            claxis_config::ConfigFile::Files,
+            crate::api::config::ConfigFile::Files,
             "[General]\nsnapshots_keep = 7\nsnapshots_persist = false\n"
                 .parse()
                 .unwrap(),
@@ -386,8 +388,8 @@ fn each_file_owns_its_keys() {
 #[test]
 fn a_file_does_not_affect_another() {
     // Ключ из чужого файла игнорируется, а не применяется как будто свой.
-    let config = claxis_config::Config::from_documents([(
-        claxis_config::ConfigFile::Files,
+    let config = crate::api::config::Config::from_documents([(
+        crate::api::config::ConfigFile::Files,
         "[General]\nhistory_depth = 64\n".parse().unwrap(),
     )]);
     let settings = crate::router::Settings::from_config(&config);
@@ -398,14 +400,14 @@ fn a_file_does_not_affect_another() {
 fn every_file_opens_independently() {
     // Все файлы открываются вместе и не мешают друг другу: общий, три
     // состояния, темы и локализация.
-    let config = claxis_config::Config::from_documents(
-        claxis_config::ConfigFile::ALL
+    let config = crate::api::config::Config::from_documents(
+        crate::api::config::ConfigFile::ALL
             .iter()
             .map(|f| (*f, "[General]\n".parse().unwrap())),
     );
     let open = config.open_files();
-    assert_eq!(open.len(), claxis_config::ConfigFile::ALL.len());
-    for f in claxis_config::ConfigFile::ALL {
+    assert_eq!(open.len(), crate::api::config::ConfigFile::ALL.len());
+    for f in crate::api::config::ConfigFile::ALL {
         assert!(open.contains(f), "файл {} не открыт", f.file_name());
     }
 }
@@ -413,20 +415,20 @@ fn every_file_opens_independently() {
 #[test]
 fn common_settings_are_read_from_the_editor_file() {
     // Общие настройки редактора лежат в config.toml, а не в состоянии.
-    let config = claxis_config::Config::from_documents([(
-        claxis_config::ConfigFile::Global,
+    let config = crate::api::config::Config::from_documents([(
+        crate::api::config::ConfigFile::Global,
         "[General]\ntap_hold_milliseconds = 350\n".parse().unwrap(),
     )]);
-    let key = claxis_config::schema::find(
-        claxis_config::ConfigFile::Global,
+    let key = crate::api::config::schema::find(
+        crate::api::config::ConfigFile::Global,
         "General.tap_hold_milliseconds",
     )
     .unwrap();
     assert_eq!(config.u32_or_default(key), 350);
 
     // Тот же ключ в файле состояния ничего не делает.
-    let leaked = claxis_config::Config::from_documents([(
-        claxis_config::ConfigFile::Edit,
+    let leaked = crate::api::config::Config::from_documents([(
+        crate::api::config::ConfigFile::Edit,
         "[General]\ntap_hold_milliseconds = 350\n".parse().unwrap(),
     )]);
     assert_eq!(leaked.u32_or_default(key), 200);
@@ -435,17 +437,17 @@ fn common_settings_are_read_from_the_editor_file() {
 #[test]
 fn unknown_key_is_reported_per_file() {
     // Опечатку должно быть видно, и видно в том файле, где она.
-    let config = claxis_config::Config::from_documents([(
-        claxis_config::ConfigFile::Edit,
+    let config = crate::api::config::Config::from_documents([(
+        crate::api::config::ConfigFile::Edit,
         "[General]\nhistory_dept = 64\n".parse().unwrap(),
     )]);
     assert_eq!(
-        config.unknown_keys(claxis_config::ConfigFile::Edit),
+        config.unknown_keys(crate::api::config::ConfigFile::Edit),
         vec!["General.history_dept".to_string()]
     );
     assert!(
         config
-            .unknown_keys(claxis_config::ConfigFile::Files)
+            .unknown_keys(crate::api::config::ConfigFile::Files)
             .is_empty()
     );
 }
@@ -475,7 +477,7 @@ fn first_run_creates_every_config_file() {
     std::fs::create_dir_all(tmp.dir()).unwrap();
     let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
     assert!(!editor.created.is_empty(), "файлы должны быть созданы");
-    for file in claxis_config::ConfigFile::ALL {
+    for file in crate::api::config::ConfigFile::ALL {
         assert!(
             tmp.dir().join(file.file_name()).exists(),
             "{} не создан",
@@ -492,7 +494,7 @@ fn generated_files_carry_every_key_with_a_comment() {
     std::fs::create_dir_all(tmp.dir()).unwrap();
     crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
 
-    for key in claxis_config::KEYS {
+    for key in crate::api::config::KEYS {
         let path = tmp.dir().join(key.file.file_name());
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -584,9 +586,12 @@ fn editing_one_key_keeps_the_rest_of_the_file() {
     std::fs::create_dir_all(tmp.dir()).unwrap();
     crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
 
-    let key = claxis_config::schema::find(claxis_config::ConfigFile::Edit, "General.history_depth")
-        .unwrap();
-    claxis_config::generate::write_value(tmp.dir(), key, "256").unwrap();
+    let key = crate::api::config::schema::find(
+        crate::api::config::ConfigFile::Edit,
+        "General.history_depth",
+    )
+    .unwrap();
+    crate::api::config::generate::write_value(tmp.dir(), key, "256").unwrap();
 
     let text = std::fs::read_to_string(tmp.dir().join("edit.toml")).unwrap();
     assert!(text.contains("history_depth = 256"), "{text}");

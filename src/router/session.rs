@@ -16,7 +16,7 @@ use crate::messages::Messages;
 #[derive(Debug)]
 pub enum SessionError {
     /// Буфер не создан: глубина истории недопустима.
-    Buffer(claxis_buffer::Error),
+    Buffer(crate::api::buffer::Error),
     /// Хранилище не открылось.
     Store { path: String, reason: String },
     /// Файл документа не прочитан.

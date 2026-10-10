@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::messages::Messages;
+
 /// Ошибка конфига.
 #[derive(Debug)]
 pub enum Error {
@@ -63,24 +65,30 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Текст ошибки на языке каталога. По умолчанию — английский.
+    pub fn message(&self, m: &dyn Messages) -> String {
+        match self {
+            Error::Read { path, reason } => m.read_failed(path, reason),
+            Error::Write { path, reason } => m.write_failed(path, reason),
+            Error::Parse { path, reason } => m.parse_failed(path, reason),
+            Error::UnknownKey { key } => m.unknown_key(key),
+            Error::BadValue { key, got, expected } => m.bad_value(key, got, expected),
+            Error::WrongSection { key, want, got } => m.wrong_section(key, want, got),
+            Error::NoLastGood => m.no_last_good(),
+            Error::UnknownKeyInFile { file, key } => m.unknown_key_in_file(file, key),
+        }
+    }
+
+    /// Текст ошибки на языке по умолчанию.
+    pub fn text(&self) -> String {
+        self.message(&crate::messages::En)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Read { path, reason } => write!(f, "cannot read config {path}: {reason}"),
-            Error::Parse { path, reason } => write!(f, "cannot parse config {path}: {reason}"),
-            Error::UnknownKey { key } => write!(f, "unknown key: {key}"),
-            Error::BadValue { key, got, expected } => {
-                write!(f, "bad value for {key}: {got}, expected {expected}")
-            }
-            Error::WrongSection { key, want, got } => {
-                write!(f, "key {key} belongs to {want}, but is in {got}")
-            }
-            Error::Write { path, reason } => write!(f, "cannot write config {path}: {reason}"),
-            Error::NoLastGood => write!(f, "no saved valid config to fall back to"),
-            Error::UnknownKeyInFile { file, key } => {
-                write!(f, "{file}: unknown key {key}")
-            }
-        }
+        f.write_str(&self.text())
     }
 }
 

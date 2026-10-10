@@ -15,9 +15,11 @@
 
 pub mod defaults;
 pub mod error;
+pub mod messages;
 pub mod path;
 
 pub use error::{Error, Result};
+pub use messages::{En, Messages};
 pub use path::LangPath;
 
 /// Каталог: английский текст на перевод.

@@ -133,7 +133,7 @@ impl Buffer {
             original.as_ref(),
             crate::defaults::buffer::HISTORY_DEPTH.value,
         )
-        .expect("глубина по умолчанию корректна по построению")
+        .expect("the default history depth is valid by construction")
     }
 
     /// Буфер с заданной глубиной истории.

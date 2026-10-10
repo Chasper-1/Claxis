@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::messages::Messages;
+
 /// Ошибка перевода.
 #[derive(Debug)]
 pub enum Error {
@@ -42,22 +44,27 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Текст ошибки на языке каталога. По умолчанию — английский.
+    pub fn message(&self, messages: &dyn Messages) -> String {
+        match self {
+            Error::UnknownLang { lang } => messages.unknown_lang(lang),
+            Error::Read { path, reason } => messages.read_failed(path, reason),
+            Error::Parse { path, reason } => messages.parse_failed(path, reason),
+            Error::Incomplete { lang, count, total } => messages.incomplete(lang, *count, *total),
+            Error::DuplicateKey { lang, key } => messages.duplicate_key(lang, key),
+        }
+    }
+
+    /// Текст ошибки на языке по умолчанию.
+    pub fn text(&self) -> String {
+        self.message(&crate::messages::En)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::UnknownLang { lang } => write!(f, "unknown language: {lang}"),
-            Error::Read { path, reason } => write!(f, "cannot read translation {path}: {reason}"),
-            Error::Parse { path, reason } => {
-                write!(f, "cannot parse translation {path}: {reason}")
-            }
-            Error::Incomplete { lang, count, total } => write!(
-                f,
-                "translation for {lang} is incomplete: {count} of {total} strings missing"
-            ),
-            Error::DuplicateKey { lang, key } => {
-                write!(f, "translation for {lang} repeats the key {key}")
-            }
-        }
+        f.write_str(&self.text())
     }
 }
 

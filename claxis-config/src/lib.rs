@@ -10,12 +10,14 @@
 pub mod error;
 pub mod generate;
 pub mod load;
+pub mod messages;
 pub mod path;
 pub mod schema;
 pub mod watch;
 
 pub use error::{Error, Result};
 pub use load::{Issue, Loaded, Problem};
+pub use messages::{En, Messages};
 pub use schema::{ConfigFile, GENERAL, KEYS, KeyDef, Kind};
 pub use watch::Watch;
 

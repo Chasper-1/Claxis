@@ -141,6 +141,12 @@ pub struct KeyDef {
     /// Комментарий к ключу. Он же ключ в каталоге перевода: английский текст
     /// и есть то, что переводится.
     pub comment: &'static str,
+    /// Читает ли код это значение сейчас.
+    ///
+    /// Правдивость этого поля проверяется тестом: если ключ помечен как
+    /// подключённый, а его никто не читает, пользователь правит настройку и
+    /// не видит никакой разницы.
+    pub active: bool,
 }
 
 impl KeyDef {
@@ -179,6 +185,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "200",
         kind: Kind::U32,
         comment: "How long a key is held before it counts as held, in milliseconds.",
+        active: false,
     },
     KeyDef {
         file: ConfigFile::Global,
@@ -186,6 +193,7 @@ pub const KEYS: &[KeyDef] = &[
         default: claxis_i18n::defaults::DEFAULT_LANGUAGE,
         kind: Kind::Str,
         comment: "Active language. The file name in the lang folder is the language code.",
+        active: false,
     },
     KeyDef {
         file: ConfigFile::Global,
@@ -193,6 +201,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "default",
         kind: Kind::Str,
         comment: "Active theme. The file name in the theme folder is the theme name.",
+        active: false,
     },
     // ── edit.toml ──────────────────────────────────────────────────────
     KeyDef {
@@ -201,6 +210,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "8192",
         kind: Kind::U32,
         comment: "How many edits to keep in memory before taking a snapshot.",
+        active: true,
     },
     KeyDef {
         file: ConfigFile::Edit,
@@ -208,6 +218,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "8192",
         kind: Kind::U32,
         comment: "Upper bound for history depth, no more is possible.",
+        active: false,
     },
     // Режим: секция названа режимом, ключ внутри неё.
     KeyDef {
@@ -216,6 +227,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "4",
         kind: Kind::U32,
         comment: "How many spaces one indent level is worth.",
+        active: false,
     },
     // Третий уровень разрешён внутри режима, когда иначе не выразить.
     KeyDef {
@@ -224,6 +236,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "true",
         kind: Kind::Bool,
         comment: "Keep the indent on a line that has no other text.",
+        active: false,
     },
     // ── command.toml ───────────────────────────────────────────────────
     KeyDef {
@@ -232,6 +245,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "true",
         kind: Kind::Bool,
         comment: "Show completion suggestions while typing a command.",
+        active: false,
     },
     // ── files.toml ─────────────────────────────────────────────────────
     KeyDef {
@@ -240,6 +254,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "3",
         kind: Kind::U32,
         comment: "How many snapshots of one file to keep in the cache. Older ones are dropped.",
+        active: true,
     },
     KeyDef {
         file: ConfigFile::Files,
@@ -247,6 +262,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "true",
         kind: Kind::Bool,
         comment: "Keep snapshots in the cache between runs.",
+        active: true,
     },
 ];
 

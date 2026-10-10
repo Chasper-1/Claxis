@@ -7,6 +7,7 @@
 use std::io::Write;
 
 use crate::api::buffer;
+use crate::api::config;
 use crate::api::i18n;
 use crate::api::store;
 use crate::api::term;
@@ -45,8 +46,8 @@ pub fn print_messages(out: &mut impl Write) -> std::io::Result<()> {
         ("claxis-buffer", buffer::messages::samples()),
         ("claxis-store", store::messages::samples()),
         ("claxis-term", term::messages::samples()),
-        ("claxis-i18n", i18n::samples()),
-        ("claxis-config", config::samples()),
+        ("claxis-i18n", i18n::messages::samples()),
+        ("claxis-config", config::messages::samples()),
         ("Claxis", main_messages::samples()),
     ];
 
@@ -61,59 +62,38 @@ pub fn print_messages(out: &mut impl Write) -> std::io::Result<()> {
 }
 
 /// Справка по командной строке.
-pub fn print_help(out: &mut impl Write) -> std::io::Result<()> {
-    writeln!(out, "claxis [команда] [файл]")?;
+///
+/// Текст идёт через каталог: справку читает пользователь, значит она такая же
+/// переводимая, как всё остальное.
+pub fn print_help(out: &mut impl Write, m: &dyn main_messages::Messages) -> std::io::Result<()> {
+    writeln!(out, "{}", m.usage("claxis [command] [file]"))?;
     writeln!(out)?;
-    writeln!(out, "Без команды открывается редактор.")?;
+    writeln!(out, "{}", m.opens_editor())?;
     writeln!(out)?;
-    writeln!(out, "Команды:")?;
-    writeln!(out, "  messages   показать все сообщения всех крейтов")?;
-    writeln!(out, "  help       эта справка")?;
+    writeln!(out, "{}", m.commands_heading())?;
+    for (name, what) in COMMANDS {
+        writeln!(out, "{}", m.command_line(name, what))?;
+    }
     Ok(())
 }
 
-/// Сообщения крейта конфига, собранные здесь, чтобы команда не знала про него.
-mod config {
-    /// Все сообщения конфига с примерами значений.
-    pub fn samples() -> Vec<(&'static str, String)> {
-        let mut out = Vec::new();
-        let issue = claxis_config::load::Issue {
-            file: "edit.toml",
-            line: 2,
-            key: "General.history_dept".to_string(),
-            problem: claxis_config::Problem::UnknownKey,
-        };
-        out.push(("unknown_key", issue.text()));
-        let bad = claxis_config::load::Issue {
-            file: "files.toml",
-            line: 5,
-            key: "General.snapshots_keep".to_string(),
-            problem: claxis_config::Problem::BadType {
-                expected: "a whole number",
-                got: String::from("\"много\""),
-            },
-        };
-        out.push(("bad_value", bad.text()));
-        let unreadable = claxis_config::load::Issue {
-            file: "config.toml",
-            line: 0,
-            key: String::new(),
-            problem: claxis_config::Problem::Unreadable("permission denied".to_string()),
-        };
-        out.push(("unreadable", unreadable.text()));
-        out
-    }
-}
+/// Команды и что они делают. Значения переводятся каталогом.
+const COMMANDS: [(&str, &str); 2] = [
+    ("messages", "show every message of every crate"),
+    ("help", "this help"),
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{i18n, store, term};
 
     fn out_of(command: Command) -> String {
+        use crate::main_messages::En;
         let mut buf: Vec<u8> = Vec::new();
         match command {
             Command::Messages => print_messages(&mut buf).unwrap(),
-            Command::Help => print_help(&mut buf).unwrap(),
+            Command::Help => print_help(&mut buf, &En).unwrap(),
             Command::Run => {}
         }
         String::from_utf8(buf).unwrap()
@@ -160,8 +140,8 @@ mod tests {
         assert!(!buffer::messages::samples().is_empty());
         assert!(!store::messages::samples().is_empty());
         assert!(!term::messages::samples().is_empty());
-        assert!(!i18n::samples().is_empty());
-        assert!(!config::samples().is_empty());
+        assert!(!i18n::messages::samples().is_empty());
+        assert!(!config::messages::samples().is_empty());
         assert!(!main_messages::samples().is_empty());
     }
 
@@ -170,5 +150,48 @@ mod tests {
         let text = out_of(Command::Help);
         assert!(text.contains("messages"), "{text}");
         assert!(text.contains("help"), "{text}");
+    }
+
+    #[test]
+    fn help_comes_from_the_catalog() {
+        // Справка читает пользователь, значит она переводима наравне со всем
+        // остальным. Если появится перевод, он обязан сюда попасть.
+        use crate::main_messages::En;
+        struct Ru;
+        impl main_messages::Messages for Ru {
+            fn terminal_failed(&self, r: &str) -> String {
+                format!("нет терминала: {r}")
+            }
+            fn session_failed(&self, r: &str) -> String {
+                format!("нет сессии: {r}")
+            }
+            fn event_line(&self, e: &str) -> String {
+                format!("событие: {e}")
+            }
+            fn using_last_good(&self) -> String {
+                "взят запасной".to_string()
+            }
+            fn usage(&self, u: &str) -> String {
+                format!("запуск: {u}")
+            }
+            fn opens_editor(&self) -> String {
+                "откроется редактор".to_string()
+            }
+            fn commands_heading(&self) -> String {
+                "Команды:".to_string()
+            }
+            fn command_line(&self, n: &str, w: &str) -> String {
+                format!("  {n} — {w}")
+            }
+        }
+        let _ = En;
+        let mut buf: Vec<u8> = Vec::new();
+        print_help(&mut buf, &Ru).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("откроется редактор"),
+            "перевод не попал: {text}"
+        );
+        assert!(text.contains("Команды:"), "{text}");
     }
 }

@@ -6,6 +6,7 @@ use claxis::main_messages::{En, Messages};
 use claxis::router::Editor;
 
 fn main() {
+    let messages = En;
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Команды разбираются до терминала: `claxis messages` должен работать
@@ -20,7 +21,7 @@ fn main() {
         }
         Command::Help => {
             let mut out = std::io::stdout().lock();
-            let _ = cli::print_help(&mut out).and_then(|()| out.flush());
+            let _ = cli::print_help(&mut out, &messages).and_then(|()| out.flush());
         }
         // Редактор открывается с терминалом, дальше идёт обычный цикл.
         Command::Run => run(),
@@ -29,7 +30,6 @@ fn main() {
 
 fn run() {
     let messages = En;
-
     let mut term = match Terminal::new() {
         Ok(t) => t,
         Err(e) => {

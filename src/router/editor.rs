@@ -6,9 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use claxis_config::schema::ConfigFile;
-use claxis_config::{Issue, generate};
-use claxis_i18n::Catalog;
+use crate::api::config::schema::ConfigFile;
+use crate::api::config::{Issue, generate};
+
+use crate::api::i18n::Catalog;
 
 use crate::router::{Applied, Session, SessionError, Settings};
 
@@ -34,18 +35,25 @@ pub enum StartError {
     },
 }
 
+impl StartError {
+    /// Текст на языке каталога. По умолчанию — английский.
+    pub fn message(&self, m: &dyn crate::messages::Messages) -> String {
+        match self {
+            StartError::Session(e) => e.message(m),
+            StartError::ConfigDir { path, reason } => m.config_dir_failed(path, reason),
+            StartError::NoUsableConfig { issues } => m.no_usable_config(*issues),
+        }
+    }
+
+    /// Текст на языке по умолчанию.
+    pub fn text(&self) -> String {
+        self.message(&crate::messages::En)
+    }
+}
+
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StartError::Session(e) => write!(f, "{e}"),
-            StartError::ConfigDir { path, reason } => {
-                write!(f, "cannot use config directory {path}: {reason}")
-            }
-            StartError::NoUsableConfig { issues } => write!(
-                f,
-                "config has {issues} problems and no saved valid copy to fall back to"
-            ),
-        }
+        f.write_str(&self.text())
     }
 }
 
@@ -67,7 +75,7 @@ pub struct Editor {
     ///
     /// `None`, если система не смогла подписаться: конфиг перестанет
     /// применяться сам, и об этом честно скажем, а не промолчим.
-    pub watch: Option<claxis_config::Watch>,
+    pub watch: Option<crate::api::config::Watch>,
 }
 
 /// Что вышло из перечитывания конфига.
@@ -96,17 +104,17 @@ impl Reloaded {
 impl Editor {
     /// Открыть редактор с конфигом пользователя и хранилищем в кеше.
     pub fn open() -> Result<Self, StartError> {
-        let dir = claxis_config::path::user_dir().ok_or_else(|| StartError::ConfigDir {
+        let dir = crate::api::config::path::user_dir().ok_or_else(|| StartError::ConfigDir {
             path: "?".to_string(),
             reason: "cannot find the home directory".to_string(),
         })?;
-        let store_dir = claxis_store::path::StorePaths::from_env().dir;
+        let store_dir = crate::api::store::StorePaths::from_env().dir;
         Self::open_in(&dir, &store_dir)
     }
 
     /// Конфиг задан явно, хранилище — кеш пользователя.
     pub fn open_at(dir: &Path) -> Result<Self, StartError> {
-        let store_dir = claxis_store::path::StorePaths::from_env().dir;
+        let store_dir = crate::api::store::StorePaths::from_env().dir;
         Self::open_in(dir, &store_dir)
     }
 
@@ -114,10 +122,13 @@ impl Editor {
     pub fn open_in(config_dir: &Path, store_dir: &Path) -> Result<Self, StartError> {
         // Порядок важен: сначала читается конфиг, потом под его настройки
         // создаётся сессия. Иначе настройки из файла просто никуда не денутся.
-        let generated = generate::ensure_files(config_dir).map_err(|e| StartError::ConfigDir {
-            path: config_dir.display().to_string(),
-            reason: e.to_string(),
-        })?;
+        let generated =
+            generate::ensure_files(config_dir, &claxis_i18n::Catalog::new()).map_err(|e| {
+                StartError::ConfigDir {
+                    path: config_dir.display().to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
 
         let loaded = generate::read_all(config_dir);
         let issues = loaded.issues;
@@ -142,7 +153,7 @@ impl Editor {
         // Подписка на каталог: конфиг могут поменять снаружи, и открытый
         // редактор обязан это увидеть. Отписка не удаляет подписку, а лишь
         // говорит, что следить не вышло.
-        let mut watch = claxis_config::Watch::new(config_dir).ok();
+        let mut watch = crate::api::config::Watch::new(config_dir).ok();
         if let Some(w) = watch.as_mut() {
             // Подписка случилась до отметки: события между ними не считаются
             // изменением, а то первый же запуск сочтётся правкой конфига.
@@ -275,7 +286,7 @@ impl Editor {
 /// и работа не должна вставать из-за кеша.
 fn save_last_good(store_dir: &Path, dir: &Path) {
     let Ok(mut store) =
-        claxis_store::SnapshotStore::open(&claxis_store::path::StorePaths::new(store_dir), 1)
+        crate::api::store::SnapshotStore::open(&crate::api::store::StorePaths::new(store_dir), 1)
     else {
         return;
     };
@@ -288,9 +299,9 @@ fn save_last_good(store_dir: &Path, dir: &Path) {
 }
 
 /// Забрать последний корректный конфиг из кеша.
-fn load_last_good(store_dir: &Path) -> Option<claxis_config::Config> {
+fn load_last_good(store_dir: &Path) -> Option<crate::api::config::Config> {
     let store =
-        claxis_store::SnapshotStore::open(&claxis_store::path::StorePaths::new(store_dir), 1)
+        crate::api::store::SnapshotStore::open(&crate::api::store::StorePaths::new(store_dir), 1)
             .ok()?;
     let mut docs = Vec::new();
     for &file in ConfigFile::ALL {
@@ -303,5 +314,5 @@ fn load_last_good(store_dir: &Path) -> Option<claxis_config::Config> {
     if docs.is_empty() {
         return None;
     }
-    Some(claxis_config::Config::from_documents(docs))
+    Some(crate::api::config::Config::from_documents(docs))
 }

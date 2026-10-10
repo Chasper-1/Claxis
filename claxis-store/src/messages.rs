@@ -7,7 +7,8 @@ use claxis_text::substitute;
 
 /// Каталог сообщений об ошибках хранилища.
 ///
-/// Места под значения: `{path}`, `{reason}`, `{file}`.
+/// Места под значения: `{path}`, `{reason}`, `{lang}`, `{count}`, `{total}`,
+/// `{key}`.
 pub trait Messages {
     /// Файл базы не открылся.
     fn open_failed(&self, path: &str, reason: &str) -> String;

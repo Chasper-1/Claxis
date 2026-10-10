@@ -41,19 +41,14 @@ pub struct Issue {
 }
 
 impl Issue {
-    /// Текст для сообщения: файл, строка, ключ и суть.
-    ///
-    /// Собирается из частей, а не хранится готовой строкой: пользователь
-    /// переводит это на свой язык.
+    /// Текст на языке каталога. По умолчанию — английский.
+    pub fn message(&self, messages: &dyn super::messages::Messages) -> String {
+        messages.issue(self)
+    }
+
+    /// Текст на языке по умолчанию.
     pub fn text(&self) -> String {
-        let where_ = format!("{}:{}", self.file, self.line);
-        match &self.problem {
-            Problem::UnknownKey => format!("{where_}: unknown key {}", self.key),
-            Problem::BadType { expected, got } => {
-                format!("{where_}: key {} has {got}, expected {expected}", self.key)
-            }
-            Problem::Unreadable(reason) => format!("{where_}: cannot read file: {reason}"),
-        }
+        self.message(&super::messages::En)
     }
 }
 
