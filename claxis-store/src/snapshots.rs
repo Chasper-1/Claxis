@@ -31,12 +31,12 @@ pub struct SnapshotStore {
     /// Куда лежит база. Нужно, чтобы открыть ещё одно подключение.
     path: std::path::PathBuf,
     /// Сколько снапшотов одного файла хранить.
-    keep: u32,
+    keep: u8,
 }
 
 impl SnapshotStore {
     /// Открыть хранилище, создав базу при первом запуске.
-    pub fn open(paths: &StorePaths, keep: u32) -> Result<Self> {
+    pub fn open(paths: &StorePaths, keep: u8) -> Result<Self> {
         paths.ensure_dir()?;
         let conn = Connection::open(paths.database()).map_err(|e| Error::Open {
             path: paths.database().display().to_string(),
@@ -71,7 +71,7 @@ impl SnapshotStore {
     }
 
     /// Сколько снапшотов одного файла хранится.
-    pub fn keep(&self) -> u32 {
+    pub fn keep(&self) -> u8 {
         self.keep
     }
 
@@ -80,7 +80,7 @@ impl SnapshotStore {
     /// Меняется сразу, без перезапуска редактора: это просто число, вокруг
     /// которого крутится выборка. Старые лишние снапшоты не трогаются — они
     /// вытеснятся при следующей записи.
-    pub fn set_keep(&mut self, keep: u32) {
+    pub fn set_keep(&mut self, keep: u8) {
         self.keep = keep;
     }
 

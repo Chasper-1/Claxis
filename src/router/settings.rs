@@ -18,7 +18,7 @@ pub struct Settings {
     /// Глубина истории: сколько правок живёт в памяти до снапшота.
     pub history_depth: u32,
     /// Сколько снапшотов одного файла держать в кеше.
-    pub snapshots_keep: u32,
+    pub snapshots_keep: u8,
     /// Писать ли снапшоты на диск между запусками.
     pub snapshots_persist: bool,
     /// Активный язык.
@@ -52,7 +52,7 @@ impl Settings {
             settings.history_depth = config.u32_or_default(def);
         }
         if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_keep") {
-            settings.snapshots_keep = config.u32_or_default(def);
+            settings.snapshots_keep = config.u8_or_default(def);
         }
         if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_persist") {
             settings.snapshots_persist = config.bool_or_default(def);

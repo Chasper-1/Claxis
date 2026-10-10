@@ -28,12 +28,12 @@ impl Temp {
         self.dir.join(name)
     }
 
-    fn session(&self, keep: u32) -> Session {
+    fn session(&self, keep: u8) -> Session {
         Session::open_at(self.dir.clone(), keep).unwrap()
     }
 
     /// Сессия с короткой историей: снапшот срабатывает быстро.
-    fn short_session(&self, keep: u32, depth: u32) -> Session {
+    fn short_session(&self, keep: u8, depth: u32) -> Session {
         Session::open_at_with(self.dir.clone(), keep, true, depth).unwrap()
     }
 
@@ -49,7 +49,7 @@ impl Temp {
     }
 
     /// Сессия, которая не пишет снапшоты на диск.
-    fn no_persist_session(&self, keep: u32, depth: u32) -> Session {
+    fn no_persist_session(&self, keep: u8, depth: u32) -> Session {
         Session::open_at_with(self.dir.clone(), keep, false, depth).unwrap()
     }
 }

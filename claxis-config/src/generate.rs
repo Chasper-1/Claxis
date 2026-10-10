@@ -135,6 +135,7 @@ fn comment_body(key: &KeyDef, catalog: &claxis_i18n::Catalog) -> String {
     let phrase = match key.kind {
         schema::Kind::Bool => "Value: true or false.",
         schema::Kind::U32 => "Value: a whole number.",
+        schema::Kind::U8 => "Value: a number from 0 to 255.",
         schema::Kind::Str => "Value: a string.",
     };
     format!("# {}", tr(catalog, phrase))
@@ -231,7 +232,7 @@ pub fn write_value(
 fn parse_value(key: &KeyDef, value: &str) -> Item {
     use toml_edit::Value;
     match key.kind {
-        schema::Kind::U32 => match value.parse::<i64>() {
+        schema::Kind::U32 | schema::Kind::U8 => match value.parse::<i64>() {
             Ok(n) => Item::Value(Value::from(n)),
             Err(_) => Item::Value(Value::from(value)),
         },

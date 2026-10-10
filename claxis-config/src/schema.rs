@@ -112,6 +112,8 @@ pub enum Kind {
     Bool,
     /// Целое число.
     U32,
+    /// Целое от 0 до 255.
+    U8,
     /// Строка.
     Str,
 }
@@ -122,6 +124,7 @@ impl Kind {
         match self {
             Kind::Bool => "a boolean",
             Kind::U32 => "a whole number",
+            Kind::U8 => "a number from 0 to 255",
             Kind::Str => "a string",
         }
     }
@@ -252,8 +255,8 @@ pub const KEYS: &[KeyDef] = &[
         file: ConfigFile::Files,
         path: "General.snapshots_keep",
         default: "3",
-        kind: Kind::U32,
-        comment: "How many snapshots of one file to keep in the cache. Older ones are dropped.",
+        kind: Kind::U8,
+        comment: "How many snapshots of one file to keep in the cache. Older ones are dropped. Zero keeps the history in memory only, nothing is written to disk and the history is not destroyed. More than 255 makes no sense.",
         active: true,
     },
     KeyDef {
@@ -427,6 +430,11 @@ mod tests {
                 Kind::U32 => assert!(
                     key.default.parse::<u32>().is_ok(),
                     "{}: значение по умолчанию не число",
+                    key.path
+                ),
+                Kind::U8 => assert!(
+                    key.default.parse::<u8>().is_ok(),
+                    "{}: значение по умолчанию не помещается в байт",
                     key.path
                 ),
                 Kind::Str => {}

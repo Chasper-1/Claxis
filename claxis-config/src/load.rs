@@ -203,6 +203,10 @@ fn check(def: &KeyDef, value: &toml_edit::Item) -> std::result::Result<(), Probl
             .as_integer()
             .map(|n| n >= 0 && n <= u32::MAX as i64)
             .unwrap_or(false),
+        Kind::U8 => value
+            .as_integer()
+            .map(|n| (0..=u8::MAX as i64).contains(&n))
+            .unwrap_or(false),
         Kind::Str => value.as_str().is_some(),
     };
     if ok {

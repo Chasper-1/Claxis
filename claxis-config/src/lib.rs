@@ -84,6 +84,14 @@ impl Config {
             .unwrap_or_else(|| def.default.parse().unwrap_or(0))
     }
 
+    /// Значение от 0 до 255 из конфига, иначе значение по умолчанию.
+    pub fn u8_or_default(&self, def: &'static KeyDef) -> u8 {
+        self.get(def)
+            .and_then(|i| i.as_integer())
+            .and_then(|n| u8::try_from(n).ok())
+            .unwrap_or_else(|| def.default.parse().unwrap_or(0))
+    }
+
     /// Логическое значение ключа из конфига, иначе значение по умолчанию.
     pub fn bool_or_default(&self, def: &'static KeyDef) -> bool {
         self.get(def)

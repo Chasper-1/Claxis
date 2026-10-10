@@ -136,14 +136,14 @@ impl Session {
     }
 
     /// Открыть сессию с заданными `keep` и глубиной истории.
-    pub fn open(keep: u32, persist: bool, history_depth: u32) -> Result<Self, SessionError> {
+    pub fn open(keep: u8, persist: bool, history_depth: u32) -> Result<Self, SessionError> {
         let paths = StorePaths::from_env();
         Self::build(paths, keep, persist, history_depth)
     }
 
     fn build(
         paths: StorePaths,
-        keep: u32,
+        keep: u8,
         persist: bool,
         history_depth: u32,
     ) -> Result<Self, SessionError> {
@@ -161,14 +161,14 @@ impl Session {
     }
 
     /// Открыть сессию с хранилищем в заданном каталоге — нужно в тестах.
-    pub fn open_at(dir: impl Into<PathBuf>, keep: u32) -> Result<Self, SessionError> {
+    pub fn open_at(dir: impl Into<PathBuf>, keep: u8) -> Result<Self, SessionError> {
         Self::open_at_with(dir, keep, PERSIST, HISTORY_DEPTH.value)
     }
 
     /// То же, но с явными `persist` и глубиной истории.
     pub fn open_at_with(
         dir: impl Into<PathBuf>,
-        keep: u32,
+        keep: u8,
         persist: bool,
         history_depth: u32,
     ) -> Result<Self, SessionError> {
@@ -178,15 +178,15 @@ impl Session {
     /// То же, но путь принимается как ссылка.
     pub fn open_at_ref(
         dir: &Path,
-        keep: u32,
+        keep: u8,
         persist: bool,
         history_depth: u32,
     ) -> Result<Self, SessionError> {
         Self::open_at_with(dir.to_path_buf(), keep, persist, history_depth)
     }
 
-    /// Сколько снапшотов одного файла хранится.
-    pub fn keep(&self) -> u32 {
+    /// Сколько снапшотов одного файла хранится. Ноль — только память.
+    pub fn keep(&self) -> u8 {
         self.store.keep()
     }
 

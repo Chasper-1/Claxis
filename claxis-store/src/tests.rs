@@ -18,7 +18,7 @@ impl Temp {
         StorePaths::new(self.dir.clone())
     }
 
-    fn store(&self, keep: u32) -> SnapshotStore {
+    fn store(&self, keep: u8) -> SnapshotStore {
         SnapshotStore::open(&self.paths(), keep).unwrap()
     }
 }
@@ -86,16 +86,33 @@ fn keep_limits_snapshots_per_file() {
 }
 
 #[test]
+fn zero_keep_saves_nothing_and_destroys_nothing() {
+    // Ноль — честный выбор: на диск не пишется ничего, но вызовы не падают.
+    let tmp = Temp::new("keep-zero");
+    let f = file("a.rs");
+    let mut store = tmp.store(0);
+    for i in 0..5 {
+        store.put(&f, format!("{i}").as_bytes()).unwrap();
+    }
+    assert_eq!(store.count(&f).unwrap(), 0, "при keep = 0 писать нечего");
+    assert!(store.latest(&f).unwrap().is_none());
+}
+
+#[test]
 fn keep_is_respected_for_any_value() {
     // Настройка из конфига: хоть один снапшот, хоть десять.
-    for keep in [1u32, 2, 7, 10] {
+    for keep in [1u8, 2, 7, 10] {
         let tmp = Temp::new(&format!("keep{keep}"));
         let f = file("a.rs");
         let mut store = tmp.store(keep);
         for i in 0..keep + 3 {
             store.put(&f, format!("{i}").as_bytes()).unwrap();
         }
-        assert_eq!(store.count(&f).unwrap(), keep, "keep={keep} не соблюдён");
+        assert_eq!(
+            store.count(&f).unwrap(),
+            keep as u32,
+            "keep={keep} не соблюдён"
+        );
     }
 }
 
