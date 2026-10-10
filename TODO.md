@@ -136,7 +136,9 @@
       Свои типы событий, не crossterm-овские. 10 тестов.
 * [x] `main.rs` — тонкий бинарь: открывает терминал, читает события, печатает,
       выходит по Ctrl+Q. Отказ без протокола с внятным сообщением.
-* [ ] `claxis-config` — см. раздел 4.
-* [ ] `claxis-commands`, `claxis-view`, `claxis-theme`, `claxis-i18n`,
+* [ ] `claxis-config` — не дописан, см. раздел 4.
+* [ ] `claxis-theme` — список тем в папке и проверка имени темы, на которую
+      указывает `config.toml`. Согласовано, содержания пока нет.
+* [ ] `claxis-commands`, `claxis-view`, `claxis-i18n` (сделаны основы),
       `claxis-core`, `claxis-search`, `claxis-files`, `claxis-modes`,
       `claxis-plugin` — создаются по мере появления содержания.

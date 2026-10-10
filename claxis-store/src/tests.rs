@@ -230,3 +230,51 @@ fn store_paths_from_env_have_claxis_dir() {
     );
     assert!(paths.database().display().to_string().ends_with("store.db"));
 }
+
+#[test]
+fn last_good_config_round_trip() {
+    // Последний корректный конфиг переживает перезапуск редактора.
+    let tmp = Temp::new("last-good");
+    let store = tmp.store(3);
+    assert!(store.last_good("config").unwrap().is_none());
+
+    let mut store = store;
+    store
+        .save_last_good("config", "tap_hold_milliseconds = 200")
+        .unwrap();
+    assert_eq!(
+        store.last_good("config").unwrap().as_deref(),
+        Some("tap_hold_milliseconds = 200")
+    );
+}
+
+#[test]
+fn last_good_config_overwrites_and_forgets() {
+    let tmp = Temp::new("last-good-overwrite");
+    let mut store = tmp.store(3);
+
+    store.save_last_good("config", "old").unwrap();
+    store.save_last_good("config", "new").unwrap();
+    assert_eq!(store.last_good("config").unwrap().as_deref(), Some("new"));
+
+    // Другие имена не трогаются: конфиг и тема хранятся раздельно.
+    store.save_last_good("edit", "edit body").unwrap();
+    store.forget_last_good("config").unwrap();
+    assert!(store.last_good("config").unwrap().is_none());
+    assert_eq!(
+        store.last_good("edit").unwrap().as_deref(),
+        Some("edit body")
+    );
+}
+
+#[test]
+fn last_good_survives_reopening() {
+    // Перезапуск редактора не должен терять сохранённый конфиг.
+    let tmp = Temp::new("last-good-reopen");
+    {
+        let mut store = tmp.store(3);
+        store.save_last_good("config", "body").unwrap();
+    }
+    let store = tmp.store(3);
+    assert_eq!(store.last_good("config").unwrap().as_deref(), Some("body"));
+}

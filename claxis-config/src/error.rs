@@ -47,6 +47,13 @@ pub enum Error {
     },
     /// Нет сохранённого правильного конфига, чтобы продолжить работу.
     NoLastGood,
+    /// Файл не записан: `{path}`, `{reason}`.
+    Write {
+        /// Путь к файлу.
+        path: String,
+        /// Почему не записан.
+        reason: String,
+    },
     /// В файле `files.toml` ключ `{key}`, которого нет в схеме.
     UnknownKeyInFile {
         /// Имя файла.
@@ -68,6 +75,7 @@ impl fmt::Display for Error {
             Error::WrongSection { key, want, got } => {
                 write!(f, "key {key} belongs to {want}, but is in {got}")
             }
+            Error::Write { path, reason } => write!(f, "cannot write config {path}: {reason}"),
             Error::NoLastGood => write!(f, "no saved valid config to fall back to"),
             Error::UnknownKeyInFile { file, key } => {
                 write!(f, "{file}: unknown key {key}")

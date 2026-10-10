@@ -23,6 +23,8 @@ pub enum Problem {
         /// Что пришло на самом деле.
         got: String,
     },
+    /// Файл не прочитан: `{reason}`.
+    Unreadable(String),
 }
 
 /// Проблема в конфиге: файл, строка, ключ и суть.
@@ -50,6 +52,7 @@ impl Issue {
             Problem::BadType { expected, got } => {
                 format!("{where_}: key {} has {got}, expected {expected}", self.key)
             }
+            Problem::Unreadable(reason) => format!("{where_}: cannot read file: {reason}"),
         }
     }
 }
@@ -108,36 +111,14 @@ pub fn parse(file: ConfigFile, text: &str) -> Loaded {
     let mut issues = Vec::new();
     let mut bad_sections: Vec<String> = Vec::new();
 
-    for (section_name, item) in doc.as_table().iter() {
-        let Some(section) = item.as_table() else {
-            continue;
-        };
-        for (key_name, value) in section.iter() {
-            let path = format!("{section_name}.{key_name}");
-            match super::schema::find(file, &path) {
-                None => {
-                    bad_sections.push(section_name.to_string());
-                    issues.push(Issue {
-                        file: file.file_name(),
-                        line: line_of(text, section_name, key_name).unwrap_or(0),
-                        key: path,
-                        problem: Problem::UnknownKey,
-                    });
-                }
-                Some(def) => {
-                    if let Err(problem) = check(def, value) {
-                        bad_sections.push(section_name.to_string());
-                        issues.push(Issue {
-                            file: file.file_name(),
-                            line: line_of(text, section_name, key_name).unwrap_or(0),
-                            key: path,
-                            problem,
-                        });
-                    }
-                }
-            }
-        }
-    }
+    walk(
+        file,
+        doc.as_table(),
+        "",
+        text,
+        &mut issues,
+        &mut bad_sections,
+    );
 
     // Плохая секция целиком выключается: остальные настройки из неё могут
     // оказаться неверными из-за той же опечатки.
@@ -151,6 +132,55 @@ pub fn parse(file: ConfigFile, text: &str) -> Loaded {
     Loaded {
         config: Config::from_documents([(file, doc)]),
         issues,
+    }
+}
+
+/// Обойти все ключи файла, включая вложенные секции режимов.
+///
+/// Секция может быть вложенной (`[Word.Word]`), поэтому обход идёт вглубь, а
+/// путь ключа собирается по дороге.
+fn walk(
+    file: ConfigFile,
+    table: &toml_edit::Table,
+    prefix: &str,
+    text: &str,
+    issues: &mut Vec<Issue>,
+    bad_sections: &mut Vec<String>,
+) {
+    for (name, item) in table.iter() {
+        // Путь до ключа: вложенная секция добавляет уровень, скалярное
+        // значение стоит уже на своём месте.
+        let here = |prefix: &str, name: &str| {
+            if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+
+        // Вложенная таблица — это секция режима, а не ключ.
+        if let Some(sub) = item.as_table() {
+            let section = here(prefix, name);
+            walk(file, sub, &section, text, issues, bad_sections);
+            continue;
+        }
+
+        let section = prefix.to_string();
+        let path = here(prefix, name);
+        let problem = match super::schema::find(file, &path) {
+            None => Some(Problem::UnknownKey),
+            Some(def) => check(def, item).err(),
+        };
+        if let Some(problem) = problem {
+            // Отключается секция целиком: ключ внутри неё, а не сам ключ.
+            bad_sections.push(section.clone());
+            issues.push(Issue {
+                file: file.file_name(),
+                line: line_of(text, &section, name).unwrap_or(0),
+                key: path,
+                problem,
+            });
+        }
     }
 }
 

@@ -83,9 +83,50 @@ impl SnapshotStore {
                     file   TEXT NOT NULL,
                     text   BLOB NOT NULL
                  );
-                 CREATE INDEX IF NOT EXISTS snapshots_file ON snapshots(file, seq);",
+                 CREATE INDEX IF NOT EXISTS snapshots_file ON snapshots(file, seq);
+                 CREATE TABLE IF NOT EXISTS last_good (
+                    name TEXT PRIMARY KEY,
+                    body TEXT NOT NULL
+                 );",
             )
             .map_err(query)
+    }
+
+    /// Сохранить последний корректный конфиг.
+    ///
+    /// Он лежит в кеше, а не рядом с настоящим конфигом: пользовательский файл
+    /// может быть поломан, а работать надо. Отсюда редактор запускается, если
+    /// текущий конфиг не загрузился целиком.
+    pub fn save_last_good(&mut self, name: &str, body: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO last_good (name, body) VALUES (?1, ?2)
+                 ON CONFLICT(name) DO UPDATE SET body = excluded.body",
+                (name, body),
+            )
+            .map_err(query)?;
+        Ok(())
+    }
+
+    /// Забрать последний корректный конфиг.
+    pub fn last_good(&self, name: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT body FROM last_good WHERE name = ?1")
+            .map_err(query)?;
+        let mut rows = stmt.query([name]).map_err(query)?;
+        match rows.next().map_err(query)? {
+            Some(row) => Ok(Some(row.get(0).map_err(query)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Забыть сохранённый конфиг.
+    pub fn forget_last_good(&mut self, name: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM last_good WHERE name = ?1", [name])
+            .map_err(query)?;
+        Ok(())
     }
 
     /// Положить снапшот. Если для этого файла уже есть `keep` штук, самый

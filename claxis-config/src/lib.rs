@@ -8,7 +8,9 @@
 //! локализации, но не наоборот.
 
 pub mod error;
+pub mod generate;
 pub mod load;
+pub mod path;
 pub mod schema;
 
 pub use error::{Error, Result};

@@ -10,6 +10,7 @@ use crate::router::{Session, SessionError};
 /// Отдельный каталог под каждый тест: базы не делятся.
 struct Temp {
     dir: PathBuf,
+    store: PathBuf,
 }
 
 impl Temp {
@@ -17,7 +18,9 @@ impl Temp {
         let dir = std::env::temp_dir().join(format!("claxis-router-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Self { dir }
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        Self { dir, store }
     }
 
     /// Файл документа рядом с базой.
@@ -32,6 +35,17 @@ impl Temp {
     /// Сессия с короткой историей: снапшот срабатывает быстро.
     fn short_session(&self, keep: u32, depth: u32) -> Session {
         Session::open_at_with(self.dir.clone(), keep, true, depth).unwrap()
+    }
+
+    /// Сам каталог.
+    fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// Каталог хранилища рядом с конфигом, чтобы тесты не трогали кеш
+    /// пользователя.
+    fn store_dir(&self) -> &std::path::Path {
+        &self.store
     }
 
     /// Сессия, которая не пишет снапшоты на диск.
@@ -445,9 +459,137 @@ fn editor_builds_session_from_settings() {
     settings.snapshots_keep = 5;
     settings.snapshots_persist = false;
 
-    let editor = crate::router::Editor::new_at(tmp.dir.clone(), settings).unwrap();
+    let editor = crate::router::Editor::with_settings(tmp.store_dir(), settings).unwrap();
     assert_eq!(editor.session().history_depth(), 32);
     assert_eq!(editor.session().keep(), 5);
     assert!(!editor.session().persist());
     assert_eq!(editor.language(), "en");
+}
+
+// ── Запуск с конфигом ─────────────────────────────────────────────────────────
+
+#[test]
+fn first_run_creates_every_config_file() {
+    // При первом запуске создаются все файлы разом, со всеми ключами.
+    let tmp = Temp::new("first-run-cfg");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert!(!editor.created.is_empty(), "файлы должны быть созданы");
+    for file in claxis_config::ConfigFile::ALL {
+        assert!(
+            tmp.dir().join(file.file_name()).exists(),
+            "{} не создан",
+            file.file_name()
+        );
+    }
+    assert!(editor.issues.is_empty(), "проблемы: {:?}", editor.issues);
+    assert!(!editor.used_last_good);
+}
+
+#[test]
+fn generated_files_carry_every_key_with_a_comment() {
+    let tmp = Temp::new("keys-with-comments");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+    for key in claxis_config::KEYS {
+        let path = tmp.dir().join(key.file.file_name());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(key.key()),
+            "{}: нет ключа {}",
+            key.file.file_name(),
+            key.key()
+        );
+        assert!(
+            text.contains(key.comment),
+            "{}: нет комментария к {}",
+            key.file.file_name(),
+            key.key()
+        );
+    }
+}
+
+#[test]
+fn settings_from_the_file_reach_the_session() {
+    let tmp = Temp::new("settings-reach");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+    std::fs::write(
+        tmp.dir().join("edit.toml"),
+        "[General]\nhistory_depth = 64\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.dir().join("files.toml"),
+        "[General]\nsnapshots_keep = 7\n",
+    )
+    .unwrap();
+
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.session().history_depth(), 64);
+    assert_eq!(editor.session().keep(), 7);
+}
+
+#[test]
+fn broken_config_falls_back_to_the_saved_one() {
+    // Главное: сломанный конфиг не должен оставлять пользователя с пустым
+    // редактором. Работаем на последнем корректном.
+    let tmp = Temp::new("fallback");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+
+    // Первый запуск: всё в порядке, конфиг сохраняется.
+    {
+        let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert!(editor.issues.is_empty());
+        assert!(!editor.used_last_good);
+    }
+
+    // Второй запуск: пользователь сломал файл.
+    std::fs::write(tmp.dir().join("edit.toml"), "[General]\nhistory_dept = 1\n").unwrap();
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+    assert!(editor.used_last_good, "должен был пойти на запасной конфиг");
+    assert_eq!(editor.issues.len(), 1);
+    let issue = editor.first_issue().unwrap();
+    assert_eq!(issue.file, "edit.toml");
+    assert_eq!(issue.line, 2);
+    // Настройки те же, что и до поломки.
+    assert_eq!(editor.session().history_depth(), 8192);
+}
+
+#[test]
+fn broken_config_on_first_run_has_nothing_to_fall_back_to() {
+    // Падать можно только когда работать не с чем.
+    let tmp = Temp::new("no-fallback");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    // Готовим сломанный файл ДО первого запуска: сохранять нечего.
+    std::fs::write(tmp.dir().join("edit.toml"), "[General]\nhistory_dept = 1\n").unwrap();
+
+    match crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()) {
+        Ok(editor) => {
+            // Запасной мог появиться из других файлов — тогда всё в порядке.
+            assert!(editor.used_last_good || !editor.issues.is_empty());
+        }
+        Err(crate::router::StartError::NoUsableConfig { .. }) => {}
+        Err(other) => panic!("не та ошибка: {other}"),
+    }
+}
+
+#[test]
+fn editing_one_key_keeps_the_rest_of_the_file() {
+    // Точечная запись не переписывает файл: комментарии и порядок целы.
+    let tmp = Temp::new("point-write");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+    let key = claxis_config::schema::find(claxis_config::ConfigFile::Edit, "General.history_depth")
+        .unwrap();
+    claxis_config::generate::write_value(tmp.dir(), key, "256").unwrap();
+
+    let text = std::fs::read_to_string(tmp.dir().join("edit.toml")).unwrap();
+    assert!(text.contains("history_depth = 256"), "{text}");
+    assert!(text.contains(key.comment), "комментарий пропал: {text}");
+    assert!(text.contains("max_history_depth"), "соседний ключ пропал");
 }

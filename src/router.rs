@@ -37,7 +37,7 @@ mod editor;
 mod session;
 mod settings;
 
-pub use editor::Editor;
+pub use editor::{Editor, StartError};
 pub use session::{Document, Session, SessionError};
 pub use settings::Settings;
 

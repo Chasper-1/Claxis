@@ -4,39 +4,144 @@
 //! переводит настройки в параметры того, что их использует: глубина истории
 //! уходит в буфер, `keep` и `persist` — в хранилище снапшотов.
 
+use std::path::{Path, PathBuf};
+
+use claxis_config::schema::ConfigFile;
+use claxis_config::{Issue, generate};
 use claxis_i18n::Catalog;
 
 use crate::router::{Session, SessionError, Settings};
+
+/// Что не так с конфигом при запуске.
+#[derive(Debug)]
+pub enum StartError {
+    /// Сессия не открылась.
+    Session(SessionError),
+    /// Каталог конфига недоступен: `{path}`, `{reason}`.
+    ConfigDir {
+        /// Путь к каталогу.
+        path: String,
+        /// Почему недоступен.
+        reason: String,
+    },
+    /// Конфиг сломан настолько, что продолжать не с чем.
+    ///
+    /// Так бывает, только если сломаны все файлы разом и запасной не
+    /// сохранился: работать не с чем.
+    NoUsableConfig {
+        /// Сколько проблем в файлах.
+        issues: usize,
+    },
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::Session(e) => write!(f, "{e}"),
+            StartError::ConfigDir { path, reason } => {
+                write!(f, "cannot use config directory {path}: {reason}")
+            }
+            StartError::NoUsableConfig { issues } => write!(
+                f,
+                "config has {issues} problems and no saved valid copy to fall back to"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartError {}
 
 /// Редактор: собранное из всех крейтов.
 pub struct Editor {
     session: Session,
     settings: Settings,
+    /// Проблемы конфига: файл, строка, ключ, суть.
+    pub issues: Vec<Issue>,
+    /// Файлы, которых не было и которые созданы при первом запуске.
+    pub created: Vec<PathBuf>,
+    /// Редактор пошёл на последнем корректном конфиге.
+    pub used_last_good: bool,
 }
 
 impl Editor {
-    /// Собрать редактор по настройкам.
-    pub fn new(settings: Settings) -> Result<Self, SessionError> {
-        let session = Session::open(
+    /// Открыть редактор с конфигом пользователя и хранилищем в кеше.
+    pub fn open() -> Result<Self, StartError> {
+        let dir = claxis_config::path::user_dir().ok_or_else(|| StartError::ConfigDir {
+            path: "?".to_string(),
+            reason: "cannot find the home directory".to_string(),
+        })?;
+        let store_dir = claxis_store::path::StorePaths::from_env().dir;
+        Self::open_in(&dir, &store_dir)
+    }
+
+    /// Конфиг задан явно, хранилище — кеш пользователя.
+    pub fn open_at(dir: &Path) -> Result<Self, StartError> {
+        let store_dir = claxis_store::path::StorePaths::from_env().dir;
+        Self::open_in(dir, &store_dir)
+    }
+
+    /// Конфиг и хранилище заданы явно — нужно в тестах.
+    pub fn open_in(config_dir: &Path, store_dir: &Path) -> Result<Self, StartError> {
+        // Порядок важен: сначала читается конфиг, потом под его настройки
+        // создаётся сессия. Иначе настройки из файла просто никуда не денутся.
+        let generated = generate::ensure_files(config_dir).map_err(|e| StartError::ConfigDir {
+            path: config_dir.display().to_string(),
+            reason: e.to_string(),
+        })?;
+
+        let loaded = generate::read_all(config_dir);
+        let issues = loaded.issues;
+
+        let (config, used_last_good) = if issues.is_empty() {
+            save_last_good(store_dir, config_dir);
+            (loaded.config, false)
+        } else {
+            // Текущий конфиг не годен: работаем на последнем корректном.
+            // Пустой редактор со сброшенными настройками хуже, чем рабочий со
+            // старыми, поэтому падать здесь нельзя.
+            match load_last_good(store_dir) {
+                Some(previous) => (previous, true),
+                None => {
+                    return Err(StartError::NoUsableConfig {
+                        issues: issues.len(),
+                    });
+                }
+            }
+        };
+
+        let settings = Settings::from_config(&config);
+        let session = Session::open_at_with(
+            store_dir,
             settings.snapshots_keep,
             settings.snapshots_persist,
             settings.history_depth,
-        )?;
-        Ok(Self { session, settings })
+        )
+        .map_err(StartError::Session)?;
+
+        Ok(Self {
+            settings,
+            session,
+            issues,
+            created: generated.created,
+            used_last_good,
+        })
     }
 
-    /// Собрать редактор с хранилищем в заданном каталоге — нужно в тестах.
-    pub fn new_at(
-        dir: impl AsRef<std::path::Path>,
-        settings: Settings,
-    ) -> Result<Self, SessionError> {
-        let session = Session::open_at_ref(
+    /// Собрать редактор с готовыми настройками, без чтения файлов.
+    pub fn with_settings(dir: impl AsRef<Path>, settings: Settings) -> Result<Self, SessionError> {
+        let session = Session::open_at_with(
             dir.as_ref(),
             settings.snapshots_keep,
             settings.snapshots_persist,
             settings.history_depth,
         )?;
-        Ok(Self { session, settings })
+        Ok(Self {
+            session,
+            settings,
+            issues: Vec::new(),
+            created: Vec::new(),
+            used_last_good: false,
+        })
     }
 
     /// Сессия: документы и снапшоты.
@@ -58,4 +163,46 @@ impl Editor {
     pub fn catalog(&self) -> &Catalog {
         &self.settings.catalog
     }
+
+    /// Первая проблема конфига: на неё ставится курсор.
+    pub fn first_issue(&self) -> Option<&Issue> {
+        self.issues.first()
+    }
+}
+
+/// Сохранить текущие файлы как последний корректный конфиг.
+///
+/// Кеш может быть недоступен — тогда просто не сохраняем: конфиг уже загружен,
+/// и работа не должна вставать из-за кеша.
+fn save_last_good(store_dir: &Path, dir: &Path) {
+    let Ok(mut store) =
+        claxis_store::SnapshotStore::open(&claxis_store::path::StorePaths::new(store_dir), 1)
+    else {
+        return;
+    };
+    for &file in ConfigFile::ALL {
+        let path = dir.join(file.file_name());
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            let _ = store.save_last_good(file.file_name(), &body);
+        }
+    }
+}
+
+/// Забрать последний корректный конфиг из кеша.
+fn load_last_good(store_dir: &Path) -> Option<claxis_config::Config> {
+    let store =
+        claxis_store::SnapshotStore::open(&claxis_store::path::StorePaths::new(store_dir), 1)
+            .ok()?;
+    let mut docs = Vec::new();
+    for &file in ConfigFile::ALL {
+        let body = store.last_good(file.file_name()).ok()??;
+        // Разбор идёт по тем же правилам: запасной тоже может быть старым.
+        if let Ok(doc) = body.parse::<toml_edit::DocumentMut>() {
+            docs.push((file, doc));
+        }
+    }
+    if docs.is_empty() {
+        return None;
+    }
+    Some(claxis_config::Config::from_documents(docs))
 }

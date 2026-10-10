@@ -8,10 +8,9 @@
 //! Конфиг разнесён по файлам: `edit.toml`, `command.toml`, `files.toml`. Здесь
 //! берутся нужные ключи и складываются в настройки редактора.
 
-use claxis_config::{Config, ConfigFile};
+use claxis_config::Config;
+use claxis_config::schema::{self, ConfigFile};
 use claxis_i18n::Catalog;
-
-use claxis_config::schema;
 
 /// Настройки редактора вместе с языком интерфейса.
 #[derive(Clone, Debug)]

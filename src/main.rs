@@ -1,6 +1,6 @@
 use claxis::api::term::{Event, KeyCode, Modifiers, Terminal};
 use claxis::main_messages::{En, Messages};
-use claxis::router::Session;
+use claxis::router::Editor;
 
 fn main() {
     let messages = En;
@@ -14,15 +14,25 @@ fn main() {
         }
     };
 
-    // Сессия: хранилище снапшотов и настройки из конфигов крейтов.
-    let session = match Session::open_default() {
-        Ok(s) => s,
+    // Редактор: конфиг с диска, настройки из него, сессия под них.
+    let editor = match Editor::open() {
+        Ok(e) => e,
         Err(e) => {
-            eprintln!("{}", messages.session_failed(&e.text()));
+            eprintln!("{}", messages.session_failed(&e.to_string()));
             std::process::exit(1);
         }
     };
-    println!("{}", messages.event_line(&format!("{session:?}")));
+
+    // Сломанный конфиг не молчит: сообщаем, что пошли на запасной.
+    if editor.used_last_good {
+        eprintln!(
+            "{}",
+            messages.event_line("config is broken, using the last saved good copy")
+        );
+    }
+    for issue in &editor.issues {
+        eprintln!("{}", messages.event_line(&issue.text()));
+    }
 
     loop {
         match term.next_event() {
