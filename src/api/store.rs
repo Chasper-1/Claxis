@@ -4,4 +4,5 @@
 //! функции. Реализация лежит в самом крейте, а связь с ручками других
 //! крейтов делает маршрутизатор `crate::router`.
 
+pub use claxis_store::defaults::{KEEP, PERSIST};
 pub use claxis_store::{Error, SnapshotStore, StorePaths};

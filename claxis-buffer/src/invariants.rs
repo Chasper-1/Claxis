@@ -491,11 +491,18 @@ fn every_default_is_present_and_documented() {
     }
 
     // Какая настройка подключена, а какая задумана — проверяется при компиляции.
+    //
+    // Помечено `used` только то, что код действительно читает. Флаг врёт легко:
+    // настройка выглядит подключённой, а её значение никто не открывает. Тогда
+    // пользователь правит конфиг и не видит никакой разницы.
     const _: () = assert!(buffer::HISTORY_DEPTH.active);
     const _: () = assert!(!buffer::MAX_HISTORY_DEPTH.active);
 
     // Значения по умолчанию согласованы с настоящими ограничениями.
+    // Значение по умолчанию обязано быть тем, с чем реально создаётся буфер.
+    // Иначе настройка и поведение разойдутся.
     assert_eq!(buffer::HISTORY_DEPTH.value, crate::DEFAULT_DEPTH);
+    const _: () = assert!(buffer::HISTORY_DEPTH.value <= crate::MAX_DEPTH);
     const _: () = assert!(
         buffer::HISTORY_DEPTH.value <= crate::MAX_DEPTH,
         "глубина по умолчанию должна быть в допустимых пределах"

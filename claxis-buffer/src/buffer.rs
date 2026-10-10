@@ -1,7 +1,7 @@
 use std::fmt;
 use std::mem::size_of;
 
-use crate::arena::{Arena, DEFAULT_DEPTH, MAX_DEPTH, Record, RecordId};
+use crate::arena::{Arena, MAX_DEPTH, Record, RecordId};
 use crate::current::Current;
 use crate::snapshot::{NullSink, SnapshotSink};
 
@@ -123,13 +123,17 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    /// Буфер с глубиной истории по умолчанию — полный блок в 8192 записи.
+    /// Буфер с глубиной истории по умолчанию.
     ///
-    /// Глубина здесь константа, известная корректной, поэтому проверки и
-    /// `Result` нет: паникой было бы сообщать о том, что невозможно.
+    /// Глубина берётся из настроек, а не из константы арены: когда появится
+    /// конфиг, значение придёт оттуда, и менять тут ничего не придётся.
+    /// Значение известно корректное, поэтому `Result` не нужен.
     pub fn new(original: impl AsRef<[u8]>) -> Self {
-        Self::build(original.as_ref(), DEFAULT_DEPTH)
-            .expect("глубина по умолчанию корректна по построению")
+        Self::build(
+            original.as_ref(),
+            crate::defaults::buffer::HISTORY_DEPTH.value,
+        )
+        .expect("глубина по умолчанию корректна по построению")
     }
 
     /// Буфер с заданной глубиной истории.

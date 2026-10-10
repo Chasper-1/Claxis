@@ -1,13 +1,28 @@
-use claxis_term::{Event, KeyCode, Modifiers, Terminal};
+use claxis::api::term::{Event, KeyCode, Modifiers, Terminal};
+use claxis::main_messages::{En, Messages};
+use claxis::router::Session;
 
 fn main() {
+    let messages = En;
+
+    // Терминал: без протокола событий отпускания модель ввода не работает.
     let mut term = match Terminal::new() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{}", messages.terminal_failed(&e.to_string()));
             std::process::exit(1);
         }
     };
+
+    // Сессия: хранилище снапшотов и настройки из конфигов крейтов.
+    let session = match Session::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", messages.session_failed(&e.text()));
+            std::process::exit(1);
+        }
+    };
+    println!("{}", messages.event_line(&format!("{session:?}")));
 
     loop {
         match term.next_event() {
@@ -16,9 +31,9 @@ fn main() {
             {
                 break;
             }
-            Ok(event) => println!("{event:?}"),
+            Ok(event) => println!("{}", messages.event_line(&format!("{event:?}"))),
             Err(e) => {
-                eprintln!("{e}");
+                eprintln!("{}", messages.terminal_failed(&e.to_string()));
                 std::process::exit(1);
             }
         }

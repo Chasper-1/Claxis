@@ -31,7 +31,12 @@ impl Temp {
 
     /// Сессия с короткой историей: снапшот срабатывает быстро.
     fn short_session(&self, keep: u32, depth: u32) -> Session {
-        Session::open_at_with(self.dir.clone(), keep, depth).unwrap()
+        Session::open_at_with(self.dir.clone(), keep, true, depth).unwrap()
+    }
+
+    /// Сессия, которая не пишет снапшоты на диск.
+    fn no_persist_session(&self, keep: u32, depth: u32) -> Session {
+        Session::open_at_with(self.dir.clone(), keep, false, depth).unwrap()
     }
 }
 
@@ -281,4 +286,45 @@ fn big_numbers_are_split_into_readable_parts() {
     assert_eq!(group_digits(999), "999");
     assert_eq!(group_digits(100), "100");
     assert_eq!(group_digits(0), "0");
+}
+
+#[test]
+fn persist_false_keeps_snapshots_in_memory_only() {
+    // Настройка persist обязана что-то значить: при false снапшоты не пишутся.
+    let tmp = Temp::new("no-persist");
+    let file = tmp.file("a.rs");
+    let session = tmp.no_persist_session(3, 8);
+
+    let mut doc = session.open_file(&file).unwrap();
+    for _ in 0..40 {
+        let end = doc.buffer().len();
+        doc.buffer().insert(end, b"z").unwrap();
+    }
+    // Снапшоты берутся, текст в буфере есть.
+    assert!(
+        doc.buffer().snapshots_taken() > 1,
+        "снапшоты должны браться"
+    );
+    assert_eq!(doc.buffer().len(), 40, "правки на месте");
+    drop(doc);
+
+    // Но на диске пусто.
+    assert_eq!(
+        session.store().count(&file).unwrap(),
+        0,
+        "при persist = false на диск не пишется ничего"
+    );
+}
+
+#[test]
+fn defaults_come_from_crate_settings() {
+    // Сессия по умолчанию берёт значения из настроек крейтов, а не из
+    // зашитых констант.
+    let tmp = Temp::new("defaults");
+    let session = Session::open_at(tmp.dir.clone(), crate::api::store::KEEP).unwrap();
+    assert_eq!(
+        session.history_depth(),
+        crate::api::buffer::HISTORY_DEPTH.value
+    );
+    assert_eq!(session.persist(), crate::api::store::PERSIST);
 }

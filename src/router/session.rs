@@ -8,8 +8,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::api::buffer::{Buffer, DEFAULT_DEPTH, SnapshotSink};
-use crate::api::store::{SnapshotStore, StorePaths};
+use crate::api::buffer::{Buffer, HISTORY_DEPTH, SnapshotSink};
+use crate::api::store::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::messages::Messages;
 
 /// Что пошло не так в сессии.
@@ -102,21 +102,32 @@ pub struct Session {
     paths: StorePaths,
     /// Сколько записей правки живёт в памяти до снапшота. Из конфига.
     history_depth: u32,
+    /// Писать ли снапшоты на диск. Из конфига.
+    persist: bool,
 }
 
 impl Session {
-    /// Открыть сессию с хранилищем в кеше, `keep` снапшотов на файл.
-    pub fn open(keep: u32) -> Result<Self, SessionError> {
-        Self::open_with(keep, DEFAULT_DEPTH)
+    /// Открыть сессию по настройкам по умолчанию.
+    ///
+    /// Значения берутся из настроек крейтов: `keep` и `persist` — из стора,
+    /// глубина истории — из буфера. Когда появится конфиг, он подставит сюда
+    /// свои значения, и менять тут ничего не придётся.
+    pub fn open_default() -> Result<Self, SessionError> {
+        Self::open(KEEP, PERSIST, HISTORY_DEPTH.value)
     }
 
     /// Открыть сессию с заданными `keep` и глубиной истории.
-    pub fn open_with(keep: u32, history_depth: u32) -> Result<Self, SessionError> {
+    pub fn open(keep: u32, persist: bool, history_depth: u32) -> Result<Self, SessionError> {
         let paths = StorePaths::from_env();
-        Self::build(paths, keep, history_depth)
+        Self::build(paths, keep, persist, history_depth)
     }
 
-    fn build(paths: StorePaths, keep: u32, history_depth: u32) -> Result<Self, SessionError> {
+    fn build(
+        paths: StorePaths,
+        keep: u32,
+        persist: bool,
+        history_depth: u32,
+    ) -> Result<Self, SessionError> {
         let store = SnapshotStore::open(&paths, keep).map_err(|e| SessionError::Store {
             path: paths.database().display().to_string(),
             reason: e.to_string(),
@@ -125,21 +136,28 @@ impl Session {
             store,
             paths,
             history_depth,
+            persist,
         })
     }
 
     /// Открыть сессию с хранилищем в заданном каталоге — нужно в тестах.
     pub fn open_at(dir: impl Into<PathBuf>, keep: u32) -> Result<Self, SessionError> {
-        Self::open_at_with(dir, keep, DEFAULT_DEPTH)
+        Self::open_at_with(dir, keep, PERSIST, HISTORY_DEPTH.value)
     }
 
-    /// То же, но с заданной глубиной истории.
+    /// То же, но с явными `persist` и глубиной истории.
     pub fn open_at_with(
         dir: impl Into<PathBuf>,
         keep: u32,
+        persist: bool,
         history_depth: u32,
     ) -> Result<Self, SessionError> {
-        Self::build(StorePaths::new(dir), keep, history_depth)
+        Self::build(StorePaths::new(dir), keep, persist, history_depth)
+    }
+
+    /// Пишутся ли снапшоты на диск.
+    pub fn persist(&self) -> bool {
+        self.persist
     }
 
     /// Глубина истории, с которой открыты документы.
@@ -185,12 +203,16 @@ impl Session {
         };
         let mut buffer =
             Buffer::with_history_depth(text, self.history_depth).map_err(SessionError::Buffer)?;
-        // Своё подключение к той же базе: буфер живёт дольше сессии.
-        let store = self.store.reopen().map_err(|e| SessionError::Store {
-            path: self.paths.database().display().to_string(),
-            reason: e.to_string(),
-        })?;
-        buffer.set_sink(path.clone(), Box::new(StoreSink { store }));
+        // Приёмник вешается только если снапшоты положено хранить. Иначе
+        // буфер работает без диска и настройка `persist` что-то значит.
+        if self.persist {
+            // Своё подключение к той же базе: буфер живёт дольше сессии.
+            let store = self.store.reopen().map_err(|e| SessionError::Store {
+                path: self.paths.database().display().to_string(),
+                reason: e.to_string(),
+            })?;
+            buffer.set_sink(path.clone(), Box::new(StoreSink { store }));
+        }
         Ok(Document { path, buffer })
     }
 }

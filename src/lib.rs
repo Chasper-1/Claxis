@@ -5,5 +5,6 @@
 //! воркспейсе и знают только про себя.
 
 pub mod api;
+pub mod main_messages;
 pub mod messages;
 pub mod router;

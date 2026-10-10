@@ -4,6 +4,7 @@
 //! функции. Реализация лежит в самом крейте, а связь с ручками других
 //! крейтов делает маршрутизатор `crate::router`.
 
+pub use claxis_buffer::defaults::buffer::HISTORY_DEPTH;
 pub use claxis_buffer::{
     Buffer, DEFAULT_DEPTH, En as MessagesEn, Error, MAX_DEPTH, Messages, NullSink, ORIGINAL_ID,
     ParseError, Record, RecordId, Segment, SnapshotSink, substitute,
