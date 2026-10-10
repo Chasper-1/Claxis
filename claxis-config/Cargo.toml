@@ -10,3 +10,4 @@ claxis-buffer = { path = "../claxis-buffer" }
 claxis-store = { path = "../claxis-store" }
 claxis-input = { path = "../claxis-input" }
 toml_edit = "0.22"
+notify = "8"

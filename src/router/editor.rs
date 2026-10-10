@@ -63,6 +63,11 @@ pub struct Editor {
     pub used_last_good: bool,
     /// Откуда читается конфиг.
     config_dir: PathBuf,
+    /// Наблюдатель за каталогом конфига.
+    ///
+    /// `None`, если система не смогла подписаться: конфиг перестанет
+    /// применяться сам, и об этом честно скажем, а не промолчим.
+    pub watch: Option<claxis_config::Watch>,
 }
 
 /// Что вышло из перечитывания конфига.
@@ -134,6 +139,16 @@ impl Editor {
             }
         };
 
+        // Подписка на каталог: конфиг могут поменять снаружи, и открытый
+        // редактор обязан это увидеть. Отписка не удаляет подписку, а лишь
+        // говорит, что следить не вышло.
+        let mut watch = claxis_config::Watch::new(config_dir).ok();
+        if let Some(w) = watch.as_mut() {
+            // Подписка случилась до отметки: события между ними не считаются
+            // изменением, а то первый же запуск сочтётся правкой конфига.
+            w.mark_current(config_dir);
+        }
+
         let settings = Settings::from_config(&config);
         let session = Session::open_at_with(
             store_dir,
@@ -150,6 +165,7 @@ impl Editor {
             created: generated.created,
             used_last_good,
             config_dir: config_dir.to_path_buf(),
+            watch,
         })
     }
 
@@ -168,6 +184,7 @@ impl Editor {
             created: Vec::new(),
             used_last_good: false,
             config_dir: dir.as_ref().to_path_buf(),
+            watch: None,
         })
     }
 
@@ -232,6 +249,23 @@ impl Editor {
     /// Каталог, из которого читается конфиг.
     pub fn config_dir(&self) -> &Path {
         &self.config_dir
+    }
+
+    /// Перечитать конфиг, если система сообщила, что файл изменился.
+    ///
+    /// Вызывается из цикла редактора. Возвращает `None`, если изменений нет,
+    /// иначе результат применения.
+    pub fn poll_watch(&mut self) -> Option<Reloaded> {
+        let changed = self.watch.as_mut()?.changed();
+        if changed.is_empty() {
+            return None;
+        }
+        Some(self.reload())
+    }
+
+    /// Следит ли редактор за каталогом конфига.
+    pub fn is_watching(&self) -> bool {
+        self.watch.is_some()
     }
 }
 

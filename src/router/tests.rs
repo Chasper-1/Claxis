@@ -711,3 +711,59 @@ fn reloading_an_unchanged_file_changes_nothing() {
     assert!(reloaded.applied.applied.is_empty());
     assert!(reloaded.applied.needs_restart.is_empty());
 }
+
+// ── Наблюдение за каталогом конфига ────────────────────────────────────────────
+
+#[test]
+fn editor_watches_the_config_directory() {
+    let tmp = Temp::new("watching");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert!(editor.is_watching(), "редактор должен следить за конфигом");
+}
+
+#[test]
+fn external_edit_is_applied_without_touching_the_editor() {
+    // Главное: правка снаружи видна открытому редактору.
+    let tmp = Temp::new("external");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let mut editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    let before = editor.session().keep();
+
+    // Пишем со стороны, как будто это другой редактор или git.
+    std::fs::write(
+        tmp.dir().join("files.toml"),
+        "[General]\nsnapshots_keep = 6\n",
+    )
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut applied = None;
+    while std::time::Instant::now() < deadline && applied.is_none() {
+        if let Some(reloaded) = editor.poll_watch() {
+            applied = Some(reloaded);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let reloaded = applied.expect("правка снаружи должна быть замечена");
+    assert!(reloaded.is_ok(), "конфиг должны были принять: {reloaded:?}");
+    assert!(before != editor.session().keep(), "настройка не сменилась");
+    assert_eq!(editor.session().keep(), 6);
+}
+
+#[test]
+fn nothing_happens_when_the_config_is_quiet() {
+    // Пока файлы не трогают, перечитывания быть не должно.
+    let tmp = Temp::new("quiet");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let mut editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+    for _ in 0..10 {
+        assert!(
+            editor.poll_watch().is_none(),
+            "перечитывание без изменения файла"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
