@@ -1,9 +1,9 @@
 [workspace]
-members = ["claxis-buffer", "claxis-store", "claxis-input"]
+members = ["claxis-buffer", "claxis-store", "claxis-input", "claxis-term"]
 
 [package]
 name = "Claxis"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 
 # Бинарная цель остаётся `Claxis`, библиотечная — `claxis`: слой API и
@@ -16,3 +16,4 @@ path = "src/lib.rs"
 claxis-buffer = { path = "claxis-buffer" }
 claxis-store = { path = "claxis-store" }
 claxis-input = { path = "claxis-input" }
+claxis-term = { path = "claxis-term" }

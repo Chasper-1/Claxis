@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::messages::Messages;
+
 /// Что пошло не так в хранилище.
 #[derive(Debug)]
 pub enum Error {
@@ -13,18 +15,26 @@ pub enum Error {
     NoSnapshot { file: String },
 }
 
+impl Error {
+    /// Текст ошибки на языке каталога. По умолчанию — английский.
+    pub fn message(&self, messages: &dyn Messages) -> String {
+        match self {
+            Error::Open { path, reason } => messages.open_failed(path, reason),
+            Error::PrepareDir { path, reason } => messages.prepare_dir_failed(path, reason),
+            Error::Query { reason } => messages.query_failed(reason),
+            Error::NoSnapshot { file } => messages.no_snapshot(file),
+        }
+    }
+
+    /// Текст ошибки на языке по умолчанию.
+    pub fn text(&self) -> String {
+        self.message(&crate::messages::En)
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Open { path, reason } => {
-                write!(f, "cannot open store at {path}: {reason}")
-            }
-            Error::PrepareDir { path, reason } => {
-                write!(f, "cannot create store directory {path}: {reason}")
-            }
-            Error::Query { reason } => write!(f, "store query failed: {reason}"),
-            Error::NoSnapshot { file } => write!(f, "no snapshot stored for {file}"),
-        }
+        f.write_str(&self.text())
     }
 }
 

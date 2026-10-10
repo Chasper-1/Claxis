@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::api::buffer::{Buffer, DEFAULT_DEPTH, SnapshotSink};
 use crate::api::store::{SnapshotStore, StorePaths};
+use crate::messages::Messages;
 
 /// Что пошло не так в сессии.
 #[derive(Debug)]
@@ -20,19 +21,35 @@ pub enum SessionError {
     Store { path: String, reason: String },
     /// Файл документа не прочитан.
     ReadFile { path: String, reason: String },
+    /// Файл больше, чем помещается в `u32`.
+    FileTooLarge { bytes: u64 },
+}
+
+impl SessionError {
+    /// Текст ошибки на языке каталога. По умолчанию — английский.
+    pub fn message(&self, messages: &dyn Messages) -> String {
+        match self {
+            SessionError::Buffer(e) => messages.buffer_error(e),
+            SessionError::Store { path, reason } => messages.store_failed(path, reason),
+            SessionError::ReadFile { path, reason } => messages.read_file_failed(path, reason),
+            SessionError::FileTooLarge { bytes } => messages.file_too_large(
+                *bytes,
+                *bytes as f64 / 1_000_000_000.0,
+                u32::MAX as u64,
+                u32::MAX as f64 / 1_000_000_000.0,
+            ),
+        }
+    }
+
+    /// Текст ошибки на языке по умолчанию.
+    pub fn text(&self) -> String {
+        self.message(&crate::messages::En)
+    }
 }
 
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SessionError::Buffer(e) => write!(f, "{e}"),
-            SessionError::Store { path, reason } => {
-                write!(f, "cannot open store at {path}: {reason}")
-            }
-            SessionError::ReadFile { path, reason } => {
-                write!(f, "cannot read file {path}: {reason}")
-            }
-        }
+        f.write_str(&self.text())
     }
 }
 
@@ -146,6 +163,16 @@ impl Session {
     /// возникает.
     pub fn open_file(&self, path: impl AsRef<Path>) -> Result<Document, SessionError> {
         let path = path.as_ref().to_path_buf();
+
+        // Проверяем размер до чтения: буфер работает с u32, файл больше
+        // u32::MAX байт не помещается.
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            let len = metadata.len();
+            if len > u32::MAX as u64 {
+                return Err(SessionError::FileTooLarge { bytes: len });
+            }
+        }
+
         let text = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),

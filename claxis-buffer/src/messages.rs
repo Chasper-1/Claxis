@@ -87,6 +87,32 @@ pub fn substitute(text: &str, values: &[(&str, String)]) -> String {
     out
 }
 
+/// Разделитель разрядов в числах.
+///
+/// Пробел: он читается одинаково в любом языке и не путается с точкой в
+/// десятичной дроби, в отличие от точки или запятой.
+const THOUSANDS: char = ' ';
+
+/// Разбить число на разряды: `4294967295` становится `4 294 967 295`.
+///
+/// Без разбивки длинное число не читается — не видно, где миллиард. Правило
+/// одно на все сообщения редактора, а не на каждый крейт своё.
+pub fn group_digits(n: u64) -> String {
+    let digits = n.to_string();
+    if digits.len() <= 3 {
+        return digits;
+    }
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        // Разделитель ставим там, где справа остаётся кратное трём число цифр.
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(THOUSANDS);
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Английские сообщения — язык по умолчанию.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct En;
@@ -96,9 +122,9 @@ impl Messages for En {
         substitute(
             "range {anchor}..{end} is outside the document of length {doc_len}",
             &[
-                ("anchor", anchor.to_string()),
-                ("end", end.to_string()),
-                ("doc_len", doc_len.to_string()),
+                ("anchor", group_digits(anchor as u64)),
+                ("end", group_digits(end as u64)),
+                ("doc_len", group_digits(doc_len as u64)),
             ],
         )
     }
@@ -107,9 +133,9 @@ impl Messages for En {
         substitute(
             "invalid history depth {depth}: must be between {min} and {max} records",
             &[
-                ("depth", depth.to_string()),
-                ("min", min.to_string()),
-                ("max", max.to_string()),
+                ("depth", group_digits(depth as u64)),
+                ("min", group_digits(min as u64)),
+                ("max", group_digits(max as u64)),
             ],
         )
     }
@@ -118,8 +144,8 @@ impl Messages for En {
         substitute(
             "buffer tree pool exhausted: {capacity} nodes is not enough for depth {depth}",
             &[
-                ("capacity", capacity.to_string()),
-                ("depth", depth.to_string()),
+                ("capacity", group_digits(capacity as u64)),
+                ("depth", group_digits(depth as u64)),
             ],
         )
     }
