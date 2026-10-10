@@ -1,5 +1,5 @@
 [workspace]
-members = ["claxis-text", "claxis-buffer", "claxis-store", "claxis-input", "claxis-term"]
+members = ["claxis-text", "claxis-buffer", "claxis-store", "claxis-input", "claxis-term", "claxis-i18n", "claxis-config"]
 
 [package]
 name = "Claxis"
@@ -18,3 +18,6 @@ claxis-buffer = { path = "claxis-buffer" }
 claxis-store = { path = "claxis-store" }
 claxis-input = { path = "claxis-input" }
 claxis-term = { path = "claxis-term" }
+claxis-i18n = { path = "claxis-i18n" }
+claxis-config = { path = "claxis-config" }
+toml_edit = "0.22"

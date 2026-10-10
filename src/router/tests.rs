@@ -328,3 +328,126 @@ fn defaults_come_from_crate_settings() {
     );
     assert_eq!(session.persist(), crate::api::store::PERSIST);
 }
+
+// ── Настройки: конфиг и перевод ────────────────────────────────────────────────
+
+#[test]
+fn defaults_come_from_the_schema() {
+    // Настройки без конфига берутся из схемы, а не из зашитых чисел.
+    let settings = crate::router::Settings::defaults();
+    let depth =
+        claxis_config::schema::find(claxis_config::ConfigFile::Edit, "General.history_depth")
+            .unwrap()
+            .default
+            .parse::<u32>()
+            .unwrap();
+    assert_eq!(settings.history_depth, depth);
+    assert_eq!(settings.snapshots_keep, 3);
+    assert!(settings.snapshots_persist);
+    assert_eq!(settings.language, "en");
+}
+
+#[test]
+fn each_file_owns_its_keys() {
+    // Глубина истории живёт в edit.toml, снапшоты — в files.toml.
+    let config = claxis_config::Config::from_documents([
+        (
+            claxis_config::ConfigFile::Edit,
+            "[General]\nhistory_depth = 64\n".parse().unwrap(),
+        ),
+        (
+            claxis_config::ConfigFile::Files,
+            "[General]\nsnapshots_keep = 7\nsnapshots_persist = false\n"
+                .parse()
+                .unwrap(),
+        ),
+    ]);
+
+    let settings = crate::router::Settings::from_config(&config);
+    assert_eq!(settings.history_depth, 64);
+    assert_eq!(settings.snapshots_keep, 7);
+    assert!(!settings.snapshots_persist);
+}
+
+#[test]
+fn a_file_does_not_affect_another() {
+    // Ключ из чужого файла игнорируется, а не применяется как будто свой.
+    let config = claxis_config::Config::from_documents([(
+        claxis_config::ConfigFile::Files,
+        "[General]\nhistory_depth = 64\n".parse().unwrap(),
+    )]);
+    let settings = crate::router::Settings::from_config(&config);
+    assert_eq!(settings.history_depth, 8192);
+}
+
+#[test]
+fn every_file_opens_independently() {
+    // Все файлы открываются вместе и не мешают друг другу: общий, три
+    // состояния, темы и локализация.
+    let config = claxis_config::Config::from_documents(
+        claxis_config::ConfigFile::ALL
+            .iter()
+            .map(|f| (*f, "[General]\n".parse().unwrap())),
+    );
+    let open = config.open_files();
+    assert_eq!(open.len(), claxis_config::ConfigFile::ALL.len());
+    for f in claxis_config::ConfigFile::ALL {
+        assert!(open.contains(f), "файл {} не открыт", f.file_name());
+    }
+}
+
+#[test]
+fn common_settings_are_read_from_the_editor_file() {
+    // Общие настройки редактора лежат в config.toml, а не в состоянии.
+    let config = claxis_config::Config::from_documents([(
+        claxis_config::ConfigFile::Global,
+        "[General]\ntap_hold_milliseconds = 350\n".parse().unwrap(),
+    )]);
+    let key = claxis_config::schema::find(
+        claxis_config::ConfigFile::Global,
+        "General.tap_hold_milliseconds",
+    )
+    .unwrap();
+    assert_eq!(config.u32_or_default(key), 350);
+
+    // Тот же ключ в файле состояния ничего не делает.
+    let leaked = claxis_config::Config::from_documents([(
+        claxis_config::ConfigFile::Edit,
+        "[General]\ntap_hold_milliseconds = 350\n".parse().unwrap(),
+    )]);
+    assert_eq!(leaked.u32_or_default(key), 200);
+}
+
+#[test]
+fn unknown_key_is_reported_per_file() {
+    // Опечатку должно быть видно, и видно в том файле, где она.
+    let config = claxis_config::Config::from_documents([(
+        claxis_config::ConfigFile::Edit,
+        "[General]\nhistory_dept = 64\n".parse().unwrap(),
+    )]);
+    assert_eq!(
+        config.unknown_keys(claxis_config::ConfigFile::Edit),
+        vec!["General.history_dept".to_string()]
+    );
+    assert!(
+        config
+            .unknown_keys(claxis_config::ConfigFile::Files)
+            .is_empty()
+    );
+}
+
+#[test]
+fn editor_builds_session_from_settings() {
+    // Настройки действительно доходят до сессии, а не лежат мёртвым грузом.
+    let tmp = Temp::new("editor");
+    let mut settings = crate::router::Settings::defaults();
+    settings.history_depth = 32;
+    settings.snapshots_keep = 5;
+    settings.snapshots_persist = false;
+
+    let editor = crate::router::Editor::new_at(tmp.dir.clone(), settings).unwrap();
+    assert_eq!(editor.session().history_depth(), 32);
+    assert_eq!(editor.session().keep(), 5);
+    assert!(!editor.session().persist());
+    assert_eq!(editor.language(), "en");
+}

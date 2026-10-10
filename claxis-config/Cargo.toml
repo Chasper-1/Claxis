@@ -1,0 +1,12 @@
+[package]
+name = "claxis-config"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+claxis-text = { path = "../claxis-text" }
+claxis-i18n = { path = "../claxis-i18n" }
+claxis-buffer = { path = "../claxis-buffer" }
+claxis-store = { path = "../claxis-store" }
+claxis-input = { path = "../claxis-input" }
+toml_edit = "0.22"

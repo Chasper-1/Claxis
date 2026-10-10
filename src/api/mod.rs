@@ -5,6 +5,8 @@
 //! занимается маршрутизатор, `crate::router`.
 
 pub mod buffer;
+pub mod config;
+pub mod i18n;
 pub mod input;
 pub mod store;
 pub mod term;

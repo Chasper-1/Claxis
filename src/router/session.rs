@@ -155,6 +155,21 @@ impl Session {
         Self::build(StorePaths::new(dir), keep, persist, history_depth)
     }
 
+    /// То же, но путь принимается как ссылка.
+    pub fn open_at_ref(
+        dir: &Path,
+        keep: u32,
+        persist: bool,
+        history_depth: u32,
+    ) -> Result<Self, SessionError> {
+        Self::open_at_with(dir.to_path_buf(), keep, persist, history_depth)
+    }
+
+    /// Сколько снапшотов одного файла хранится.
+    pub fn keep(&self) -> u32 {
+        self.store.keep()
+    }
+
     /// Пишутся ли снапшоты на диск.
     pub fn persist(&self) -> bool {
         self.persist

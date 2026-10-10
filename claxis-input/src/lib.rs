@@ -19,20 +19,22 @@ pub mod defaults {
     /// подряд оно распространяться не может: тогда каждый введённый символ
     /// приходил бы с задержкой в окно и печатать было бы невозможно.
     ///
-    /// Ключ: `tap_hold_ms`.
-    pub const TAP_HOLD_MS: u32 = 200;
+    /// Ключ: `tap_hold_milliseconds`.
+    pub const TAP_HOLD_MILLISECONDS: u32 = 200;
 }
 
 /// Каждая настройка здесь описана и имеет значение.
 #[cfg(test)]
 mod tests {
-    use super::defaults::TAP_HOLD_MS;
+    use super::defaults::TAP_HOLD_MILLISECONDS;
 
     #[test]
     fn tap_hold_window_is_usable() {
         // Ноль означал бы, что удержание невозможно и второй смысл клавиши
         // недоступен вообще.
-        const { assert!(TAP_HOLD_MS > 0, "окно должно быть больше нуля") }
+        const {
+            assert!(TAP_HOLD_MILLISECONDS > 0, "окно должно быть больше нуля")
+        }
     }
 
     #[test]
@@ -41,7 +43,7 @@ mod tests {
         // медленнее. 200 мс это обычное значение для split-клавиатур.
         const {
             assert!(
-                TAP_HOLD_MS <= 1000,
+                TAP_HOLD_MILLISECONDS <= 1000,
                 "окно больше секунды сделает ввод невозможным"
             )
         }
