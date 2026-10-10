@@ -104,6 +104,25 @@ pub struct Session {
     history_depth: u32,
     /// Писать ли снапшоты на диск. Из конфига.
     persist: bool,
+    /// Глубина, с которой сессия открыта и под которую созданы буферы.
+    ///
+    /// Отличается от `history_depth`, если конфиг поменяли на лету: буферы
+    /// уже созданы под прежнюю, и пересоздать их без потери истории нельзя.
+    opened_depth: u32,
+}
+
+/// Что применилось сразу, а что ждёт перезапуска.
+///
+/// Не всё настраивается на лету: размер пула узлов задан при создании буфера,
+/// и сменить его можно только пересоздав буфер вместе с историей. Лучше сказать
+/// пользователю, что нужен перезапуск, чем применить наполовину и сделать
+/// вид, что всё в порядке.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    /// Ключи, подхваченные сразу.
+    pub applied: Vec<&'static str>,
+    /// Ключи, которые заработают после перезапуска.
+    pub needs_restart: Vec<&'static str>,
 }
 
 impl Session {
@@ -137,6 +156,7 @@ impl Session {
             paths,
             history_depth,
             persist,
+            opened_depth: history_depth,
         })
     }
 
@@ -175,9 +195,17 @@ impl Session {
         self.persist
     }
 
-    /// Глубина истории, с которой открыты документы.
+    /// Глубина истории из последнего прочитанного конфига.
     pub fn history_depth(&self) -> u32 {
         self.history_depth
+    }
+
+    /// Глубина, под которую реально созданы буферы.
+    ///
+    /// Расходится с `history_depth`, если конфиг поменяли на лету: применять
+    /// такой ключ можно только перезапуском.
+    pub fn opened_depth(&self) -> u32 {
+        self.opened_depth
     }
 
     /// Где лежит хранилище.
@@ -188,6 +216,35 @@ impl Session {
     /// Хранилище снапшотов.
     pub fn store(&self) -> &SnapshotStore {
         &self.store
+    }
+
+    /// Применить настройки без перезапуска редактора.
+    ///
+    /// Конфиг сохранили — редактор перечитал его и применяет. Не всё можно
+    /// применить на лету, и сказать об этом лучше, чем применить наполовину.
+    ///
+    /// `snapshots_keep` применяется сразу: это число вокруг которого
+    /// выбираются снапшоты. `snapshots_persist` — сразу для документов,
+    /// которые откроются дальше; уже открытые держат то, что получили при
+    /// открытии. `history_depth` задаёт размер пула узлов при создании буфера
+    /// и без пересоздания истории не меняется.
+    pub fn apply(&mut self, settings: &crate::router::Settings) -> Applied {
+        let mut applied = Applied::default();
+
+        if self.store.keep() != settings.snapshots_keep {
+            self.store.set_keep(settings.snapshots_keep);
+            applied.applied.push("snapshots_keep");
+        }
+        if self.persist != settings.snapshots_persist {
+            self.persist = settings.snapshots_persist;
+            applied.applied.push("snapshots_persist");
+        }
+        if self.history_depth != settings.history_depth {
+            self.history_depth = settings.history_depth;
+            applied.needs_restart.push("history_depth");
+        }
+
+        applied
     }
 
     /// Открыть документ: прочитать файл и привязать снапшоты к хранилищу.

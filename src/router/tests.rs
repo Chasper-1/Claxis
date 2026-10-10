@@ -593,3 +593,121 @@ fn editing_one_key_keeps_the_rest_of_the_file() {
     assert!(text.contains(key.comment), "комментарий пропал: {text}");
     assert!(text.contains("max_history_depth"), "соседний ключ пропал");
 }
+
+// ── Динамический конфиг: сохранил — применилось ──────────────────────────────
+
+#[test]
+fn saved_config_applies_without_restart() {
+    // Главное: сохранение файла подхватывается сразу.
+    let tmp = Temp::new("dynamic-apply");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let mut editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+    std::fs::write(
+        tmp.dir().join("files.toml"),
+        "[General]\nsnapshots_keep = 9\n",
+    )
+    .unwrap();
+
+    let reloaded = editor.reload();
+    assert!(
+        reloaded.is_ok(),
+        "конфиг должны были принять: {:?}",
+        reloaded
+    );
+    assert!(reloaded.issues.is_empty());
+    // Применилось сразу, без перезапуска.
+    assert!(
+        reloaded.applied.applied.contains(&"snapshots_keep"),
+        "keep должен примениться сразу: {:?}",
+        reloaded.applied
+    );
+    assert!(reloaded.applied.needs_restart.is_empty());
+    assert_eq!(editor.session().keep(), 9);
+}
+
+#[test]
+fn broken_saved_config_is_refused_and_reported() {
+    // Сломанный конфиг не применяется: старые настройки остаются, а где
+    // ошибка — видно, чтобы подсветить.
+    let tmp = Temp::new("dynamic-broken");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let mut editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    let before = editor.session().keep();
+
+    std::fs::write(
+        tmp.dir().join("files.toml"),
+        "[General]\nsnapshots_keep = 9\nnonsense = 1\n",
+    )
+    .unwrap();
+
+    let reloaded = editor.reload();
+    assert!(!reloaded.is_ok(), "сломанный конфиг принят быть не должен");
+    assert_eq!(reloaded.issues.len(), 1);
+
+    let issue = reloaded.first_issue().expect("где сломалось");
+    assert_eq!(issue.file, "files.toml");
+    assert_eq!(issue.line, 3);
+    assert_eq!(issue.key, "General.nonsense");
+
+    // Настройки те же: сломанный конфиг ничего не поменял.
+    assert_eq!(editor.session().keep(), before);
+}
+
+#[test]
+fn reload_writes_nothing_to_the_file() {
+    // Никто ничего не дописывает: конфиг выглядит ровно так, как его написал
+    // пользователь.
+    let tmp = Temp::new("dynamic-no-write");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let mut editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+    let path = tmp.dir().join("files.toml");
+    let mine = "[General]\nsnapshots_keep = 4\n";
+    std::fs::write(&path, mine).unwrap();
+
+    editor.reload();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        mine,
+        "редактор не должен трогать файл пользователя"
+    );
+}
+
+#[test]
+fn depth_change_asks_for_restart_instead_of_half_applying() {
+    // Размер пула задан при создании буфера: на лету не меняется, и редактор
+    // честно говорит об этом, а не делает вид.
+    let tmp = Temp::new("dynamic-depth");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let mut editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+    std::fs::write(
+        tmp.dir().join("edit.toml"),
+        "[General]\nhistory_depth = 128\n",
+    )
+    .unwrap();
+
+    let reloaded = editor.reload();
+    assert!(reloaded.is_ok());
+    assert!(
+        reloaded.applied.needs_restart.contains(&"history_depth"),
+        "глубина должна просить перезапуск: {:?}",
+        reloaded.applied
+    );
+    // Буфер продолжает работать на прежней глубине: половинчатое применение
+    // хуже, чем честная просьба перезапустить.
+    assert_eq!(editor.session().opened_depth(), 8192);
+}
+
+#[test]
+fn reloading_an_unchanged_file_changes_nothing() {
+    let tmp = Temp::new("dynamic-noop");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let mut editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+    let reloaded = editor.reload();
+    assert!(reloaded.is_ok());
+    assert!(reloaded.applied.applied.is_empty());
+    assert!(reloaded.applied.needs_restart.is_empty());
+}

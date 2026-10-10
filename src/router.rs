@@ -37,8 +37,8 @@ mod editor;
 mod session;
 mod settings;
 
-pub use editor::{Editor, StartError};
-pub use session::{Document, Session, SessionError};
+pub use editor::{Editor, Reloaded, StartError};
+pub use session::{Applied, Document, Session, SessionError};
 pub use settings::Settings;
 
 #[cfg(test)]

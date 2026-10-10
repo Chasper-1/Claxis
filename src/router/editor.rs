@@ -10,7 +10,7 @@ use claxis_config::schema::ConfigFile;
 use claxis_config::{Issue, generate};
 use claxis_i18n::Catalog;
 
-use crate::router::{Session, SessionError, Settings};
+use crate::router::{Applied, Session, SessionError, Settings};
 
 /// Что не так с конфигом при запуске.
 #[derive(Debug)]
@@ -61,6 +61,31 @@ pub struct Editor {
     pub created: Vec<PathBuf>,
     /// Редактор пошёл на последнем корректном конфиге.
     pub used_last_good: bool,
+    /// Откуда читается конфиг.
+    config_dir: PathBuf,
+}
+
+/// Что вышло из перечитывания конфига.
+#[derive(Clone, Debug, Default)]
+pub struct Reloaded {
+    /// Что применилось сразу, а что ждёт перезапуска.
+    pub applied: Applied,
+    /// Проблемы, если конфиг негоден.
+    pub issues: Vec<Issue>,
+    /// Конфиг принят.
+    pub accepted: bool,
+}
+
+impl Reloaded {
+    /// Конфиг негоден: показываем, где сломалось.
+    pub fn is_ok(&self) -> bool {
+        self.accepted
+    }
+
+    /// Первая проблема: на неё ставится курсор.
+    pub fn first_issue(&self) -> Option<&Issue> {
+        self.issues.first()
+    }
 }
 
 impl Editor {
@@ -124,6 +149,7 @@ impl Editor {
             issues,
             created: generated.created,
             used_last_good,
+            config_dir: config_dir.to_path_buf(),
         })
     }
 
@@ -141,6 +167,7 @@ impl Editor {
             issues: Vec::new(),
             created: Vec::new(),
             used_last_good: false,
+            config_dir: dir.as_ref().to_path_buf(),
         })
     }
 
@@ -167,6 +194,44 @@ impl Editor {
     /// Первая проблема конфига: на неё ставится курсор.
     pub fn first_issue(&self) -> Option<&Issue> {
         self.issues.first()
+    }
+
+    /// Перечитать конфиг после сохранения и применить, если он годен.
+    ///
+    /// Это и есть динамический конфиг: файл сохранили — редактор сразу
+    /// подхватил изменения. Если конфиг сломан, он **не применяется**: в
+    /// ответе останутся старые настройки и список проблем с файлом и
+    /// строкой, чтобы подсветить место поломки.
+    ///
+    /// Ничего не дописывается и не дополняется: конфиг выглядит ровно так,
+    /// как его написал пользователь.
+    pub fn reload(&mut self) -> Reloaded {
+        let loaded = generate::read_all(&self.config_dir);
+        if !loaded.issues.is_empty() {
+            // Сломанный конфиг не трогаем: пользователь должен увидеть, что
+            // его правка не сработала, и где именно ошибка.
+            return Reloaded {
+                applied: Applied::default(),
+                issues: loaded.issues,
+                accepted: false,
+            };
+        }
+
+        let settings = Settings::from_config(&loaded.config);
+        let applied = self.session.apply(&settings);
+        self.settings = settings;
+        self.issues = Vec::new();
+
+        Reloaded {
+            applied,
+            issues: Vec::new(),
+            accepted: true,
+        }
+    }
+
+    /// Каталог, из которого читается конфиг.
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
     }
 }
 
