@@ -75,43 +75,7 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Подставить значения вместо имён в фигурных скобках.
-///
-/// Публичная: каталог из конфига пользуется ею же, чтобы подставить значения
-/// в текст, написанный переводчиком.
-pub fn substitute(text: &str, values: &[(&str, String)]) -> String {
-    let mut out = text.to_owned();
-    for (name, value) in values {
-        out = out.replace(&format!("{{{name}}}"), value);
-    }
-    out
-}
-
-/// Разделитель разрядов в числах.
-///
-/// Пробел: он читается одинаково в любом языке и не путается с точкой в
-/// десятичной дроби, в отличие от точки или запятой.
-const THOUSANDS: char = ' ';
-
-/// Разбить число на разряды: `4294967295` становится `4 294 967 295`.
-///
-/// Без разбивки длинное число не читается — не видно, где миллиард. Правило
-/// одно на все сообщения редактора, а не на каждый крейт своё.
-pub fn group_digits(n: u64) -> String {
-    let digits = n.to_string();
-    if digits.len() <= 3 {
-        return digits;
-    }
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        // Разделитель ставим там, где справа остаётся кратное трём число цифр.
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(THOUSANDS);
-        }
-        out.push(ch);
-    }
-    out
-}
+pub use claxis_text::{group_digits, substitute};
 
 /// Английские сообщения — язык по умолчанию.
 #[derive(Clone, Copy, Debug, Default)]

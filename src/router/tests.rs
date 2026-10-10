@@ -271,7 +271,7 @@ fn gigabytes_are_decimal_not_binary() {
 
 #[test]
 fn big_numbers_are_split_into_readable_parts() {
-    use crate::messages::group_digits;
+    use claxis_text::group_digits;
 
     // Без разделителей длинное число не читается.
     assert_eq!(group_digits(4_294_967_295), "4 294 967 295");

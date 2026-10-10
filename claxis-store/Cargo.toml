@@ -1,8 +1,9 @@
 [package]
 name = "claxis-store"
-version = "0.1.0"
+version = "0.2.3"
 edition = "2024"
 
 [dependencies]
+claxis-text = { path = "../claxis-text" }
 # bundled: SQLite собирается из исходников, системный пакет не нужен.
 rusqlite = { version = "0.37", features = ["bundled"] }

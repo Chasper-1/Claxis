@@ -1,5 +1,5 @@
 [package]
-name = "claxis-input"
+name = "claxis-text"
 version = "0.2.3"
 edition = "2024"
 
