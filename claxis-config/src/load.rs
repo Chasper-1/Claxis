@@ -240,9 +240,9 @@ fn check(def: &KeyDef, value: &toml_edit::Item) -> std::result::Result<(), Probl
     use super::schema::Kind;
     let ok = match def.kind {
         Kind::Bool => value.as_bool().is_some(),
-        Kind::U32 => value
+        Kind::U16 => value
             .as_integer()
-            .map(|n| n >= 0 && n <= u32::MAX as i64)
+            .map(|n| (0..=u16::MAX as i64).contains(&n))
             .unwrap_or(false),
         Kind::U8 => value
             .as_integer()
@@ -363,7 +363,7 @@ mod tests {
             .iter()
             .find(|k| k.path == "General.snapshots_keep")
             .unwrap();
-        assert_eq!(loaded.config.u32_or_default(keep), 7);
+        assert_eq!(loaded.config.u8_or_default(keep), 7);
     }
 
     #[test]

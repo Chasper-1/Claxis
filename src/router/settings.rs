@@ -49,7 +49,9 @@ impl Settings {
         let mut settings = Self::defaults();
 
         if let Some(def) = schema::find(ConfigFile::Edit, "General.history_depth") {
-            settings.history_depth = config.u32_or_default(def);
+            // Конфиг ограничивает число 65535, буферу нужен u32: привести
+            // шире, чем есть, ничего не теряется.
+            settings.history_depth = config.u16_or_default(def) as u32;
         }
         if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_keep") {
             settings.snapshots_keep = config.u8_or_default(def);

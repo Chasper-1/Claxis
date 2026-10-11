@@ -149,7 +149,7 @@ pub fn samples() -> Vec<(&'static str, String)> {
         line: 5,
         key: "General.snapshots_keep".to_string(),
         problem: Problem::BadType {
-            expected: "a whole number",
+            expected: "a number from 0 to 255",
             got: "\"много\"".to_string(),
         },
     };
@@ -178,7 +178,11 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ("unknown_key", m.unknown_key("General.history_dept")),
         (
             "bad_value",
-            m.bad_value("General.snapshots_keep", "\"много\"", "a whole number"),
+            m.bad_value(
+                "General.snapshots_keep",
+                "\"много\"",
+                "a number from 0 to 255",
+            ),
         ),
         (
             "wrong_section",

@@ -110,8 +110,8 @@ pub const GENERAL: &str = "General";
 pub enum Kind {
     /// Да или нет.
     Bool,
-    /// Целое число.
-    U32,
+    /// Целое от 0 до 65535.
+    U16,
     /// Целое от 0 до 255.
     U8,
     /// Строка.
@@ -123,7 +123,7 @@ impl Kind {
     pub fn expected(self) -> &'static str {
         match self {
             Kind::Bool => "a boolean",
-            Kind::U32 => "a whole number",
+            Kind::U16 => "a number from 0 to 65535",
             Kind::U8 => "a number from 0 to 255",
             Kind::Str => "a string",
         }
@@ -206,7 +206,7 @@ impl TableDef {
 pub const TABLES: &[TableDef] = &[TableDef {
     file: ConfigFile::Global,
     path: "General.hold",
-    kind: Kind::U32,
+    kind: Kind::U16,
     default: &[("alt", "200"), ("ctrl", "200")],
     comment: "Keys that mean two things, and how long a press counts as held. The key is the key itself, the value is the window in milliseconds. Add as many keys as you like.",
 }];
@@ -244,24 +244,16 @@ pub const KEYS: &[KeyDef] = &[
         file: ConfigFile::Edit,
         path: "General.history_depth",
         default: "8192",
-        kind: Kind::U32,
+        kind: Kind::U16,
         comment: "How many edits to keep in memory before taking a snapshot.",
         active: true,
-    },
-    KeyDef {
-        file: ConfigFile::Edit,
-        path: "General.max_history_depth",
-        default: "8192",
-        kind: Kind::U32,
-        comment: "Upper bound for history depth, no more is possible.",
-        active: false,
     },
     // Режим: секция названа режимом, ключ внутри неё.
     KeyDef {
         file: ConfigFile::Edit,
         path: "Word.indent_size",
         default: "4",
-        kind: Kind::U32,
+        kind: Kind::U16,
         comment: "How many spaces one indent level is worth.",
         active: false,
     },
@@ -460,9 +452,9 @@ mod tests {
                     "{}: значение по умолчанию не да/нет",
                     key.path
                 ),
-                Kind::U32 => assert!(
-                    key.default.parse::<u32>().is_ok(),
-                    "{}: значение по умолчанию не число",
+                Kind::U16 => assert!(
+                    key.default.parse::<u16>().is_ok(),
+                    "{}: значение по умолчанию не помещается в два байта",
                     key.path
                 ),
                 Kind::U8 => assert!(

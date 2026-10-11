@@ -77,11 +77,11 @@ impl Config {
             .to_string()
     }
 
-    /// Целое значение ключа из конфига, иначе значение по умолчанию.
-    pub fn u32_or_default(&self, def: &'static KeyDef) -> u32 {
+    /// Значение от 0 до 65535 из конфига, иначе значение по умолчанию.
+    pub fn u16_or_default(&self, def: &'static KeyDef) -> u16 {
         self.get(def)
             .and_then(|i| i.as_integer())
-            .map(|n| n as u32)
+            .and_then(|n| u16::try_from(n).ok())
             .unwrap_or_else(|| def.default.parse().unwrap_or(0))
     }
 
@@ -183,7 +183,7 @@ mod tests {
     fn reads_a_value_from_the_right_file() {
         let config = edit_config("[General]\nhistory_depth = 64\n");
         let def = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
-        assert_eq!(config.u32_or_default(def), 64);
+        assert_eq!(config.u16_or_default(def), 64);
     }
 
     #[test]
@@ -191,7 +191,7 @@ mod tests {
         // Не задано — работает то, что в схеме.
         let config = edit_config("[General]\n");
         let def = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
-        assert_eq!(config.u32_or_default(def), def.default.parse().unwrap());
+        assert_eq!(config.u16_or_default(def), def.default.parse().unwrap());
     }
 
     #[test]
@@ -202,7 +202,7 @@ mod tests {
             "[General]\nhistory_depth = 64\n".parse().unwrap(),
         )]);
         let def = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
-        assert_eq!(config.u32_or_default(def), 8192);
+        assert_eq!(config.u16_or_default(def), 8192);
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn known_keys_are_not_reported() {
-        let config = edit_config("[General]\nhistory_depth = 64\nmax_history_depth = 10\n");
+        let config = edit_config("[General]\nhistory_depth = 64\n\n[Word]\nindent_size = 4\n");
         assert!(config.unknown_keys(ConfigFile::Edit).is_empty());
     }
 

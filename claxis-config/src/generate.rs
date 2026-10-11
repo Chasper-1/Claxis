@@ -180,7 +180,7 @@ fn tr<'a>(catalog: &'a claxis_i18n::Catalog, text: &'a str) -> &'a str {
 fn kind_hint(kind: schema::Kind) -> &'static str {
     match kind {
         schema::Kind::Bool => "true or false",
-        schema::Kind::U32 => "a whole number",
+        schema::Kind::U16 => "a number from 0 to 65535",
         schema::Kind::U8 => "a number from 0 to 255",
         schema::Kind::Str => "a string",
     }
@@ -200,7 +200,7 @@ fn comment_body(key: &KeyDef, catalog: &claxis_i18n::Catalog) -> String {
     // стоит слово «значение», а где название типа.
     let phrase = match key.kind {
         schema::Kind::Bool => "Value: true or false.",
-        schema::Kind::U32 => "Value: a whole number.",
+        schema::Kind::U16 => "Value: a number from 0 to 65535.",
         schema::Kind::U8 => "Value: a number from 0 to 255.",
         schema::Kind::Str => "Value: a string.",
     };
@@ -298,7 +298,7 @@ pub fn write_value(
 fn parse_value(key: &KeyDef, value: &str) -> Item {
     use toml_edit::Value;
     match key.kind {
-        schema::Kind::U32 | schema::Kind::U8 => match value.parse::<i64>() {
+        schema::Kind::U16 | schema::Kind::U8 => match value.parse::<i64>() {
             Ok(n) => Item::Value(Value::from(n)),
             Err(_) => Item::Value(Value::from(value)),
         },
@@ -336,8 +336,8 @@ mod tests {
                     "Not set: no value is assigned to this key.",
                     "Не задано: ключу не назначено значение.",
                 ),
-                ("Value: a whole number.", "Значение: целое число."),
-                ("a whole number", "целое число"),
+                ("Value: a number from 0 to 65535.", "Значение: число от 0 до 65535."),
+                ("a number from 0 to 65535", "число от 0 до 65535"),
             ]
             .map(|(k, v)| (k.to_string(), v.to_string())),
         )
@@ -416,8 +416,8 @@ mod tests {
         let loaded = crate::load::parse(ConfigFile::Edit, &text);
         let key = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
         assert_eq!(
-            loaded.config.u32_or_default(key),
-            key.default.parse::<u32>().unwrap()
+            loaded.config.u16_or_default(key),
+            key.default.parse::<u16>().unwrap()
         );
     }
 
@@ -513,7 +513,7 @@ mod tests {
             "перевод предупреждения не попал в файл: {text}"
         );
         assert!(
-            text.contains("целое число"),
+            text.contains("число от 0 до 65535"),
             "перевод типа не попал: {text}"
         );
     }
@@ -529,7 +529,7 @@ mod tests {
         }
         for phrase in [
             NOT_SET,
-            "Value: a whole number.",
+            "Value: a number from 0 to 65535.",
             "Value: true or false.",
             "Value: a string.",
         ] {
@@ -563,7 +563,7 @@ mod tests {
         let loaded = read_all(tmp.dir());
         assert!(loaded.is_ok(), "пустой каталог не должен давать ошибок");
         let key = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
-        assert_eq!(loaded.config.u32_or_default(key), 8192);
+        assert_eq!(loaded.config.u16_or_default(key), 8192);
     }
 
     #[test]

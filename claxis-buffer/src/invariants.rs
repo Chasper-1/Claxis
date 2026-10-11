@@ -467,18 +467,11 @@ fn every_default_is_present_and_documented() {
     use crate::defaults::buffer;
 
     // Ключ не пустой, комментарий полный — у всех настроек.
-    for (name, key, comment) in [
-        (
-            "Buffer.history_depth",
-            buffer::HISTORY_DEPTH.key,
-            buffer::HISTORY_DEPTH.comment,
-        ),
-        (
-            "Buffer.max_history_depth",
-            buffer::MAX_HISTORY_DEPTH.key,
-            buffer::MAX_HISTORY_DEPTH.comment,
-        ),
-    ] {
+    for (name, key, comment) in [(
+        "Buffer.history_depth",
+        buffer::HISTORY_DEPTH.key,
+        buffer::HISTORY_DEPTH.comment,
+    )] {
         assert!(!key.is_empty(), "{name}: ключ не может быть пустым");
         assert!(
             !comment.is_empty(),
@@ -496,7 +489,6 @@ fn every_default_is_present_and_documented() {
     // настройка выглядит подключённой, а её значение никто не открывает. Тогда
     // пользователь правит конфиг и не видит никакой разницы.
     const _: () = assert!(buffer::HISTORY_DEPTH.active);
-    const _: () = assert!(!buffer::MAX_HISTORY_DEPTH.active);
 
     // Значения по умолчанию согласованы с настоящими ограничениями.
     // Значение по умолчанию обязано быть тем, с чем реально создаётся буфер.

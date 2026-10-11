@@ -67,13 +67,6 @@ pub mod buffer {
         "Сколько записей правки держать в памяти до снапшота.",
     );
 
-    /// Настройки, задуманные, но пока не подключённые.
-    pub const MAX_HISTORY_DEPTH: Default<u32> = Default::planned(
-        "max_history_depth",
-        crate::arena::MAX_DEPTH,
-        "Верхняя граница глубины истории, больше нельзя.",
-    );
-
     /// Все настройки раздела.
-    pub const ALL: &[Default<u32>] = &[HISTORY_DEPTH, MAX_HISTORY_DEPTH];
+    pub const ALL: &[Default<u32>] = &[HISTORY_DEPTH];
 }

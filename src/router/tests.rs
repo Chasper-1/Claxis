@@ -607,7 +607,7 @@ fn editing_one_key_keeps_the_rest_of_the_file() {
     let text = std::fs::read_to_string(tmp.dir().join("edit.toml")).unwrap();
     assert!(text.contains("history_depth = 256"), "{text}");
     assert!(text.contains(key.comment), "комментарий пропал: {text}");
-    assert!(text.contains("max_history_depth"), "соседний ключ пропал");
+    assert!(text.contains("indent_size"), "соседний ключ пропал");
 }
 
 // ── Динамический конфиг: сохранил — применилось ──────────────────────────────
