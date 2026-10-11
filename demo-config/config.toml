@@ -19,17 +19,17 @@ insert_final_newline = true
 # mouse settings
 mouse_mode = true
 middle_click_paste = true
-step_scroll_lines = 3     # u8
+step_scroll_lines = 3     # u8 1..255. Меньше 0 ошибка
 
 # space edit settings
-end_padding = 5     # u8
+end_padding = 5     # u8 0..255. 0 не работает значит
 shell_os = "unix"     # enum unix = "sh -c" / windows = "cmd /C"
 numberline = "relative"     # enum absolute or relative.
 cursor_numberline = "column_start"     # enum column_start or column_end
 continue_comments = true     # if you create a new line while in the comment line, the new line will continue the comment.
 auto_completion = true
 path_completion = { files = true, directory = true }     # files = bool, directory = bool
-max_text_width = 0     # u8 
+max_line_width = 0     # u8 0..255. 0 не работает значит
 
 [Statusline]
 left = []
@@ -52,6 +52,7 @@ search = "Search"
 file_manager = "Manager"
 git = "Git"
 
+[Statusline.Setting]
 position = { cursor = "{number}", selection = "{number}" }     # selection = "percentage", cursor = "percentage"
 
 [Commandline]
