@@ -3,29 +3,79 @@
 # ---
 
 [Path]
-theme = "~/.config/claxis/theme"       # указывается папка, это дефолт путь в Linux
+theme = "~/.config/claxis/theme"     # указывается папка, это дефолт путь в Linux
 # edit = "любой/не/дефолт/путь"
 # command = "аналогично"
 # file = "аналогично"
-# setting = "аналогично"               # новое состояние, там будут некоторые только настройки прямо из редактора, конфиг основной способ и главный.
+# setting = "аналогично"     # новое состояние, там будут некоторые только настройки прямо из редактора, конфиг — основной способ и главный.
 
 [General]
-language = "ru"                        # Enum > ru, en, uk...
+language = "ru"     # enum ru, en, uk...
 color_modes = true
-auto_format = true                     # Enable automatic formatting on save
+auto_format = true     # enable automatic formatting on save
 insert_final_newline = true
+
+# mouse settings
+mouse_mode = true
+middle_click_paste = true
+step_scroll_lines = 3     # u8
+
+# space edit settings
+end_padding = 5     # u8
+shell_os = "unix"     # enum unix = "sh -c" / windows = "cmd /C"
+numberline = "relative"     # enum absolute else relative. line_number: absolute
+cursorline = "column_start"     # enum column_start or column_end
+continue_comments = true     # if you create a new line while in the comment line, the new line will continue the comment.
+auto_completion = true
+path_completion = { files = true, directory = true }     # files = bool, directory = bool
+max_text_width = 0     # u8 
+
+[Statusline]
+left = 
+center = 
+right = [ "position",  ]
+
+[Statusline.States]     # Отображаемые имена состояний в статус линии
+edit = "Edit"
+command = "Command"
+file = "File"
+
+[Statusline.Modes]     # Отображаемые имена режимов в статус линии
+# state edit
+type = "Type"
+view = "View"
+replace = "Replace"
+selection = "Selection"
+search = "Search"
+
+# state file
+file_manager = "Manager"
+git = "Git"
+selection = "Selection"
+search = "Search"
+
+position = { cursor = "{number}", selection = "{number}" }     # selection = "percentage", cursor = "percentage"
+
+[Commandline]
+hide = true
+center_mode = true
 
 [Keyboard]
 
 
-[Homescreen]                           # Домашний экран, пока не придумал другое название ему.
+[Startscreen]     # Начальный экран
 include = true
 
-[Savescreen]                           # После сохранения экран со статистикой
+[Savescreen]     # После сохранения экран со статистикой
 include = true
-mode = "fullscreen"                    # enum из режимов на весь эран, окном или сообщением. fuulscreen, messange, window
+mode = "fullscreen"     # enum из режимов на весь эран, окном или сообщением. fullscreen, messange, window
 
 [Savescreen.Statistic]
 input_char = true
 delete_char = true
+history_usage = true
+
+
+[Savescreen.Setting]
+history_usage = { percent = "{used}", number = "{remaining}" }     # enum used or remaining. remaining = max - used
 
