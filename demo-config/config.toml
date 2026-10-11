@@ -8,6 +8,7 @@ theme = "~/.config/claxis/theme"     # указывается папка, это
 # command = "аналогично"
 # file = "аналогично"
 # setting = "аналогично"     # новое состояние, там будут некоторые только настройки прямо из редактора, конфиг — основной способ и главный.
+# schema = "аналогично"
 
 [General]
 language = "ru"     # enum ru, en, uk...
@@ -23,16 +24,16 @@ step_scroll_lines = 3     # u8
 # space edit settings
 end_padding = 5     # u8
 shell_os = "unix"     # enum unix = "sh -c" / windows = "cmd /C"
-numberline = "relative"     # enum absolute else relative. line_number: absolute
-cursorline = "column_start"     # enum column_start or column_end
+numberline = "relative"     # enum absolute or relative.
+cursor_numberline = "column_start"     # enum column_start or column_end
 continue_comments = true     # if you create a new line while in the comment line, the new line will continue the comment.
 auto_completion = true
 path_completion = { files = true, directory = true }     # files = bool, directory = bool
 max_text_width = 0     # u8 
 
 [Statusline]
-left = 
-center = 
+left = []
+center = []
 right = [ "position",  ]
 
 [Statusline.States]     # Отображаемые имена состояний в статус линии
@@ -47,12 +48,9 @@ view = "View"
 replace = "Replace"
 selection = "Selection"
 search = "Search"
-
-# state file
+# state file none search and selection
 file_manager = "Manager"
 git = "Git"
-selection = "Selection"
-search = "Search"
 
 position = { cursor = "{number}", selection = "{number}" }     # selection = "percentage", cursor = "percentage"
 
@@ -68,7 +66,7 @@ include = true
 
 [Savescreen]     # После сохранения экран со статистикой
 include = true
-mode = "fullscreen"     # enum из режимов на весь эран, окном или сообщением. fullscreen, messange, window
+mode = "fullscreen"     # enum из режимов на весь эран, окном или сообщением. fullscreen, message, window
 
 [Savescreen.Statistic]
 input_char = true
