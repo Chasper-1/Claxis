@@ -10,10 +10,10 @@
 
 use std::path::Path;
 
-use crate::api::config::path::theme_dir;
+use crate::api::config::path::{lang_dir, theme_dir};
 use crate::api::config::schema;
 use crate::api::config::{Config, ConfigFile};
-use crate::api::i18n::load::catalog_for;
+use crate::api::i18n::load::load;
 use crate::api::i18n::{Catalog, DEFAULT_LANGUAGE, Error as LangError};
 use crate::api::theme::DEFAULT_THEME;
 
@@ -90,7 +90,7 @@ impl Settings {
     /// интерфейс на языке, которого нет, и должен узнать об этом, а не
     /// получить английский вместо своего.
     pub fn load_language(&mut self, config_dir: &Path) -> Result<(), LangError> {
-        self.catalog = catalog_for(config_dir, &self.language)?;
+        self.catalog = load(lang_dir(config_dir), &self.language)?;
         Ok(())
     }
 

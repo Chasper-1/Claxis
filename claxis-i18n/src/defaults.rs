@@ -7,8 +7,3 @@
 ///
 /// Ключ: `language`.
 pub const DEFAULT_LANGUAGE: &str = "en";
-
-/// Папка с переводами внутри каталога конфига.
-///
-/// Ключ: `language_dir`.
-pub const LANGUAGE_DIR: &str = "lang";

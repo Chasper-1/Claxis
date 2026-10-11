@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::defaults::{DEFAULT_LANGUAGE, LANGUAGE_DIR};
+use crate::defaults::DEFAULT_LANGUAGE;
 
 /// Путь к файлу перевода.
 ///
@@ -56,11 +56,6 @@ impl LangPath {
     pub fn dir(&self) -> &Path {
         self.0.parent().unwrap_or_else(|| Path::new("."))
     }
-}
-
-/// Каталог переводов по умолчанию: `<конфиг>/lang`.
-pub fn default_dir(config_dir: impl AsRef<Path>) -> PathBuf {
-    config_dir.as_ref().join(LANGUAGE_DIR)
 }
 
 /// Язык по умолчанию.

@@ -9,13 +9,16 @@
 use std::path::Path;
 
 use crate::defaults::DEFAULT_LANGUAGE;
-use crate::path::{LangPath, default_dir};
+use crate::path::LangPath;
 
 /// Прочитать язык по коду из каталога переводов `dir`.
 ///
 /// Папка — склад, а не выбор: файлов переводов может лежать сколько угодно,
 /// и работает только тот, чей код написан в конфиге. Ничего не перебираем и
 /// ничего не выбираем сами.
+///
+/// Крейт не знает, где лежит папка: путь приходит готовым от того, кто знает
+/// раскладку на диске. Имя папки — не его дело.
 ///
 /// Английский не читается с диска: он зашит и разбирается как «файл есть
 /// всегда». Остальные языки обязаны быть на диске — молча остаться на
@@ -81,11 +84,6 @@ pub fn check_complete(
         count: missing.len(),
         total: required.len(),
     })
-}
-
-/// Каталог для языка из кода: английский — из кода, остальные — с диска.
-pub fn catalog_for(config_dir: impl AsRef<Path>, lang: &str) -> crate::Result<crate::Catalog> {
-    load(default_dir(config_dir), lang)
 }
 
 #[cfg(test)]
@@ -254,15 +252,5 @@ mod tests {
             }
             other => panic!("ожидалась неполнота, получено: {other:?}"),
         }
-    }
-
-    #[test]
-    fn catalog_for_reads_from_the_default_subdirectory() {
-        let tmp = Temp::new("default-dir");
-        let lang = tmp.0.join("lang");
-        std::fs::create_dir_all(&lang).unwrap();
-        std::fs::write(lang.join("ru.toml"), good()).unwrap();
-        let catalog = catalog_for(&tmp.0, "ru").unwrap();
-        assert_eq!(catalog.get("Open file"), Some("Открыть файл"));
     }
 }

@@ -1103,3 +1103,51 @@ fn translations_in_the_folder_do_not_apply_themselves() {
     assert!(editor.language_error.is_none());
     assert_eq!(editor.catalog().get("Open file"), Some("Открыть файл"));
 }
+
+#[test]
+fn only_the_config_crate_knows_where_the_folders_are() {
+    // Крейты получают готовый путь и ничего не знают о раскладке на диске.
+    // Если тема или перевод снова начнут собирать путь сами, знание о папках
+    // размажется по двум местам, и правка одной распа��ется на другую.
+    //
+    // Проверяем по коду: ни в `claxis-theme`, ни в `claxis-i18n` не должно быть
+    // имён папок. Имена папок — дело одного крейта.
+    let forbidden = ["THEME_DIR", "LANG_DIR", "theme_dir", "lang_dir", "user_dir"];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for crate_name in ["claxis-theme", "claxis-i18n"] {
+        let src = root.join(crate_name).join("src");
+        for entry in std::fs::read_dir(&src).unwrap().flatten() {
+            if entry.path().extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            for name in forbidden {
+                // Только код, не комментарии и не примеры сообщений: текст
+                // про пути в сообщении — это текст, а не знание о раскладке.
+                for (n, line) in text.lines().enumerate() {
+                    let line = line.trim();
+                    if line.starts_with("//") || line.contains('"') {
+                        continue;
+                    }
+                    assert!(
+                        !line.contains(name),
+                        "{}:{}: крейт не должен знать про папки ({name}): {line}",
+                        entry.path().display(),
+                        n + 1
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_config_crate_resolves_every_folder() {
+    // Раз знает один крейт, он и раздаёт папки. Обе папки собираются оттуда.
+    let config = crate::api::config::path::user_dir().expect("каталог находится");
+    let theme = crate::api::config::path::theme_dir(&config);
+    let lang = crate::api::config::path::lang_dir(&config);
+    assert!(theme.ends_with("theme"), "{theme:?}");
+    assert!(lang.ends_with("lang"), "{lang:?}");
+    assert_ne!(theme, lang);
+}
