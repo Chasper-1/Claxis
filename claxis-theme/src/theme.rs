@@ -4,6 +4,11 @@
 //! пока не разбирается: здесь только то, что нужно конфигу, — какие темы
 //! есть и какое имя выбрано.
 //!
+//! `default` — не отдельная тема, а отсутствие своих цветов: рисуем тем, что
+//! уже задано в терминале. Файла у неё нет, и придумывать его незачем.
+//! Придумывать свои цвета тоже незачем: несколько готовых тем будут вшиты в
+//! редактор.
+//!
 //! Крейт ничего не знает про конфиг и про редактор: ему дают папку и имя,
 //! он отвечает, есть ли такая тема.
 
@@ -14,12 +19,16 @@ use crate::{Error, Result};
 /// Расширение файла темы.
 pub const EXTENSION: &str = "toml";
 
-/// Тема, когда своя не выбрана.
+/// Тема, когда в конфиге тема не написана.
 ///
 /// `default` — это **не** отдельная тема, а отсутствие своих цветов: рисуем
 /// теми цветами, что уже заданы в терминале. Отдельного файла у неё нет и
 /// быть не должно: пользователю незачем придумывать пустую тему, чтобы получить
 /// пустую тему.
+///
+/// Файлов тем в папке может лежать сколько угодно, и они все доступны: папка
+/// это просто склад. Работает та тема, **имя которой написано в конфиге**, а
+/// не та, что попалась первой. Не написана — значит `default`.
 ///
 /// Если пользователь всё же положит `default.toml`, он перекроет эту и станет
 /// обычной темой со своими цветами.
@@ -44,8 +53,8 @@ pub fn list(dir: impl AsRef<Path>) -> Result<Vec<Theme>> {
     let dir = dir.as_ref();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        // Папки нет — остаётся только встроенная тема. Так и бывает до
-        // первого запуска.
+        // Папки нет — остаётся только `default`, то есть цвета терминала.
+        // Так и бывает до первого запуска.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![builtin()]),
         Err(e) => {
             return Err(Error::ReadDir {
@@ -71,7 +80,7 @@ pub fn list(dir: impl AsRef<Path>) -> Result<Vec<Theme>> {
     Ok(themes)
 }
 
-/// Встроенная тема. Файла у неё нет: содержимое темы ещё не определено.
+/// `default` — цвета терминала. Файла у неё нет и не нужно.
 fn builtin() -> Theme {
     Theme {
         name: DEFAULT_THEME.to_string(),
@@ -160,23 +169,23 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_folder_leaves_only_the_builtin_theme() {
+    fn a_missing_folder_leaves_only_default() {
         // Так бывает до первого запуска: папки ещё нет, и это не поломка.
-        // Встроенная тема есть всегда, иначе свежий конфиг ругался бы сразу.
+        // `default` есть всегда, иначе свежий конфиг ругался бы сразу.
         let dir = std::env::temp_dir().join("claxis-theme-nonexistent-xyz");
         assert_eq!(names_in(&list(&dir).unwrap()), vec!["default"]);
     }
 
     #[test]
-    fn the_builtin_theme_works_without_a_file() {
-        // Содержимое темы ещё не определено, поэтому файла с ней нет.
+    fn default_works_without_a_file() {
+        // `default` — это цвета терминала, а не файл: брать его не откуда.
         let dir = std::env::temp_dir().join("claxis-theme-nonexistent-xyz");
         assert_eq!(find(&dir, DEFAULT_THEME).unwrap().name, "default");
     }
 
     #[test]
-    fn a_file_may_replace_the_builtin_theme() {
-        // Файл с тем же именем перекрывает встроенную тему, а не дублирует её.
+    fn a_file_may_replace_default() {
+        // Файл с тем же именем перекрывает `default`, а не дублирует его.
         let tmp = Temp::new("override");
         tmp.theme("default.toml");
         assert_eq!(names_in(&list(&tmp.0).unwrap()), vec!["default"]);
@@ -250,8 +259,28 @@ mod tests {
     }
 
     #[test]
+    fn files_in_the_folder_do_not_choose_the_theme() {
+        // Главное правило: папка — склад, а не выбор. Файлов может лежать
+        // сколько угодно, и работает та, чьё имя написано в конфиге. Не
+        // написана — `default`, а не «первая попавшаяся в каталоге».
+        let tmp = Temp::new("no-choice");
+        tmp.theme("everforest.toml")
+            .theme("solarized.toml")
+            .theme("nord.toml");
+        // Список показывает все три — они доступны.
+        assert_eq!(
+            tmp.names(),
+            vec!["default", "everforest", "nord", "solarized"]
+        );
+        // Но пока имя не написано в конфиге, работает `default`.
+        assert_eq!(find(&tmp.0, DEFAULT_THEME).unwrap().name, "default");
+        // Написано — работает именно она, а не какая попалась.
+        assert_eq!(find(&tmp.0, "solarized").unwrap().name, "solarized");
+    }
+
+    #[test]
     fn a_message_always_offers_the_builtin_theme() {
-        // Список не бывает пустым: встроенная тема есть всегда.
+        // Список не бывает пустым: `default` есть всегда.
         let tmp = Temp::new("empty");
         let err = find(&tmp.0, "solarized").unwrap_err();
         let text = err.text();

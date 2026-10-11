@@ -1053,3 +1053,53 @@ fn the_generated_config_asks_for_a_theme_up_front() {
     );
     assert!(!text.contains("#theme"), "ключ не закомментирован: {text}");
 }
+
+#[test]
+fn themes_in_the_folder_do_not_apply_themselves() {
+    // Папка — склад, а не выбор. Файлов может лежать сколько угодно, но без
+    // имени в конфиге работает `default`: иначе тема применялась бы сама, и
+    // пользователь не знал бы, почему.
+    let tmp = Temp::new("theme-no-choice");
+    write_theme(tmp.dir(), "everforest.toml");
+    write_theme(tmp.dir(), "solarized.toml");
+    // Конфиг создаётся с ключом темы по умолчанию — это `default`.
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.settings().theme, "default");
+    assert!(editor.theme_error.is_none());
+
+    // Как только имя написано — работает именно эта тема.
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\ntheme = \"everforest\"\n",
+    )
+    .unwrap();
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.settings().theme, "everforest");
+}
+
+#[test]
+fn translations_in_the_folder_do_not_apply_themselves() {
+    // Папка переводов — склад, как и папка тем. Файлов может лежать сколько
+    // угодно, и сломанный чужой перевод не должен мешать: работает только тот,
+    // чей код написан в конфиге.
+    let tmp = Temp::new("lang-no-choice");
+    write_translation(tmp.dir(), "ru", "\"Open file\" = \"Открыть файл\"\n");
+    write_translation(tmp.dir(), "de", "\"Open file\" = \n");
+    write_translation(tmp.dir(), "fr", "\"Open file\" = \"Ouvrir le fichier\"\n");
+
+    // Язык по умолчанию — английский, и он зашит, а не взят из папки.
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.language(), "en");
+    assert!(editor.language_error.is_none(), "чужие файлы не мешают");
+
+    // Написан русский — читается русский, сломанный немецкий не мешает.
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\nlanguage = \"ru\"\n",
+    )
+    .unwrap();
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.language(), "ru");
+    assert!(editor.language_error.is_none());
+    assert_eq!(editor.catalog().get("Open file"), Some("Открыть файл"));
+}

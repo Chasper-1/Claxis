@@ -13,6 +13,10 @@ use crate::path::{LangPath, default_dir};
 
 /// Прочитать язык по коду из каталога переводов `dir`.
 ///
+/// Папка — склад, а не выбор: файлов переводов может лежать сколько угодно,
+/// и работает только тот, чей код написан в конфиге. Ничего не перебираем и
+/// ничего не выбираем сами.
+///
 /// Английский не читается с диска: он зашит и разбирается как «файл есть
 /// всегда». Остальные языки обязаны быть на диске — молча остаться на
 /// английском значило бы показать пользователю не тот интерфейс, который он
@@ -128,6 +132,33 @@ mod tests {
         let catalog = load(&tmp.0, "ru").unwrap();
         assert_eq!(catalog.get("Open file"), Some("Открыть файл"));
         assert_eq!(catalog.get("Save file"), Some("Сохранить файл"));
+    }
+
+    #[test]
+    fn files_in_the_folder_do_not_choose_the_language() {
+        // Главное правило: папка — склад, а не выбор. Файлов переводов может
+        // лежать сколько угодно, и работает только тот, чей код написан в
+        // конфиге. Не тот, что попался в каталоге первым.
+        let tmp = Temp::new("no-choice");
+        tmp.write("ru.toml", good());
+        tmp.write("de.toml", good());
+        tmp.write("pt-br.toml", good());
+        // Читается именно запрошенный.
+        let catalog = load(&tmp.0, "de").unwrap();
+        assert_eq!(catalog.get("Open file"), Some("Открыть файл"));
+        // Английский зашит и не читается, сколько бы файлов ни лежало.
+        assert!(load(&tmp.0, "en").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_broken_unused_translation_does_not_affect_anything() {
+        // Сломанный перевод того языка, который не выбран, — не помеха:
+        // работает только написанный в конфиге.
+        let tmp = Temp::new("broken-unused");
+        tmp.write("ru.toml", good());
+        tmp.write("de.toml", "\"Open file\" = \n");
+        let catalog = load(&tmp.0, "ru").unwrap();
+        assert_eq!(catalog.get("Open file"), Some("Открыть файл"));
     }
 
     #[test]
