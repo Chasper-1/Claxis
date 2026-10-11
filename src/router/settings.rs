@@ -8,9 +8,14 @@
 //! Конфиг разнесён по файлам: `edit.toml`, `command.toml`, `files.toml`. Здесь
 //! берутся нужные ключи и складываются в настройки редактора.
 
+use std::path::Path;
+
+use crate::api::config::path::theme_dir;
 use crate::api::config::schema;
 use crate::api::config::{Config, ConfigFile};
-use crate::api::i18n::{Catalog, DEFAULT_LANGUAGE};
+use crate::api::i18n::load::catalog_for;
+use crate::api::i18n::{Catalog, DEFAULT_LANGUAGE, Error as LangError};
+use crate::api::theme::DEFAULT_THEME;
 
 /// Настройки редактора вместе с языком интерфейса.
 #[derive(Clone, Debug)]
@@ -25,6 +30,8 @@ pub struct Settings {
     pub language: String,
     /// Каталог перевода для этого языка.
     pub catalog: Catalog,
+    /// Активная тема.
+    pub theme: String,
 }
 
 impl Settings {
@@ -36,6 +43,7 @@ impl Settings {
             snapshots_persist: false,
             language: DEFAULT_LANGUAGE.to_string(),
             catalog: Catalog::new(),
+            theme: DEFAULT_THEME.to_string(),
         };
         settings.apply_defaults();
         settings
@@ -43,11 +51,22 @@ impl Settings {
 
     /// Прочитать настройки из набора файлов конфига.
     ///
-    /// Ключи берутся из своих файлов: глубина истории из `edit.toml`,
-    /// снапшоты из `files.toml`. Файлы не видят друг друга.
+    /// Ключи берутся из своих файлов: язык и тема из `config.toml`, глубина
+    /// истории из `edit.toml`, снапшоты из `files.toml`. Файлы не видят
+    /// друг друга.
+    ///
+    /// Каталог перевода здесь **не** читается: для этого нужен путь, а путь
+    /// знает только редактор. Язык запоминается, файл грузится отдельно —
+    /// [`Settings::load_language`].
     pub fn from_config(config: &Config) -> Self {
         let mut settings = Self::defaults();
 
+        if let Some(def) = schema::find(ConfigFile::Global, "General.language") {
+            settings.language = config.string_or_default(def);
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "General.theme") {
+            settings.theme = config.string_or_default(def);
+        }
         if let Some(def) = schema::find(ConfigFile::Edit, "General.history_depth") {
             // Конфиг ограничивает число 65535, буферу нужен u32: привести
             // шире, чем есть, ничего не теряется.
@@ -60,6 +79,29 @@ impl Settings {
             settings.snapshots_persist = config.bool_or_default(def);
         }
         settings
+    }
+
+    /// Загрузить файл перевода активного языка.
+    ///
+    /// Каталог кладётся рядом с языком, потому что они всегда меняются
+    /// вместе: сменился код — сменился и набор строк.
+    ///
+    /// Ошибка возвращается, а не проглатывается: пользователь попросил
+    /// интерфейс на языке, которого нет, и должен узнать об этом, а не
+    /// получить английский вместо своего.
+    pub fn load_language(&mut self, config_dir: &Path) -> Result<(), LangError> {
+        self.catalog = catalog_for(config_dir, &self.language)?;
+        Ok(())
+    }
+
+    /// Проверить, что выбранная тема есть.
+    ///
+    /// Содержимое темы пока не разбирается, поэтому проверяется только
+    /// наличие: имя из конфига обязано чему-то соответствовать. Имя темы —
+    /// это будущий путь, а путь не должен вылезать за пределы папки тем.
+    pub fn check_theme(&self, config_dir: &Path) -> crate::api::theme::Result<()> {
+        crate::api::theme::find(theme_dir(config_dir), &self.theme)?;
+        Ok(())
     }
 
     /// Заполнить незаданные значения дефолтами из схемы.

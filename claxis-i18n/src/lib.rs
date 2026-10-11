@@ -15,6 +15,7 @@
 
 pub mod defaults;
 pub mod error;
+pub mod load;
 pub mod messages;
 pub mod path;
 

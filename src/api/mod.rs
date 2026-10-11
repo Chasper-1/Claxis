@@ -11,6 +11,7 @@ pub mod input;
 pub mod store;
 pub mod term;
 pub mod text;
+pub mod theme;
 
 #[cfg(test)]
 mod tests;

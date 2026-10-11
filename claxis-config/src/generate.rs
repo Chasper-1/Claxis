@@ -439,9 +439,30 @@ mod tests {
     fn unused_keys_are_written_commented_out() {
         // Неподключённый ключ есть и понятен, но выключен: пользователь не
         // должен править настройку, которая ничего не делает, не зная об этом.
+        let text = render(ConfigFile::Edit, &plain());
+        assert!(text.contains("#indent_size = 4"), "{text}");
+        assert!(
+            !text.contains("\nindent_size ="),
+            "выключенный ключ не активен"
+        );
+    }
+
+    #[test]
+    fn used_theme_and_language_are_written_active() {
+        // Язык и тема работают, значит в свежем конфиге они не закомментированы:
+        // иначе пришлось бы раскомментировать их руками перед первым же
+        // использованием.
         let text = render(ConfigFile::Global, &plain());
-        assert!(text.contains("#theme = \"default\""), "{text}");
-        assert!(!text.contains("\ntheme ="), "выключенный ключ не активен");
+        assert!(text.contains("theme = \"default\""), "{text}");
+        assert!(text.contains("language = \"en\""), "{text}");
+        assert!(
+            !text.contains("#theme ="),
+            "тема не закомментирована: {text}"
+        );
+        assert!(
+            !text.contains("#language ="),
+            "язык не закомментирован: {text}"
+        );
     }
 
     #[test]
@@ -489,6 +510,8 @@ mod tests {
         // читается руками, но тест заставит его обновить, когда читать
         // станет больше.
         const READ: &[&str] = &[
+            "General.language",
+            "General.theme",
             "General.history_depth",
             "General.snapshots_keep",
             "General.snapshots_persist",
@@ -506,11 +529,13 @@ mod tests {
     #[test]
     fn comments_are_translated() {
         // Комментарий в конфиге — такой же текст для пользователя, как и всё
-        // остальное, значит он переводится.
+        // остальное, значит он переводится. Надпись о неназначенном значении
+        // проверяется на файле, где такие ключи ещё есть: в `config.toml` все
+        // ключи подключены, и она там не появляется.
         let text = render(ConfigFile::Global, &russian());
         assert!(
-            text.contains("Не задано: ключу не назначено значение."),
-            "перевод предупреждения не попал в файл: {text}"
+            text.contains("Клавиши со значением, и окно удержания для каждой."),
+            "перевод комментария не попал в файл: {text}"
         );
         assert!(
             text.contains("число от 0 до 65535"),

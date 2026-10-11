@@ -229,7 +229,7 @@ pub const KEYS: &[KeyDef] = &[
         default: claxis_i18n::defaults::DEFAULT_LANGUAGE,
         kind: Kind::Str,
         comment: "Active language. The file name in the lang folder is the language code.",
-        active: false,
+        active: true,
     },
     KeyDef {
         file: ConfigFile::Global,
@@ -237,7 +237,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "default",
         kind: Kind::Str,
         comment: "Active theme. The file name in the theme folder is the theme name.",
-        active: false,
+        active: true,
     },
     // ── edit.toml ──────────────────────────────────────────────────────
     KeyDef {

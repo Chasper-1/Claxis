@@ -1,5 +1,5 @@
 [workspace]
-members = ["claxis-text", "claxis-buffer", "claxis-store", "claxis-input", "claxis-term", "claxis-i18n", "claxis-config"]
+members = ["claxis-text", "claxis-buffer", "claxis-store", "claxis-input", "claxis-term", "claxis-i18n", "claxis-theme", "claxis-config"]
 
 [package]
 name = "Claxis"
@@ -13,11 +13,19 @@ name = "claxis"
 path = "src/lib.rs"
 
 [dependencies]
-claxis-text = { path = "claxis-text" }
-claxis-buffer = { path = "claxis-buffer" }
-claxis-store = { path = "claxis-store" }
-claxis-input = { path = "claxis-input" }
-claxis-term = { path = "claxis-term" }
-claxis-i18n = { path = "claxis-i18n" }
-claxis-config = { path = "claxis-config" }
-toml_edit = "0.22"
+claxis-text = { path = "claxis-text" }                    # all crates
+
+claxis-config = { path = "claxis-config" }                # Claxis
+claxis-term = { path = "claxis-term" }                    # Claxis
+
+claxis-buffer = { path = "claxis-buffer" }                # claxis-config
+claxis-store = { path = "claxis-store" }                  # claxis-config
+claxis-input = { path = "claxis-input" }                  # claxis-config
+claxis-i18n = { path = "claxis-i18n" }                    # claxis-config
+claxis-theme = { path = "claxis-theme" }                  # claxis-config
+toml_edit = "0.22"                                        # claxis-config, claxis-i18n, Claxis
+notify = "8"                                              # claxis-config
+
+rusqlite = { version = "0.37", features = ["bundled"] }   # claxis-store
+
+crossterm = "0.29"                                        # claxis-term

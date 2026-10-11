@@ -65,6 +65,18 @@ pub struct Editor {
     settings: Settings,
     /// Проблемы конфига: файл, строка, ключ, суть.
     pub issues: Vec<Issue>,
+    /// Выбранной темы нет в папке тем.
+    ///
+    /// Отдельно от языка по той же причине: тема лежит не в конфиге, и её
+    /// отсутствие не отключает секцию конфига. Редактор открывается с темой
+    /// по умолчанию, а правка видна сразу.
+    pub theme_error: Option<crate::api::theme::Error>,
+    /// Файл перевода не прочитан или разобран неправильно.
+    ///
+    /// Отдельно от проблем конфига: язык лежит не в конфиге, и поломка в нём
+    /// не отключает секцию конфига. Интерфейс остаётся английским, а правка
+    /// видна сразу.
+    pub language_error: Option<crate::api::i18n::Error>,
     /// Файлы, которых не было и которые созданы при первом запуске.
     pub created: Vec<PathBuf>,
     /// Редактор пошёл на последнем корректном конфиге.
@@ -159,7 +171,13 @@ impl Editor {
             w.mark_current(config_dir);
         }
 
-        let settings = Settings::from_config(&config);
+        let mut settings = Settings::from_config(&config);
+        // Перевод не входит в конфиг, но отсутствие файла — это ровно та же
+        // поломка: пользователь попросил язык, которого нет. Сообщаем, но не
+        // отказываем запускаться: редактор с английским лучше, чем ошибка
+        // вместо редактора.
+        let language_error = settings.load_language(config_dir).err();
+        let theme_error = settings.check_theme(config_dir).err();
         let session = Session::open_at_with(
             store_dir,
             settings.snapshots_keep,
@@ -172,6 +190,8 @@ impl Editor {
             settings,
             session,
             issues,
+            theme_error,
+            language_error,
             created: generated.created,
             used_last_good,
             config_dir: config_dir.to_path_buf(),
@@ -191,6 +211,8 @@ impl Editor {
             session,
             settings,
             issues: Vec::new(),
+            theme_error: None,
+            language_error: None,
             created: Vec::new(),
             used_last_good: false,
             config_dir: dir.as_ref().to_path_buf(),
@@ -244,10 +266,20 @@ impl Editor {
             };
         }
 
-        let settings = Settings::from_config(&loaded.config);
+        let mut settings = Settings::from_config(&loaded.config);
+        // Перевод грузится здесь же: язык меняется в конфиге, и ждать
+        // перезапуска для смены языка незачем.
+        //
+        // Файл перевода может быть поломан, а конфиг — в порядке. Тогда
+        // конфиг применяется целиком, а интерфейс остаётся английским, и об
+        // этом честно сообщаем.
+        let language_error = settings.load_language(&self.config_dir).err();
+        let theme_error = settings.check_theme(&self.config_dir).err();
         let applied = self.session.apply(&settings);
         self.settings = settings;
         self.issues = Vec::new();
+        self.language_error = language_error;
+        self.theme_error = theme_error;
 
         Reloaded {
             applied,

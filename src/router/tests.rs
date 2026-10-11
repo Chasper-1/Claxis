@@ -783,3 +783,273 @@ fn nothing_happens_when_the_config_is_quiet() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
+
+// ── Язык интерфейса ───────────────────────────────────────────────────────────
+
+/// Положить файл перевода в каталог конфига под временным тестом.
+fn write_translation(config_dir: &std::path::Path, lang: &str, body: &str) {
+    let dir = config_dir.join("lang");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{lang}.toml")), body).unwrap();
+}
+
+#[test]
+fn a_language_from_the_config_reaches_the_interface() {
+    // Главное: язык из config.toml действительно попадает в каталог, который
+    // потом берут подписи. Иначе ключ был бы включён, но ничего не менял.
+    let tmp = Temp::new("lang-from-config");
+    write_translation(
+        tmp.dir(),
+        "ru",
+        "\"Open file\" = \"Открыть файл\"\n\"Save file\" = \"Сохранить файл\"\n",
+    );
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\nlanguage = \"ru\"\n",
+    )
+    .unwrap();
+
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.language(), "ru");
+    assert!(
+        editor.language_error.is_none(),
+        "язык не загрузился: {:?}",
+        editor.language_error
+    );
+    assert_eq!(editor.catalog().get("Open file"), Some("Открыть файл"));
+}
+
+#[test]
+fn english_needs_no_file_on_disk() {
+    // Английский зашит в бинарник: папки lang может не быть вообще.
+    let tmp = Temp::new("lang-english");
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.language(), "en");
+    assert!(editor.language_error.is_none());
+}
+
+#[test]
+fn a_missing_language_file_is_reported_not_hidden() {
+    // Пользователь попросил язык, которого нет. Молча отдать английский —
+    // значит показать не тот интерфейс, который он выбрал.
+    let tmp = Temp::new("lang-missing");
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\nlanguage = \"ru\"\n",
+    )
+    .unwrap();
+
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.language(), "ru");
+    let error = editor
+        .language_error
+        .as_ref()
+        .expect("отсутствие файла должно быть сообщено");
+    assert!(
+        error.text().contains("ru.toml"),
+        "в сообщении нет пути: {}",
+        error.text()
+    );
+}
+
+#[test]
+fn a_broken_translation_still_opens_the_editor() {
+    // Поломка перевода — не повод не запускать редактор: конфиг в порядке,
+    // работать есть над чем. Но о поломке сказано.
+    let tmp = Temp::new("lang-broken");
+    write_translation(tmp.dir(), "ru", "\"Open file\" = \n");
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\nlanguage = \"ru\"\n",
+    )
+    .unwrap();
+
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert!(editor.issues.is_empty(), "конфиг цел: {:?}", editor.issues);
+    assert!(
+        editor.language_error.is_some(),
+        "поломка перевода не сообщена"
+    );
+    // Сессия работает: редактор открылся, а не отказался.
+    assert_eq!(editor.session().keep(), 3);
+}
+
+#[test]
+fn switching_the_language_applies_without_restart() {
+    // Язык меняется в конфиге и применяется сразу, как и остальные ключи.
+    let tmp = Temp::new("lang-switch");
+    write_translation(tmp.dir(), "ru", "\"Open file\" = \"Открыть файл\"\n");
+    let mut editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.language(), "en");
+
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\nlanguage = \"ru\"\n",
+    )
+    .unwrap();
+    let reloaded = editor.reload();
+    assert!(reloaded.is_ok(), "{reloaded:?}");
+    assert_eq!(editor.language(), "ru");
+    assert_eq!(editor.catalog().get("Open file"), Some("Открыть файл"));
+}
+
+#[test]
+fn a_language_code_cannot_escape_the_config_directory() {
+    // Код языка приходит из конфига, то есть из файла на диске: уход вверх
+    // через `../../` читался бы чужой файл.
+    let tmp = Temp::new("lang-escape");
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\nlanguage = \"../../etc/passwd\"\n",
+    )
+    .unwrap();
+
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert!(editor.language_error.is_some(), "обход должен быть отбит");
+}
+
+#[test]
+fn the_generated_config_asks_for_a_language_up_front() {
+    // Ключ включён: в свежем конфиге он не закомментирован, иначе язык пришлось
+    // бы сначала раскомментировать вручную.
+    let tmp = Temp::new("lang-generated");
+    crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    let text = std::fs::read_to_string(tmp.dir().join("config.toml")).unwrap();
+    assert!(
+        text.contains("\nlanguage = ") || text.contains("language = \"en\""),
+        "ключ языка должен быть активным: {text}"
+    );
+    assert!(
+        !text.contains("#language"),
+        "ключ языка не должен быть закомментированным: {text}"
+    );
+}
+
+// ── Темы ─────────────────────────────────────────────────────────────────────
+
+/// Положить файл темы в каталог конфига под временным тестом.
+fn write_theme(config_dir: &std::path::Path, file: &str) {
+    let dir = config_dir.join("theme");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(file), "").unwrap();
+}
+
+#[test]
+fn a_fresh_config_starts_without_a_complaint() {
+    // Папки тем на первом запуске нет, и тема «default» встроенная. Если бы
+    // требовался файл, редактор ругался бы на каждом первом запуске.
+    let tmp = Temp::new("theme-fresh");
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert!(!tmp.dir().join("theme").exists(), "папки быть не должно");
+    assert!(
+        editor.theme_error.is_none(),
+        "на первом запуске тема не должна быть претензией: {:?}",
+        editor.theme_error
+    );
+    assert_eq!(editor.settings().theme, "default");
+}
+
+#[test]
+fn a_theme_from_the_config_reaches_the_settings() {
+    // Ключ включён: имя из config.toml доходит до настроек, а тема с таким
+    // именем в папке находится.
+    let tmp = Temp::new("theme-from-config");
+    write_theme(tmp.dir(), "everforest.toml");
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\ntheme = \"everforest\"\n",
+    )
+    .unwrap();
+
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.settings().theme, "everforest");
+    assert!(
+        editor.theme_error.is_none(),
+        "тема не найдена: {:?}",
+        editor.theme_error
+    );
+}
+
+#[test]
+fn an_unknown_theme_is_reported_with_the_list() {
+    // Пользователь назвал тему, которой нет: молча брать «default» — значит
+    // показать не ту тему, которую он выбрал.
+    let tmp = Temp::new("theme-unknown");
+    write_theme(tmp.dir(), "everforest.toml");
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\ntheme = \"solarized\"\n",
+    )
+    .unwrap();
+
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    let error = editor
+        .theme_error
+        .as_ref()
+        .expect("неизвестная тема должна быть сообщена");
+    let text = error.text();
+    assert!(text.contains("solarized"), "{text}");
+    assert!(text.contains("everforest"), "в тексте нет списка: {text}");
+}
+
+#[test]
+fn a_theme_name_cannot_escape_the_config_directory() {
+    // Имя приходит из файла на диске: уход вверх через `../../` искал бы тему
+    // вне папки тем.
+    let tmp = Temp::new("theme-escape");
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\ntheme = \"../../../etc/passwd\"\n",
+    )
+    .unwrap();
+
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert!(editor.theme_error.is_some(), "обход должен быть отбит");
+}
+
+#[test]
+fn switching_the_theme_applies_without_restart() {
+    let tmp = Temp::new("theme-switch");
+    write_theme(tmp.dir(), "everforest.toml");
+    let mut editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert_eq!(editor.settings().theme, "default");
+
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\ntheme = \"everforest\"\n",
+    )
+    .unwrap();
+    let reloaded = editor.reload();
+    assert!(reloaded.is_ok(), "{reloaded:?}");
+    assert_eq!(editor.settings().theme, "everforest");
+    assert!(editor.theme_error.is_none());
+}
+
+#[test]
+fn a_broken_theme_does_not_stop_the_editor() {
+    // Тема не нашлась, а редактор должен открыться: конфиг цел, работать есть
+    // над чем. О поломке сказано, и ключ остаётся как есть.
+    let tmp = Temp::new("theme-broken");
+    std::fs::write(
+        tmp.dir().join("config.toml"),
+        "[General]\ntheme = \"nope\"\n",
+    )
+    .unwrap();
+
+    let editor = crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    assert!(editor.issues.is_empty(), "конфиг цел: {:?}", editor.issues);
+    assert!(editor.theme_error.is_some());
+    assert_eq!(editor.session().keep(), 3);
+}
+
+#[test]
+fn the_generated_config_asks_for_a_theme_up_front() {
+    let tmp = Temp::new("theme-generated");
+    crate::router::Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+    let text = std::fs::read_to_string(tmp.dir().join("config.toml")).unwrap();
+    assert!(
+        text.contains("theme = \"default\""),
+        "ключ темы должен быть активным: {text}"
+    );
+    assert!(!text.contains("#theme"), "ключ не закомментирован: {text}");
+}
