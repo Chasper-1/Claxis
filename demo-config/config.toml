@@ -2,13 +2,30 @@
 # Claxis — Configuration demo file
 # ---
 
-[Themes]
-path = "~/.config/claxis/theme"
+[Path]
+theme = "~/.config/claxis/theme"       # указывается папка, это дефолт путь в Linux
+# edit = "любой/не/дефолт/путь"
+# command = "аналогично"
+# file = "аналогично"
+# setting = "аналогично"               # новое состояние, там будут некоторые только настройки прямо из редактора, конфиг основной способ и главный.
 
 [General]
-language = "ru"                                    # Enum > ru, en, uk...
+language = "ru"                        # Enum > ru, en, uk...
 color_modes = true
-auto_format = true                                 # Enable automatic formatting on save
+auto_format = true                     # Enable automatic formatting on save
 insert_final_newline = true
 
+[Keyboard]
+
+
+[Homescreen]                           # Домашний экран, пока не придумал другое название ему.
+include = true
+
+[Savescreen]                           # После сохранения экран со статистикой
+include = true
+mode = "fullscreen"                    # enum из режимов на весь эран, окном или сообщением. fuulscreen, messange, window
+
+[Savescreen.Statistic]
+input_char = true
+delete_char = true
 
