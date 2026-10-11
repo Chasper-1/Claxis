@@ -3,3 +3,10 @@
 # ---
 
 [General]
+
+
+[Alias]
+q = "std::quit"
+
+[Keys]
+"std::quit" = ["q", "й"]
