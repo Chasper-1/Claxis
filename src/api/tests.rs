@@ -43,7 +43,12 @@ fn nothing_imports_crates_directly() {
             if line.starts_with("//") {
                 continue;
             }
-            if line.contains("use claxis_") || line.contains("::claxis_") {
+            // Ищем именно `claxis_` с подчёркиванием: это имя крейта в коде.
+            // С дефисом (`claxis-buffer`) — текст для пользователя, а не вызов,
+            // и в строках он нужен. Префиксы вида `use` или `::` не ищем:
+            // обращение может стоять где угодно, `&claxis_i18n::Catalog::new()`
+            // ни одному из них не соответствует.
+            if mentions_a_crate(line) {
                 let rel = entry.strip_prefix(root()).unwrap_or(&entry);
                 offenders.push(format!("{}:{}: {line}", rel.display(), n + 1));
             }
@@ -54,6 +59,23 @@ fn nothing_imports_crates_directly() {
         "обход маршрутизатора, всё через crate::api:\n{}",
         offenders.join("\n")
     );
+}
+
+/// Строка кода называет крейт воркспейса.
+///
+/// Имя крейта — это идентификатор `claxis_` плюс буквы, цифры и подчёркивания.
+/// Проверяется ровно это, а не отдельные ключевые слова вроде `use` или `::`:
+/// обращение может стоять в любом месте выражения, и любая другая проверка
+/// пропускает часть обходов.
+fn mentions_a_crate(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let prefix = b"claxis_";
+    bytes.windows(prefix.len()).enumerate().any(|(at, w)| {
+        w == prefix
+            && bytes
+                .get(at + prefix.len())
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    })
 }
 
 /// Имена всех крейтов воркспейса.

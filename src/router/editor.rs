@@ -122,13 +122,12 @@ impl Editor {
     pub fn open_in(config_dir: &Path, store_dir: &Path) -> Result<Self, StartError> {
         // Порядок важен: сначала читается конфиг, потом под его настройки
         // создаётся сессия. Иначе настройки из файла просто никуда не денутся.
-        let generated =
-            generate::ensure_files(config_dir, &claxis_i18n::Catalog::new()).map_err(|e| {
-                StartError::ConfigDir {
-                    path: config_dir.display().to_string(),
-                    reason: e.to_string(),
-                }
-            })?;
+        let generated = generate::ensure_files(config_dir, &Catalog::new()).map_err(|e| {
+            StartError::ConfigDir {
+                path: config_dir.display().to_string(),
+                reason: e.to_string(),
+            }
+        })?;
 
         let loaded = generate::read_all(config_dir);
         let issues = loaded.issues;

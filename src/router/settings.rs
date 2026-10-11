@@ -10,7 +10,7 @@
 
 use crate::api::config::schema;
 use crate::api::config::{Config, ConfigFile};
-use crate::api::i18n::Catalog;
+use crate::api::i18n::{Catalog, DEFAULT_LANGUAGE};
 
 /// Настройки редактора вместе с языком интерфейса.
 #[derive(Clone, Debug)]
@@ -34,7 +34,7 @@ impl Settings {
             history_depth: 0,
             snapshots_keep: 0,
             snapshots_persist: false,
-            language: claxis_i18n::path::default_language().to_string(),
+            language: DEFAULT_LANGUAGE.to_string(),
             catalog: Catalog::new(),
         };
         settings.apply_defaults();
