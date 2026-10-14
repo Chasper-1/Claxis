@@ -468,10 +468,49 @@ impl Tree {
     }
 
     /// Проверка связности дерева: зацикленности быть не должно.
+    ///
+    /// Зацикливание — это поломка, а не повод падать: диагностика обязана
+    /// показать, что именно сломалось. Поэтому дерево, которое себя не
+    /// обходит, даёт `false`, а тест на это смотрит.
     pub fn debug_walk(&self) -> (usize, usize, Option<u32>) {
         let mut seen = std::collections::HashSet::new();
-        let nodes = self.check(self.root, &mut seen, 0);
-        (nodes, self.height() as usize, None)
+        match self.check(self.root, &mut seen, 0) {
+            Some(nodes) => (nodes, self.height() as usize, None),
+            None => (0, 0, Some(0)),
+        }
+    }
+
+    /// Дерево обходится целиком и без повторов узлов.
+    ///
+    /// `None` — дерево зациклено или слишком глубокое.
+    pub fn debug_sound(&self) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        self.check(self.root, &mut seen, 0).is_some()
+    }
+
+    /// Глубина, дальше которой обход считается зацикленным.
+    const MAX_DEPTH: u32 = 128;
+
+    fn check(
+        &self,
+        idx: u32,
+        seen: &mut std::collections::HashSet<u32>,
+        depth: u32,
+    ) -> Option<usize> {
+        if idx == NIL {
+            return Some(0);
+        }
+        if depth >= Self::MAX_DEPTH || !seen.insert(idx) {
+            return None;
+        }
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            Some(1)
+        } else {
+            let left = self.check(node.left(), seen, depth + 1)?;
+            let right = self.check(node.right(), seen, depth + 1)?;
+            Some(left + right + 1)
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -506,22 +545,6 @@ impl Tree {
     pub fn debug_stats(&self) -> (usize, u32, u32, u32) {
         let mut seen = std::collections::HashSet::new();
         self.check2(self.root, &mut seen)
-    }
-
-    fn check(&self, idx: u32, seen: &mut std::collections::HashSet<u32>, depth: u32) -> usize {
-        if idx == NIL {
-            return 0;
-        }
-        if !seen.insert(idx) {
-            panic!("узел {idx} посещён дважды: дерево зациклено");
-        }
-        assert!(depth < 128, "дерево выше 128: зацикливание");
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
-            1
-        } else {
-            1 + self.check(node.left(), seen, depth + 1) + self.check(node.right(), seen, depth + 1)
-        }
     }
 }
 

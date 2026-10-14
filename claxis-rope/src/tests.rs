@@ -509,3 +509,94 @@ fn the_history_survives_the_database_round_trip() {
     assert_eq!(back.read(), text);
     assert_eq!(back.path().len(), doc.path().len());
 }
+
+#[test]
+fn an_empty_document_takes_everything() {
+    // Пустой документ — не особый случай, но именно на нём чаще всего
+    // вылезают ошибки границ.
+    let mut doc = Document::new(b"");
+    assert!(doc.is_empty());
+    assert_eq!(doc.len(), 0);
+    assert_eq!(doc.read(), Vec::<u8>::new());
+    assert_eq!(doc.read_range(0, 0), Vec::<u8>::new());
+
+    doc.insert(0, "первое".as_bytes()).unwrap();
+    assert_eq!(doc.read(), "первое".as_bytes());
+    doc.delete(0, doc.len()).unwrap();
+    assert!(doc.is_empty(), "весь текст вырезан, документ снова пустой");
+
+    // И отмена возвращает всё как было.
+    doc.undo().unwrap().expect("удаление отменяемо");
+    assert_eq!(doc.read(), "первое".as_bytes());
+}
+
+#[test]
+fn deleting_the_whole_document_is_the_same_as_a_new_one() {
+    let mut doc = d("одна строка");
+    doc.delete(0, doc.len()).unwrap();
+    assert!(doc.is_empty());
+    assert_eq!(doc.leaves().len(), 0, "листьев не осталось");
+
+    // Дерево пустое, но обязано остаться связным.
+    let (nodes, height, skew, mismatch) = doc.tree_debug_stats();
+    assert_eq!(nodes, 0);
+    assert_eq!(height, 0);
+    assert_eq!(skew, 0);
+    assert_eq!(mismatch, 0);
+
+    doc.insert(0, "снова".as_bytes()).unwrap();
+    assert_eq!(doc.read(), "снова".as_bytes());
+}
+
+#[test]
+fn a_big_piece_is_inserted_in_one_move() {
+    // Кусок больше одного листа: вставка идёт одним куском, а читаться и
+    // вырезаться он должен так же, как много мелких.
+    let chunk: Vec<u8> = (0..50_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let mut doc = d("");
+    doc.insert(0, &chunk).unwrap();
+    assert_eq!(doc.read(), chunk);
+    assert_eq!(doc.read_range(10, 20), chunk[10..20].to_vec());
+
+    doc.delete(0, 25_000).unwrap();
+    assert_eq!(doc.read(), chunk[25_000..].to_vec());
+
+    // Вставка в середину большого куска режет его надвое.
+    doc.insert(10, "ЖЖ".as_bytes()).unwrap();
+    let mut expected = chunk[25_000..].to_vec();
+    expected.splice(10..10, "ЖЖ".as_bytes().iter().copied());
+    assert_eq!(doc.read(), expected);
+    assert!(doc.leaves().len() > 1, "большой кусок не разрезался");
+}
+
+#[test]
+fn unicode_survives_being_cut_anywhere() {
+    // Кириллица — два байта на букву. Резать можно где угодно, включая
+    // середину буквы: текст от этого не портится, а длина уменьшается ровно
+    // на один байт.
+    let text = "Привет, мир! Здравствуйте.";
+    let mut doc = d(text);
+    assert_eq!(doc.read(), text.as_bytes());
+    for at in 0..text.len() as u32 {
+        doc.delete(at, 1).unwrap();
+        assert_eq!(
+            doc.read().len(),
+            text.len() - 1,
+            "вырезан байт {at}: длина должна уменьшиться ровно на один"
+        );
+        doc.undo().unwrap().expect("удаление отменяемо");
+        assert_eq!(doc.read(), text.as_bytes(), "отмена вернула не то");
+    }
+}
+
+#[test]
+fn history_of_an_untouched_document_is_empty() {
+    // Снапшот пустого документа должен разбираться, а не падать: пустая
+    // история — обычное состояние, а не поломка.
+    let doc = d("текст без правок");
+    let history = crate::history::History::capture(&doc);
+    let mut back = history.restore().expect("пустая история разбирается");
+    assert_eq!(back.read(), doc.read());
+    assert!(back.path().is_empty());
+    assert!(back.undo().unwrap().is_none(), "отменять нечего");
+}

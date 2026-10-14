@@ -171,6 +171,22 @@ pub struct Current {
 }
 
 impl Current {
+    /// Пустое состояние: ни одного сегмента.
+    ///
+    /// Не падает никогда: дерево пустое, узлы выделять не нужно. Это запасной
+    /// путь на случай, когда под исходный текст места не хватило.
+    pub fn empty(depth: u32) -> Self {
+        Self {
+            nodes: vec![DEAD; crate::current::pool_capacity_for(depth)],
+            root: NIL,
+            len: 0,
+            leaves: 0,
+            free_head: NIL,
+            next_unused: 0,
+            depth,
+        }
+    }
+
     /// Единое состояние: один лист на весь исходный текст.
     ///
     /// Пул узлов выделяется на `node_capacity` узлов — ровно столько, сколько

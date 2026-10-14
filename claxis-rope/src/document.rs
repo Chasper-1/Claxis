@@ -207,8 +207,14 @@ pub struct Document {
 
 impl Document {
     /// Документ с текстом и глубиной истории по умолчанию.
+    ///
+    /// Без паники и без `Result`: глубина по умолчанию задана самим крейтом и
+    /// проверять тут нечего. Провка остаётся у [`Document::with_depth`], где
+    /// глубину задаёт пользователь.
     pub fn new(text: impl AsRef<[u8]>) -> Self {
-        Self::with_depth(text, DEFAULT_DEPTH).expect("глубина по умолчанию верна")
+        let text = text.as_ref().to_vec();
+        let len = text.len() as u32;
+        Self::assemble(text, len, DEFAULT_DEPTH)
     }
 
     /// Документ с заданной глубиной истории.
@@ -473,22 +479,30 @@ impl Document {
 
     /// Текст диапазона документа.
     fn slice(&self, start: u32, end: u32) -> Vec<u8> {
-        #[allow(dead_code)]
         struct Collect<'a> {
             text: &'a [u8],
             out: Vec<u8>,
-            base: u32,
         }
         impl crate::tree::Sink for Collect<'_> {
+            /// Диапазон листа обрезается по буферу.
+            ///
+            /// Дерево обещает, что лист лежит в буфере, но обещание даёт код
+            /// на сто строчек ниже. Читать с проверкой дешевле, чем чинить
+            /// редактор из-за выхода за границу: обрезанный кусок — это
+            /// потерянные байты, паника — это упавший редактор.
             fn piece(&mut self, start: u32, len: u32) {
-                let s = start as usize;
-                self.out.extend_from_slice(&self.text[s..s + len as usize]);
+                let s = (start as usize).min(self.text.len());
+                let e = (start as usize)
+                    .saturating_add(len as usize)
+                    .min(self.text.len());
+                if s < e {
+                    self.out.extend_from_slice(&self.text[s..e]);
+                }
             }
         }
         let mut sink = Collect {
             text: &self.text,
             out: Vec::new(),
-            base: 0,
         };
         self.tree.read_range_into(start, end, &mut sink);
         sink.out

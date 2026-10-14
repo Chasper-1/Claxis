@@ -170,12 +170,26 @@ impl Buffer {
     /// Глубина берётся из настроек, а не из константы арены: когда появится
     /// конфиг, значение придёт оттуда, и менять тут ничего не придётся.
     /// Значение известно корректное, поэтому `Result` не нужен.
+    ///
+    /// Паники здесь нет намеренно: глубина задана самим крейтом, но если она
+    /// вдруг окажется негодной, редактор всё равно должен открыться. Тогда
+    /// документ просто создаётся без исходного текста — пустой, но рабочий.
     pub fn new(original: impl AsRef<[u8]>) -> Self {
-        Self::build(
-            original.as_ref(),
-            crate::defaults::buffer::HISTORY_DEPTH.value,
-        )
-        .expect("the default history depth is valid by construction")
+        let original = original.as_ref();
+        let depth = crate::defaults::buffer::HISTORY_DEPTH.value;
+        match Self::build(original, depth) {
+            Ok(buffer) => buffer,
+            Err(_) => Self {
+                original: Vec::new(),
+                added: Vec::new(),
+                phantom: Vec::new(),
+                arena: Arena::new(depth),
+                current: Current::empty(depth),
+                sink: Box::new(NullSink),
+                file: None,
+                snapshots: 0,
+            },
+        }
     }
 
     /// Буфер с заданной глубиной истории.

@@ -1400,3 +1400,105 @@ fn the_history_signature_defaults_to_what_the_schema_says() {
     assert_eq!(settings.savescreen_history_usage_percent, "{used}");
     assert_eq!(settings.savescreen_history_usage_number, "{remaining}");
 }
+
+#[test]
+fn a_zero_interval_snapshots_on_every_edit() {
+    // Нулевой интервал — это «на каждой правке». В конфиге так не выставляют,
+    // но без него не проверить, что счётчик не врёт.
+    let tmp = Temp::new("zero-interval");
+    let file = tmp.file("a.rs");
+    let mut session = tmp.session(3);
+    session.set_snapshot_interval(Duration::ZERO);
+
+    let mut doc = session.open_file(&file).unwrap();
+    for i in 0..5 {
+        let at = doc.buffer().len();
+        doc.buffer().insert(at, b"x").unwrap();
+        doc.snapshot_if_due();
+        assert_eq!(i + 1, doc.buffer().snapshots_taken() as u32);
+    }
+}
+
+#[test]
+fn a_missing_file_opens_as_an_empty_document() {
+    // Файла нет — это не ошибка, а новый документ. Снапшот такого должен
+    // разбираться обратно.
+    let tmp = Temp::new("missing-file-snapshot");
+    let file = tmp.file("нет-такого.rs");
+    let session = tmp.session(3);
+
+    let mut doc = session.open_file(&file).unwrap();
+    assert_eq!(doc.text(), Vec::<u8>::new(), "пустой документ");
+    doc.insert(0, "новый текст".as_bytes()).unwrap();
+    doc.snapshot();
+    assert_eq!(doc.text(), "новый текст".as_bytes());
+
+    // С диска читается то, что осталось, и история не ломает его.
+    let session2 = tmp.session(3);
+    let mut back = session2.open_file(&file).unwrap();
+    assert_eq!(back.text(), "новый текст".as_bytes());
+    back.buffer()
+        .undo()
+        .unwrap()
+        .expect("история из снапшота живая");
+    assert_eq!(back.text(), Vec::<u8>::new());
+}
+
+#[test]
+fn replace_counts_both_sides() {
+    // Замена — это удаление и вставка, и статистика должна видеть обе.
+    let tmp = Temp::new("stats-replace");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+
+    doc.insert(0, "строка".as_bytes()).unwrap();
+    assert_eq!(doc.stats().edits, 1);
+
+    // Позиции и длины — в байтах, а не в буквах: «строка» это 12 байт.
+    let len = "строка".len() as u32;
+    doc.replace(0, len, "другая".as_bytes()).unwrap();
+    let stats = doc.stats();
+    assert_eq!(stats.edits, 2, "замена — одна правка");
+    assert_eq!(stats.input_chars, 6 + 6, "шесть букв, потом шесть");
+    assert_eq!(stats.deleted_chars, u64::from(len));
+    assert_eq!(doc.text(), "другая".as_bytes());
+}
+
+#[test]
+fn statistics_survive_a_snapshot() {
+    // Снапшот чинит документ, но не обнуляет счётчики: статистика за
+    // сеанс считается с открытия файла, а не с последнего снимка.
+    let tmp = Temp::new("stats-snapshot");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+
+    doc.insert(0, "до".as_bytes()).unwrap();
+    doc.note_press(Duration::from_millis(50));
+    doc.snapshot();
+    assert_eq!(doc.stats().input_chars, 2, "счётчик не сбросился");
+    assert_eq!(doc.stats().presses, 1);
+
+    doc.insert(0, "после".as_bytes()).unwrap();
+    assert_eq!(doc.stats().input_chars, 7, "счётчик считает и дальше");
+    assert_eq!(doc.stats().edits, 2);
+}
+
+#[test]
+fn a_document_survives_a_thousand_tiny_edits() {
+    // Много мелких правок подряд: дерево перестраивается на каждой, и ни одна
+    // из них не должна его сломать.
+    let tmp = Temp::new("tiny-edits");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+
+    for i in 0..1000u32 {
+        doc.insert(0, "•".as_bytes()).unwrap();
+        // Булет — три байта, как и любая буква кириллицы.
+        assert_eq!(doc.buffer().len(), (i + 1) * 3);
+    }
+    assert_eq!(doc.text().len(), 3000);
+    assert_eq!(doc.buffer().read_range(0, 0), Vec::<u8>::new());
+}
