@@ -2,8 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::defaults::DEFAULT_LANGUAGE;
-
 /// Путь к файлу перевода.
 ///
 /// Название файла — код языка: `ru.toml`. На генерацию шаблона название не
@@ -56,11 +54,6 @@ impl LangPath {
     pub fn dir(&self) -> &Path {
         self.0.parent().unwrap_or_else(|| Path::new("."))
     }
-}
-
-/// Язык по умолчанию.
-pub fn default_language() -> &'static str {
-    DEFAULT_LANGUAGE
 }
 
 #[cfg(test)]

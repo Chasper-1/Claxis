@@ -242,8 +242,8 @@ fn against_a_reference_string_with_undo_redo_mix() {
         let mut cursor = 0usize;
 
         for step in 0..1200 {
-            let roll = rng.below(10);
-            if roll < 5 && !text.is_empty() {
+            let roll = rng.below(12);
+            if roll < 4 && !text.is_empty() {
                 let pos = rng.below(text.len());
                 let len = rng.below((text.len() - pos).min(40)) + 1;
                 let removed = text.as_bytes()[pos..pos + len].to_vec();
@@ -252,7 +252,7 @@ fn against_a_reference_string_with_undo_redo_mix() {
                 history.truncate(cursor);
                 history.push(Op::Delete { pos, removed });
                 cursor = history.len();
-            } else if roll < 8 {
+            } else if roll < 7 {
                 let pos = rng.below(text.len() + 1);
                 let piece: String = (0..rng.below(30) + 1)
                     .map(|_| (b'a' + rng.below(26) as u8) as char)
@@ -265,7 +265,26 @@ fn against_a_reference_string_with_undo_redo_mix() {
                     text: piece.into_bytes(),
                 });
                 cursor = history.len();
-            } else if roll == 8 && cursor > 0 {
+            } else if roll < 9 {
+                // Замена: самое интересное, потому что это одна запись,
+                // которая несёт и вставленное, и вырезанное.
+                let pos = rng.below(text.len() + 1);
+                let len = rng.below((text.len() - pos).min(40));
+                let removed = text.as_bytes()[pos..pos + len].to_vec();
+                let piece: String = (0..rng.below(20) + 1)
+                    .map(|_| (b'a' + rng.below(26) as u8) as char)
+                    .collect();
+                doc.replace(pos as u32, len as u32, piece.as_bytes())
+                    .unwrap();
+                text.replace_range(pos..pos + len, &piece);
+                history.truncate(cursor);
+                history.push(Op::Replace {
+                    pos,
+                    removed,
+                    text: piece.into_bytes(),
+                });
+                cursor = history.len();
+            } else if roll == 9 && cursor > 0 {
                 cursor -= 1;
                 doc.undo()
                     .unwrap()
@@ -274,6 +293,16 @@ fn against_a_reference_string_with_undo_redo_mix() {
                     Op::Insert { pos, text: t } => text.replace_range(*pos..*pos + t.len(), ""),
                     Op::Delete { pos, removed } => {
                         text.insert_str(*pos, &String::from_utf8_lossy(removed))
+                    }
+                    Op::Replace {
+                        pos,
+                        removed,
+                        text: t,
+                    } => {
+                        // Отмена замены: убрать вставленное, вернуть вырезанное.
+                        text.replace_range(*pos..*pos + t.len(), "");
+                        let back = String::from_utf8_lossy(removed).to_string();
+                        text.insert_str(*pos, &back);
                     }
                 }
             } else if cursor < history.len() {
@@ -286,6 +315,14 @@ fn against_a_reference_string_with_undo_redo_mix() {
                     }
                     Op::Delete { pos, removed } => {
                         text.replace_range(*pos..*pos + removed.len(), "")
+                    }
+                    Op::Replace {
+                        pos,
+                        removed,
+                        text: t,
+                    } => {
+                        let new = String::from_utf8_lossy(t).to_string();
+                        text.replace_range(*pos..*pos + removed.len(), &new);
                     }
                 }
                 cursor += 1;
@@ -303,8 +340,19 @@ fn against_a_reference_string_with_undo_redo_mix() {
 }
 
 enum Op {
-    Insert { pos: usize, text: Vec<u8> },
-    Delete { pos: usize, removed: Vec<u8> },
+    Insert {
+        pos: usize,
+        text: Vec<u8>,
+    },
+    Delete {
+        pos: usize,
+        removed: Vec<u8>,
+    },
+    Replace {
+        pos: usize,
+        removed: Vec<u8>,
+        text: Vec<u8>,
+    },
 }
 
 #[test]
@@ -456,7 +504,7 @@ fn an_unknown_record_kind_is_refused() {
     let mut doc = d("abc");
     doc.insert(3, b"XY").unwrap();
     let mut bytes = crate::history::History::capture(&doc).as_bytes().to_vec();
-    let last = bytes.len() - 13;
+    let last = bytes.len() - crate::history::RECORD_SIZE;
     bytes[last] = 7;
     assert_eq!(
         crate::history::History::decode(&bytes).unwrap_err(),
@@ -599,4 +647,123 @@ fn history_of_an_untouched_document_is_empty() {
     assert_eq!(back.read(), doc.read());
     assert!(back.path().is_empty());
     assert!(back.undo().unwrap().is_none(), "отменять нечего");
+}
+
+#[test]
+fn a_replace_is_one_step_of_history() {
+    // Замена — одно действие, значит и один шаг отмены. Раньше это были две
+    // записи, и одна команда отменяла половину работы.
+    let mut doc = d("The quick brown fox");
+    doc.replace(4, 5, b"slow").unwrap();
+    assert_eq!(doc.read(), b"The slow brown fox");
+    assert_eq!(doc.path().len(), 1, "в истории одна запись, а не две");
+
+    doc.undo().unwrap().expect("замена отменяема");
+    assert_eq!(
+        doc.read(),
+        b"The quick brown fox",
+        "вырезанное вернулось целиком"
+    );
+    doc.redo().unwrap().expect("замена повторяема");
+    assert_eq!(doc.read(), b"The slow brown fox");
+}
+
+#[test]
+fn a_replace_of_a_shorter_text_is_correct() {
+    // Длина меняется в обе стороны: короткий кусок вместо длинного и наоборот.
+    let mut doc = d("abcdefghij");
+    doc.replace(2, 6, b"XY").unwrap();
+    assert_eq!(doc.read(), b"abXYij");
+    doc.undo().unwrap().expect("отменяема");
+    assert_eq!(doc.read(), b"abcdefghij");
+
+    let mut doc = d("abcdefghij");
+    doc.replace(4, 1, b"1234567890").unwrap();
+    assert_eq!(doc.read(), b"abcd1234567890fghij");
+    doc.undo().unwrap().expect("отменяема");
+    assert_eq!(doc.read(), b"abcdefghij");
+}
+
+#[test]
+fn a_replace_across_leaf_borders_is_correct() {
+    // Диапазон замены не влезает ни в один лист: это самый частый случай на
+    // большом документе.
+    let mut doc = d("");
+    for i in 0..40u32 {
+        doc.insert(i, format!("{i:03}").as_bytes()).unwrap();
+    }
+    let before = doc.read();
+    let inserted = "замена".as_bytes();
+    doc.replace(10, 60, inserted).unwrap();
+    assert_eq!(doc.read_range(0, 10), before[..10].to_vec());
+    assert_eq!(
+        doc.read_range(10, 22),
+        inserted,
+        "вставлено шесть букв, двенадцать байт"
+    );
+    assert_eq!(doc.read_range(22, 76), before[70..].to_vec());
+    doc.undo().unwrap().expect("отменяема");
+    assert_eq!(doc.read(), before, "документ вернулся целиком");
+}
+
+#[test]
+fn a_replace_survives_the_snapshot() {
+    // Замена в истории — самая тяжёлая запись: несёт и вставленное, и
+    // вырезанное. После снапшота она обязана разобраться целиком.
+    let mut doc = d("исходный текст");
+    // Вырезаем только слово, пробел остаётся: «новый текст», а не «новыйтекст».
+    let cut = "исходный".len() as u32;
+    doc.replace(0, cut, "новый".as_bytes()).unwrap();
+    let history = crate::history::History::capture(&doc);
+    let mut back = history.restore().expect("снапшот разбирается");
+    assert_eq!(back.read(), "новый текст".as_bytes());
+    back.undo().unwrap().expect("история живая");
+    assert_eq!(back.read(), "исходный текст".as_bytes());
+}
+
+#[test]
+fn a_replace_of_nothing_is_an_insert() {
+    // Замена нулевого диапазона — это вставка, но запись остаётся заменой:
+    // так видно, что пользователь нажал команду «заменить».
+    let mut doc = d("ab");
+    doc.replace(1, 0, b"XY").unwrap();
+    assert_eq!(doc.read(), b"aXYb");
+    doc.undo().unwrap().expect("отменяема");
+    assert_eq!(doc.read(), b"ab");
+}
+
+#[test]
+fn a_replace_out_of_bounds_is_refused() {
+    let mut doc = d("abc");
+    assert!(doc.replace(2, 5, b"x").is_err());
+    assert!(doc.replace(9, 0, b"x").is_err());
+    assert_eq!(doc.read(), b"abc", "документ не тронут");
+    assert!(doc.path().is_empty(), "в истории пусто");
+}
+
+#[test]
+fn every_replace_position_and_length_gives_the_right_text() {
+    // Перебор всех позиций и длин на маленьких документах: тут находятся
+    // случаи, которые случайная последовательность правок не вылавливает,
+    // например пустая замена в начале документа.
+    for base_len in 0..6usize {
+        let base: String = (0..base_len).map(|i| (b'a' + i as u8) as char).collect();
+        for pos in 0..=base_len {
+            for len in 0..=(base_len - pos) {
+                let mut doc = Document::new(base.as_bytes());
+                doc.replace(pos as u32, len as u32, b"XYZ").unwrap();
+                let mut want = base.clone();
+                want.replace_range(pos..pos + len, "XYZ");
+                assert_eq!(
+                    doc.read(),
+                    want.as_bytes(),
+                    "основа {base:?}, позиция {pos}, длина {len}"
+                );
+
+                // И отмена обязана вернуть всё как было.
+                doc.undo().unwrap().expect("замена отменяема");
+                assert_eq!(doc.read(), base.as_bytes(), "отмена вернула не то");
+            }
+        }
+    }
 }

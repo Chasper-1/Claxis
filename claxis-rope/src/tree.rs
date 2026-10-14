@@ -263,6 +263,88 @@ impl Tree {
         }
     }
 
+    /// Заменить диапазон `pos..pos+removed` листом `leaf`.
+    ///
+    /// Один проход вместо двух: вырезать, потом вставить. Дерево перестраивается
+    /// по пути один раз, повороты считаются один раз, а не на каждый проход.
+    pub fn replace(&mut self, pos: u32, removed: u32, leaf: u32) {
+        // Ничего не вырезается — это обычная вставка, и она уже умеет ходить
+        // по краям дерева. Своя дорожка здесь ломалась на вставке в самое
+        // начало: диапазон пустой, а узел считался не пересекающимся.
+        if removed == 0 {
+            self.insert_leaf(pos, leaf);
+            return;
+        }
+        let gained = self.node_len(leaf);
+        if self.root == NIL {
+            self.root = leaf;
+            self.len += gained;
+            return;
+        }
+        self.root = self.replace_rec(self.root, 0, pos, pos + removed, leaf);
+        self.len = self.len - removed + gained;
+    }
+
+    /// Замена внутри поддерева. `leaf` ставится ровно один раз — в том
+    /// поддереве, где начинается вырезаемый диапазон.
+    fn replace_rec(&mut self, idx: u32, base: u32, start: u32, end: u32, leaf: u32) -> u32 {
+        if idx == NIL {
+            return leaf;
+        }
+        let node_end = base + self.node_len(idx);
+        if end <= base || start >= node_end {
+            return idx;
+        }
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            let at = node.start();
+            let len = node.leaf_len();
+            let head_len = start.saturating_sub(base);
+            let tail_at = (end - base).min(len);
+            let tail_len = len - tail_at;
+            let head = if head_len > 0 {
+                self.alloc(Node::leaf(at, head_len))
+            } else {
+                NIL
+            };
+            let tail = if tail_len > 0 {
+                self.alloc(Node::leaf(at + tail_at, tail_len))
+            } else {
+                NIL
+            };
+            self.release(idx);
+            let left = if head == NIL {
+                leaf
+            } else {
+                self.concat(head, leaf)
+            };
+            if tail == NIL {
+                left
+            } else {
+                self.concat(left, tail)
+            }
+        } else {
+            let (l, r) = (node.left(), node.right());
+            let right_base = base + self.node_len(l);
+            // Новый кусок ставится туда, где начинается диапазон. Если он
+            // начинается в правом поддереве, левое только вырезается.
+            let new = if start < right_base {
+                let l = self.replace_rec(l, base, start, end, leaf);
+                let r = self.cut_rec(r, right_base, start, end);
+                // Через concat, а не через branch: вырезанное поддерево может
+                // схлопнуться в пустоту, а ветка с пустым ребёнком — это уже
+                // не дерево.
+                self.concat(l, r)
+            } else {
+                let l = self.cut_rec(l, base, start, end);
+                let r = self.replace_rec(r, right_base, start, end, leaf);
+                self.concat(l, r)
+            };
+            self.release(idx);
+            self.rebalance(new)
+        }
+    }
+
     /// Вырезать диапазон `start..end` документа.
     pub fn cut(&mut self, start: u32, end: u32) {
         if start >= end || self.root == NIL {

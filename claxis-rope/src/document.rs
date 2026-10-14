@@ -17,6 +17,23 @@ pub enum Record {
     Insert { anchor: u32, head: u32, text: u32 },
     /// Удаление: что вырезано и где текст.
     Delete { anchor: u32, head: u32, text: u32 },
+    /// Замена диапазона: что вырезано, что вставлено и где оба текста.
+    ///
+    /// Одна запись, а не две: замена — одно действие пользователя и один
+    /// шаг отмены. Разбирать её на удаление и вставку значило бы платить два
+    /// раза за перестройку дерева и путать историю.
+    Replace {
+        /// Где начинается вырезанный диапазон.
+        anchor: u32,
+        /// Где кончается заменённый диапазон: это длина вставленного.
+        head: u32,
+        /// Где в буфере лежит вставленный текст.
+        text: u32,
+        /// Где в буфере лежит вырезанный текст: он вернётся при отмене.
+        removed: u32,
+        /// Сколько байт было вырезано.
+        removed_len: u32,
+    },
 }
 
 impl Record {
@@ -33,14 +50,18 @@ impl Record {
     /// Начало диапазона.
     pub fn anchor(&self) -> u32 {
         match self {
-            Record::Insert { anchor, .. } | Record::Delete { anchor, .. } => *anchor,
+            Record::Insert { anchor, .. }
+            | Record::Delete { anchor, .. }
+            | Record::Replace { anchor, .. } => *anchor,
         }
     }
 
     /// Конец диапазона.
     pub fn head(&self) -> u32 {
         match self {
-            Record::Insert { head, .. } | Record::Delete { head, .. } => *head,
+            Record::Insert { head, .. }
+            | Record::Delete { head, .. }
+            | Record::Replace { head, .. } => *head,
         }
     }
 
@@ -48,8 +69,47 @@ impl Record {
     pub fn text(&self) -> u32 {
         match self {
             Record::Insert { text, .. } | Record::Delete { text, .. } => *text,
+            Record::Replace { text, .. } => *text,
         }
     }
+
+    /// Смещение вырезанного текста, если запись его несёт.
+    ///
+    /// У вставки и удаления вырезанного текста нет: вставка ничего не
+    /// вырезала, а удаление ничего не вставляло.
+    pub fn removed(&self) -> Option<(u32, u32)> {
+        match self {
+            Record::Replace {
+                removed,
+                removed_len,
+                ..
+            } => Some((*removed, *removed_len)),
+            _ => None,
+        }
+    }
+
+    /// Вид записи для файла истории.
+    pub fn kind(&self) -> Kind {
+        match self {
+            Record::Insert { .. } => Kind::Insert,
+            Record::Delete { .. } => Kind::Delete,
+            Record::Replace { .. } => Kind::Replace,
+        }
+    }
+}
+
+/// Вид записи истории.
+///
+/// Отдельный тип, а не число: что попадёт в файл определяется здесь, и
+/// разбор читает то же самое. Перепутать местами нельзя.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Запись вставки.
+    Insert,
+    /// Запись удаления.
+    Delete,
+    /// Запись замены.
+    Replace,
 }
 
 /// Вершина истории: запись плюс родитель и ребёнок.
@@ -351,9 +411,37 @@ impl Document {
     }
 
     /// Заменить диапазон: удаление и вставка.
+    /// Заменить диапазон на новый текст.
+    ///
+    /// Одна запись в истории и один проход по дереву: вырезание и вставка
+    /// делаются за один раз, а не как две отдельные правки.
     pub fn replace(&mut self, anchor: u32, len: u32, data: &[u8]) -> Result<()> {
-        self.delete(anchor, len)?;
-        self.insert(anchor, data)
+        self.check(anchor, len)?;
+        if len == 0 && data.is_empty() {
+            return Ok(());
+        }
+        self.discard_redo();
+
+        // Вырезанное копируется в хвост буфера: иначе отменять нечем, а второго
+        // буфера быть не должно.
+        let removed = self.slice(anchor, anchor + len);
+        let removed_at = self.text.len() as u32;
+        self.text.extend_from_slice(&removed);
+
+        let text = self.text.len() as u32;
+        self.text.extend_from_slice(data);
+
+        let record = Record::Replace {
+            anchor,
+            head: anchor + data.len() as u32,
+            text,
+            removed: removed_at,
+            removed_len: len,
+        };
+        let new_leaf = self.tree.alloc(Node::leaf(text, data.len() as u32));
+        self.tree.replace(anchor, len, new_leaf);
+        self.push(record);
+        Ok(())
     }
 
     /// Отменить одну правку обратной операцией.
@@ -380,6 +468,26 @@ impl Document {
                 let leaf = self.tree.alloc(Node::leaf(start, len));
                 self.tree.insert_leaf(anchor, leaf);
             }
+            // Отмена замены: вырезать вставленное и вернуть вырезанное.
+            Record::Replace {
+                anchor,
+                head,
+                removed,
+                removed_len,
+                ..
+            } => {
+                self.tree.cut(anchor, head);
+                if removed_len == 0 {
+                    return Ok(Some(id));
+                }
+                let start = self.text.len() as u32;
+                let piece =
+                    self.text[removed as usize..removed as usize + removed_len as usize].to_vec();
+                self.text.extend_from_slice(&piece);
+                self.kept.push(start + removed_len);
+                let leaf = self.tree.alloc(Node::leaf(start, removed_len));
+                self.tree.insert_leaf(anchor, leaf);
+            }
         }
         Ok(Some(id))
     }
@@ -399,6 +507,17 @@ impl Document {
                 self.tree.insert_leaf(anchor, leaf);
             }
             Record::Delete { anchor, head, .. } => self.tree.cut(anchor, head),
+            Record::Replace {
+                anchor,
+                head,
+                text,
+                removed_len,
+                ..
+            } => {
+                self.tree.cut(anchor, anchor + removed_len);
+                let leaf = self.tree.alloc(Node::leaf(text, head - anchor));
+                self.tree.insert_leaf(anchor, leaf);
+            }
         }
         Ok(Some(child))
     }
@@ -415,6 +534,17 @@ impl Document {
                 self.tree.insert_leaf(anchor, leaf);
             }
             Record::Delete { anchor, head, .. } => self.tree.cut(anchor, head),
+            Record::Replace {
+                anchor,
+                head,
+                text,
+                removed_len,
+                ..
+            } => {
+                self.tree.cut(anchor, anchor + removed_len);
+                let leaf = self.tree.alloc(Node::leaf(text, head - anchor));
+                self.tree.insert_leaf(anchor, leaf);
+            }
         }
         self.push(record);
     }

@@ -25,11 +25,6 @@ pub fn user_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config").join(DIR_NAME))
 }
 
-/// Каталог конфига в заданном месте — нужно в тестах.
-pub fn dir_at(base: impl AsRef<Path>) -> PathBuf {
-    base.as_ref().to_path_buf()
-}
-
 /// Папка с темами внутри каталога конфига.
 pub fn theme_dir(config: impl AsRef<Path>) -> PathBuf {
     config.as_ref().join(crate::schema::THEME_DIR)

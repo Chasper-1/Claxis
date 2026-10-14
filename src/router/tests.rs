@@ -1347,7 +1347,7 @@ fn the_statistics_count_only_the_time_a_key_was_held() {
 
 #[test]
 fn history_usage_never_passes_a_hundred() {
-    let s = crate::router::session::Stats::default();
+    let s = crate::router::stats::Stats::default();
     assert_eq!(
         s.history_percent(900, 100),
         100,

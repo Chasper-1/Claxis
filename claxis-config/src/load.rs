@@ -205,7 +205,12 @@ fn walk(
 }
 
 /// Разобрать все файлы: плохая секция в одном файле не трогает другие.
-pub fn parse_all(files: impl IntoIterator<Item = (ConfigFile, String)>) -> Loaded {
+///
+/// Подпорка для тестов: настоящий вход — [`crate::generate::read_all`], и он
+/// разбирает файлы сам. В рабочем коде этого пути нет, чтобы правила разбора
+/// не могли разойтись в двух местах.
+#[cfg(test)]
+fn parse_all(files: impl IntoIterator<Item = (ConfigFile, String)>) -> Loaded {
     let mut all = Loaded::default();
     let mut docs = Vec::new();
     for (file, text) in files {

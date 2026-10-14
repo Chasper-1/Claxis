@@ -21,7 +21,11 @@ use crate::document::{Document, Record};
 pub const MAGIC: [u8; 4] = *b"CLRP";
 
 /// Версия формата rope.
-pub const VERSION: u8 = 1;
+///
+/// Вторая: запись замены выросла на два поля, и разбор первой версии такую
+/// запись не поймёт. Старый блоб отвергается целиком — текст из базы при этом
+/// остаётся верным, теряется только история.
+pub const VERSION: u8 = 2;
 
 /// Байт записи вставки.
 const INSERT: u8 = 0;
@@ -29,8 +33,20 @@ const INSERT: u8 = 0;
 /// Байт записи удаления.
 const DELETE: u8 = 1;
 
-/// Размер одной записи: вид, якорь, голова, текст.
-const RECORD: usize = 13;
+/// Байт записи замены.
+const REPLACE: u8 = 2;
+
+/// Размер одной записи: вид, якорь, голова, текст, вырезанное и его длина.
+///
+/// Записи одинаковой длины даже там, где часть полей не используется: сквозной
+/// размер разбирается без сдвига и ветвлений, а лишние нули стоят копейки.
+const RECORD: usize = 21;
+
+/// Размер одной записи истории в байтах.
+///
+/// Открыто наружу: тесты и хранилище должны знать, сколько байт занимает
+/// запись, иначе проверка формата будет гадать.
+pub const RECORD_SIZE: usize = RECORD;
 
 /// Сохранённая ветка правок.
 ///
@@ -66,7 +82,7 @@ impl History {
         let header = Header::parse(bytes)?;
         for kind in bytes[header.records_at..].iter().step_by(RECORD) {
             let kind = *kind;
-            if kind != INSERT && kind != DELETE {
+            if kind != INSERT && kind != DELETE && kind != REPLACE {
                 return Err(crate::Error::UnknownRecordKind { kind });
             }
         }
@@ -90,13 +106,17 @@ impl History {
         bytes.extend_from_slice(doc.buffer());
         bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
         for record in records {
+            let (removed, removed_len) = record.removed().unwrap_or((0, 0));
             bytes.push(match record {
                 Record::Insert { .. } => INSERT,
                 Record::Delete { .. } => DELETE,
+                Record::Replace { .. } => REPLACE,
             });
             bytes.extend_from_slice(&record.anchor().to_le_bytes());
             bytes.extend_from_slice(&record.head().to_le_bytes());
             bytes.extend_from_slice(&record.text().to_le_bytes());
+            bytes.extend_from_slice(&removed.to_le_bytes());
+            bytes.extend_from_slice(&removed_len.to_le_bytes());
         }
         Self { bytes }
     }
@@ -129,10 +149,17 @@ impl History {
                     head: read(5),
                     text: read(9),
                 },
-                _ => Record::Delete {
+                DELETE => Record::Delete {
                     anchor: read(1),
                     head: read(5),
                     text: read(9),
+                },
+                _ => Record::Replace {
+                    anchor: read(1),
+                    head: read(5),
+                    text: read(9),
+                    removed: read(13),
+                    removed_len: read(17),
                 },
             };
             offset += RECORD;

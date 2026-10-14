@@ -13,6 +13,7 @@ use crate::api::rope::defaults::buffer::HISTORY_DEPTH;
 use crate::api::rope::{Document as Rope, Error as RopeError, History, SnapshotSink};
 use crate::api::store::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::messages::Messages;
+use crate::router::stats::{self, Stats};
 
 /// Что пошло не так в сессии.
 #[derive(Debug)]
@@ -84,56 +85,6 @@ impl SnapshotSink for StoreSink {
 pub trait Clock: std::fmt::Debug {
     /// Сколько прошло с начала работы процесса.
     fn elapsed(&self) -> Duration;
-}
-
-/// Что собрано о работе над документом за сеанс.
-///
-/// Косметика: ничего из этого не влияет на правку и не решает за пользователя,
-/// что хорошо. Время нажатия — сумма промежутков «нажал — отпустил», а не время
-/// с открытия файла: секунды на размышление между нажатиями сюда не попадают.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Stats {
-    /// Сколько байт введено.
-    pub input_chars: u64,
-    /// Сколько байт удалено.
-    pub deleted_chars: u64,
-    /// Сколько нажатий клавиш сделано.
-    pub presses: u64,
-    /// Сколько времени заняли сами нажатия.
-    pub pressed: Duration,
-    /// Сколько правок сделано.
-    pub edits: u64,
-}
-
-/// Сколько символов в куске байт.
-///
-/// Символов, а не байт: русская буква — два байта, и по байтам статистика
-/// врала бы вдвое на всём, кроме латиницы. Разбор делается на вставленном
-/// куске, он мелкий; если это не текст, считаются байты.
-fn chars(data: &[u8]) -> u64 {
-    match std::str::from_utf8(data) {
-        Ok(text) => text.chars().count() as u64,
-        Err(_) => data.len() as u64,
-    }
-}
-
-impl Stats {
-    /// Занято истории, процент. Больше сотни не бывает: сколько бы правок ни
-    /// сделано, сотня уже значит, что историю пора сбрасывать.
-    pub fn history_percent(&self, used: u32, limit: u32) -> u32 {
-        if limit == 0 {
-            return 0;
-        }
-        (used * 100 / limit).min(100)
-    }
-
-    /// Сколько записей истории ещё можно положить, без дна.
-    ///
-    /// Остаток бывает отрицательным, и это правда: история растёт по мере
-    /// правок, а не вмещается в отведённое заранее место.
-    pub fn history_remaining(&self, used: u32, limit: u32) -> i64 {
-        i64::from(limit) - i64::from(used)
-    }
 }
 
 /// Часы, которые двигает тест: ждать настоящие пять минут нельзя.
@@ -209,25 +160,21 @@ impl Document {
     /// Вставить текст и посчитать введённые символы.
     pub fn insert(&mut self, anchor: u32, data: &[u8]) -> Result<(), RopeError> {
         self.buffer.insert(anchor, data)?;
-        self.stats.input_chars += chars(data);
-        self.stats.edits += 1;
+        stats::note_input(&mut self.stats, data);
         Ok(())
     }
 
     /// Вырезать диапазон и посчитать удалённые символы.
     pub fn delete(&mut self, anchor: u32, len: u32) -> Result<(), RopeError> {
         self.buffer.delete(anchor, len)?;
-        self.stats.deleted_chars += u64::from(len);
-        self.stats.edits += 1;
+        stats::note_deleted(&mut self.stats, len);
         Ok(())
     }
 
     /// Заменить диапазон: вставка и удаление одной операцией.
     pub fn replace(&mut self, anchor: u32, len: u32, data: &[u8]) -> Result<(), RopeError> {
         self.buffer.replace(anchor, len, data)?;
-        self.stats.input_chars += chars(data);
-        self.stats.deleted_chars += u64::from(len);
-        self.stats.edits += 1;
+        stats::note_replace(&mut self.stats, data, len);
         Ok(())
     }
 
@@ -236,8 +183,7 @@ impl Document {
     /// Нажатие без отпускания — обычное дело: палец на клавише или потерянное
     /// событие. Такое нажатие засчитывается, но времени не добавляет.
     pub fn note_press(&mut self, held: Duration) {
-        self.stats.presses += 1;
-        self.stats.pressed += held;
+        stats::note_press(&mut self.stats, held);
     }
 
     /// Через сколько после последнего снапшота снимать следующий.

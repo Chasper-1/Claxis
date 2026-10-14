@@ -30,16 +30,19 @@
 //! | Файл | Что связывает |
 //! | --- | --- |
 //! | [`session`] | буфер и хранилище: открыть документ, снять снапшот на диск |
+//! | [`stats`] | что человек делал: символы, нажатия, занятая история |
 //! | [`settings`] | конфиг и перевод: язык, значения настроек, комментарии |
 //! | [`editor`] | всё вместе: то, с чего начинается запуск |
 
 mod editor;
 pub mod session;
 mod settings;
+pub mod stats;
 
 pub use editor::{Editor, Reloaded, StartError};
 pub use session::{Applied, Document, Session, SessionError};
 pub use settings::Settings;
+pub use stats::Stats;
 
 #[cfg(test)]
 mod tests;
