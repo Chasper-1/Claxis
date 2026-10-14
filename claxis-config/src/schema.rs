@@ -103,6 +103,17 @@ pub enum Kind {
     U8,
     /// Строка.
     Str,
+    /// Список строк: `["position", "mode"]`.
+    ///
+    /// Отдельный вид, а не строка: список и строка разбираются по-разному, и
+    /// пустой список в строке не спрячешь.
+    Array,
+    /// Путь к файлу или папке.
+    Path,
+    /// Целое со знаком, любой размер: `-1`, `0`, `100000`.
+    Int,
+    /// Вещественное число: `0.5`, `-1.25`.
+    Float,
 }
 
 impl Kind {
@@ -113,6 +124,10 @@ impl Kind {
             Kind::U16 => "a number from 0 to 65535",
             Kind::U8 => "a number from 0 to 255",
             Kind::Str => "a string",
+            Kind::Array => "a list of strings",
+            Kind::Path => "a path",
+            Kind::Int => "a whole number",
+            Kind::Float => "a number with a fractional part",
         }
     }
 }
@@ -590,7 +605,7 @@ mod tests {
                     "{}: значение по умолчанию не помещается в байт",
                     key.path
                 ),
-                Kind::Str => {}
+                Kind::Str | Kind::Path | Kind::Array | Kind::Int | Kind::Float => {}
             }
         }
     }

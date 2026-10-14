@@ -84,8 +84,173 @@ impl Loaded {
 /// Разобрать один файл конфига.
 ///
 /// Не падает: плохие секции отбрасываются, проблемы возвращаются списком.
+/// Свернуть многострочные встроенные таблицы в одну строку.
+///
+/// В TOML 1.0 встроенная таблица обязана помещаться в строку, а читать её так
+/// невозможно: настройка на три строки сливается с соседними. Поэтому перед
+/// разбором таблица сворачивается, а при записи разворачивается обратно — на
+/// экране и в файле она остаётся разбитой по строкам.
+///
+/// Сворачивается **только таблица** — от открывающей скобки до её парной.
+/// Всё остальное в файле остаётся на своих местах: переносы строк, имена,
+/// комментарии и строковые значения не трогаются. Комментарий, написанный
+/// внутри многострочной таблицы, не попадает в скобки — он встаёт на
+/// отдельную строку сразу под таблицей и остаётся видимым.
+pub fn fold_inline_tables(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    // Глубина вложенности таблиц, пока идёт сворачивание.
+    let mut depth = 0usize;
+    // Свёрнутая таблица копится отдельно: пока она не закончилась, в `out`
+    // ничего не пишется, иначе перенос строки внутри неё уехал бы наружу.
+    let mut folded = String::new();
+    // Комментарии изнутри таблицы: их нельзя оставить в скобках, но и терять
+    // нельзя — они встают отдельными строками под таблицей.
+    let mut comments: Vec<String> = Vec::new();
+    // Внутри строки скобки и запятые не считаются.
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    // Последний значимый символ снаружи строки: по нему видно, что `{`
+    // стоит именно на месте значения, а не внутри имени или комментария.
+    let mut last = ' ';
+
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if depth > 0 {
+                folded.push(c);
+            } else {
+                out.push(c);
+            }
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q == '"' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+                last = q;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                if depth > 0 {
+                    folded.push(c);
+                } else {
+                    out.push(c);
+                }
+            }
+            // Комментарий внутри таблицы не может остаться в скобках: TOML
+            // его там не допускает. Текст не теряется — он уходит отдельной
+            // строкой под таблицей, где человек его и писал.
+            '#' if depth > 0 => {
+                let mut comment = String::from("#");
+                for skipped in chars.by_ref() {
+                    if skipped == '\n' {
+                        break;
+                    }
+                    comment.push(skipped);
+                }
+                comments.push(comment.trim_end().to_string());
+                folded.push(' ');
+            }
+            '{' => {
+                if last == '=' || last == ',' {
+                    depth += 1;
+                    if depth == 1 {
+                        folded.clear();
+                    }
+                    folded.push(c);
+                } else if depth > 0 {
+                    // Вложенная таблица — часть значения, сворачивается вместе.
+                    folded.push(c);
+                } else {
+                    out.push(c);
+                }
+                last = c;
+            }
+            '}' => {
+                if depth == 0 {
+                    out.push(c);
+                    last = c;
+                    continue;
+                }
+                folded.push(c);
+                depth -= 1;
+                if depth == 0 {
+                    // Таблица закончилась: вставляем её целиком, а комментарии
+                    // из неё — отдельными строками сразу под ней.
+                    out.push_str(&tidy_inline(&folded));
+                    for comment in comments.drain(..) {
+                        out.push('\n');
+                        out.push_str(&comment);
+                    }
+                    last = '}';
+                }
+            }
+            '\n' if depth > 0 => folded.push(' '),
+            c if c.is_whitespace() => {
+                if depth > 0 {
+                    folded.push(c);
+                } else {
+                    out.push(c);
+                }
+            }
+            c => {
+                if depth > 0 {
+                    folded.push(c);
+                } else {
+                    out.push(c);
+                }
+                last = c;
+            }
+        }
+    }
+    out
+}
+
+/// Убрать лишние пробелы из свёрнутой таблицы.
+///
+/// Переносы строк и отступы превратились в пробелы, и без этого в скобках
+/// оказалось бы `{   a = 1,     b = 2   }`. Пробелы внутри строк не трогаются:
+/// там они часть значения.
+fn tidy_inline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut space = false;
+    for c in text.chars() {
+        if let Some(q) = quote {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q == '"' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c.is_whitespace() {
+            space = true;
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            _ => {}
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        out.push(c);
+    }
+    out
+}
+
 pub fn parse(file: ConfigFile, text: &str) -> Loaded {
-    let doc: toml_edit::DocumentMut = match text.parse() {
+    let folded = fold_inline_tables(text);
+    let doc: toml_edit::DocumentMut = match folded.parse() {
         Ok(doc) => doc,
         Err(e) => {
             return Loaded {
@@ -241,6 +406,31 @@ fn check_kind(
 }
 
 /// Значение соответствует типу ключа?
+///
+/// Наружу: тем же правилом проверяется и запись значения, иначе ключ можно
+/// было бы положить в конфиг в виде, который сам же разбор потом отвергнет.
+pub fn value_matches(def: &KeyDef, value: &str) -> bool {
+    // Список в схеме хранится текстом без скобок, поэтому для проверки он
+    // снова оборачивается в них: проверять надо ровно то, что окажется в
+    // конфиге, а не то, что из него выведется.
+    let text = match def.kind {
+        super::schema::Kind::Array => format!("v = [{value}]\n"),
+        // Строка в схеме хранится без кавычек, а в TOML она обязана быть в
+        // кавычках: `hello` без них — не значение, а опечатка.
+        super::schema::Kind::Str | super::schema::Kind::Path => {
+            format!("v = \"{value}\"\n")
+        }
+        _ => format!("v = {value}\n"),
+    };
+    let Ok(parsed) = text.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    let Some(item) = parsed.get("v") else {
+        return false;
+    };
+    check(def, item).is_ok()
+}
+
 fn check(def: &KeyDef, value: &toml_edit::Item) -> std::result::Result<(), Problem> {
     use super::schema::Kind;
     let ok = match def.kind {
@@ -253,7 +443,15 @@ fn check(def: &KeyDef, value: &toml_edit::Item) -> std::result::Result<(), Probl
             .as_integer()
             .map(|n| (0..=u8::MAX as i64).contains(&n))
             .unwrap_or(false),
-        Kind::Str => value.as_str().is_some(),
+        Kind::Str | Kind::Path => value.as_str().is_some(),
+        // Список строк: `[]` и `["a", "b"]` годятся, `["a", 1]` — нет.
+        Kind::Array => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(|item| item.as_str().is_some())),
+        Kind::Int => value.as_integer().is_some(),
+        // Дробное принимается и целым: `3` — это тоже число, и запрещать его
+        // в дробной настройке незачем.
+        Kind::Float => value.as_float().is_some() || value.as_integer().is_some(),
     };
     if ok {
         Ok(())

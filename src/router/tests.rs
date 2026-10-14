@@ -1381,9 +1381,10 @@ fn the_history_usage_signature_is_an_inline_table() {
     // Подписи истории лежат во встроенной таблице, а не плоскими ключами: их
     // пишут и читают по именам `percent` и `number`.
     let tmp = Temp::new("history-usage-table");
+    // Ровно так, как это пишет человек: таблица разбита по строкам.
     std::fs::write(
         tmp.dir.join("config.toml"),
-        "[Savescreen.Setting]\nhistory_usage = { percent = \"{percent}\", number = \"{remaining}\" }\n",
+        "[Savescreen.Setting]\nhistory_usage = {\n  percent = \"{percent}\",\n  number = \"{remaining}\"\n}\n",
     )
     .unwrap();
     let editor = crate::router::Editor::open_in(&tmp.dir, &tmp.store).unwrap();
@@ -1501,4 +1502,43 @@ fn a_document_survives_a_thousand_tiny_edits() {
     }
     assert_eq!(doc.text().len(), 3000);
     assert_eq!(doc.buffer().read_range(0, 0), Vec::<u8>::new());
+}
+
+#[test]
+fn a_multiline_table_in_a_real_config_reaches_the_settings() {
+    // Весь путь целиком: файл на диске, написанный руками, открывается
+    // редактором, и подписи приходят в настройки без кавычек и переносов.
+    let tmp = Temp::new("multiline-end-to-end");
+    std::fs::write(
+        tmp.dir.join("config.toml"),
+        r#"[General]
+language = "en"
+
+[Savescreen]
+include = true
+
+[Savescreen.Setting]
+history_usage = {
+  percent = "{percent} of {max}",
+  number = "{used} of {remaining}"
+}
+"#,
+    )
+    .unwrap();
+    let editor = crate::router::Editor::open_in(&tmp.dir, &tmp.store).unwrap();
+    assert!(
+        editor.issues.is_empty(),
+        "конфиг с многострочной таблицей разбирается с проблемами: {:?}",
+        editor.issues
+    );
+    let settings = editor.settings();
+    assert_eq!(
+        settings.savescreen_history_usage_percent,
+        "{percent} of {max}"
+    );
+    assert_eq!(
+        settings.savescreen_history_usage_number,
+        "{used} of {remaining}"
+    );
+    assert!(settings.savescreen_include);
 }

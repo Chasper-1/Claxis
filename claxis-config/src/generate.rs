@@ -152,14 +152,139 @@ fn table_body(file: schema::ConfigFile, section: &str, catalog: &claxis_i18n::Ca
             _ => format!("{k} = {v}"),
         })
         .collect();
-    // Inline table обязана быть в одну строку: многострочная невалидна по
-    // спецификации TOML, и разбор её отвергнет.
+    // Таблица пишется по строке на пару: в одну строку её не прочитать, а
+    // разбирать мы будем сворачивая — см. `load::fold_inline_tables`.
     format!(
-        "{} = {{ {} }}  # {}\n\n",
+        "{} = {{\n  {}\n}}  # {}\n\n",
         table_name(table),
-        pairs.join(", "),
+        pairs.join(",\n  "),
         tr(catalog, table.comment),
     )
+}
+
+/// Где в строке закрывающая скобка встроенной таблицы.
+///
+/// Обычный `find('}')` не годится: в значении вида `{used}` скобка стоит
+/// внутри строки и закрыла бы таблицу на полуслове.
+fn closing_brace(s: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q == '"' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '}' => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Разделить пары встроенной таблицы по запятым снаружи строк.
+///
+/// По обычному `split(", ")` пара вида `text = "a, b"` распалась бы на две, и
+/// в конфиге появилось бы значение, которого никто не писал.
+fn split_pairs(pairs: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in pairs.chars() {
+        if let Some(q) = quote {
+            current.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && q == '"' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                current.push(c);
+            }
+            ',' => {
+                if current.trim().is_empty() {
+                    // Две запятые подряд: пустая пара, её пропускаем.
+                    current.clear();
+                } else {
+                    out.push(current.trim().to_string());
+                    current.clear();
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_string());
+    }
+    out
+}
+
+/// Развернуть встроенные таблицы схемы по строкам.
+///
+/// Только те, что принадлежат схеме: чужое оформление пользователя не
+/// трогаем, переписываем только то, что сами пишем. Пары берутся из самой
+/// строки, поэтому разворачивается и таблица, которую пользователь поправил.
+pub fn expand_schema_tables(text: &str) -> String {
+    let names: Vec<&str> = schema::TABLES.iter().map(table_name).collect();
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        out.push_str(&expand_line(line, &names));
+        out.push('\n');
+    }
+    out
+}
+
+/// Развернуть одну строку, если это таблица схемы.
+fn expand_line(line: &str, names: &[&str]) -> String {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = &line[indent_len..];
+
+    let Some(name) = names
+        .iter()
+        .find(|n| trimmed.starts_with(&format!("{n} = {{")))
+    else {
+        return line.to_string();
+    };
+    // Минус четыре: пробел, `=`, пробел и сама `{`. Дальше идут пары.
+    let rest = &trimmed[name.len() + 4..];
+    let Some(close) = closing_brace(rest) else {
+        return line.to_string();
+    };
+    let pairs = &rest[..close];
+    let tail = rest[close + 1..].trim_start();
+
+    // Пустая таблица в одну строку остаётся в одну строку: переносить нечего.
+    if pairs.trim().is_empty() {
+        return line.to_string();
+    }
+    let indent_pair = format!("{indent}  ");
+    let body = split_pairs(pairs)
+        .iter()
+        .map(|p| format!("{indent_pair}{}", p.trim()))
+        .collect::<Vec<_>>()
+        .join(",\n");
+
+    let mut out = format!("{indent}{name} = {{\n{body}\n{indent}}}");
+    if !tail.is_empty() {
+        out.push(' ');
+        out.push_str(tail);
+    }
+    out
 }
 
 /// Секция, в которой живёт табличная настройка: `General.hold` → `General`.
@@ -188,14 +313,20 @@ fn range_hint(kind: schema::Kind) -> &'static str {
         schema::Kind::Bool => "true or false",
         schema::Kind::U16 => "0 to 65535",
         schema::Kind::U8 => "0 to 255",
-        schema::Kind::Str => "",
+        schema::Kind::Str | schema::Kind::Array | schema::Kind::Path => "",
+        // У целого со знаком и у дробного верхней границы нет: она не
+        // помещается в подсказку и всё равно не нужна человеку.
+        schema::Kind::Int | schema::Kind::Float => "",
     }
 }
 
 /// Значение ключа так, как оно записывается в TOML.
 fn value_text(key: &KeyDef) -> String {
     match key.kind {
-        schema::Kind::Str => format!("\"{}\"", key.default),
+        schema::Kind::Str | schema::Kind::Path => format!("\"{}\"", key.default),
+        // Список пишется в квадратных скобках, иначе это строка, а не список,
+        // и при раскомментировании файл перестанет разбираться.
+        schema::Kind::Array => format!("[{}]", key.default),
         _ => key.default.to_string(),
     }
 }
@@ -270,7 +401,7 @@ pub fn write_value(
         path: path.display().to_string(),
         reason: e.to_string(),
     })?;
-    let mut doc = text
+    let mut doc = crate::load::fold_inline_tables(&text)
         .parse::<DocumentMut>()
         .map_err(|e: toml_edit::TomlError| Error::Parse {
             path: path.display().to_string(),
@@ -310,13 +441,113 @@ pub fn write_value(
     {
         v.decor_mut().set_suffix(suffix);
     }
-    std::fs::write(&path, doc.to_string()).map_err(|e| Error::Write {
+    // Таблицы схемы возвращаем по строкам: перед разбором они были свёрнуты,
+    // и в файле они должны выглядеть так же, как их пишет генератор.
+    let written = expand_schema_tables(&doc.to_string());
+    std::fs::write(&path, written).map_err(|e| Error::Write {
         path: path.display().to_string(),
         reason: e.to_string(),
     })
 }
 
-fn parse_value(key: &KeyDef, value: &str) -> Item {
+/// Записать пары табличной настройки, не трогая остальной файл.
+///
+/// Таблица читается человеком по строкам, значит и записывается по строкам,
+/// а комментарий ключа остаётся на месте.
+pub fn write_table_value(
+    dir: &Path,
+    def: &'static schema::TableDef,
+    pairs: &[(&str, &str)],
+) -> std::result::Result<(), Error> {
+    let path = dir.join(def.file.file_name());
+    let text = std::fs::read_to_string(&path).map_err(|e| Error::Read {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    let mut doc = crate::load::fold_inline_tables(&text)
+        .parse::<DocumentMut>()
+        .map_err(|e: toml_edit::TomlError| Error::Parse {
+            path: path.display().to_string(),
+            reason: e.message().to_string(),
+        })?;
+
+    let section = section_prefix(def);
+    let name = table_name(def);
+    let mut table: &mut Table = doc.as_table_mut();
+    for part in section.split('.') {
+        if !table.contains_key(part) {
+            table[part] = toml_edit::table();
+        }
+        table = table
+            .get_mut(part)
+            .and_then(Item::as_table_mut)
+            .ok_or_else(|| Error::Parse {
+                path: path.display().to_string(),
+                reason: format!("{part} is not a section"),
+            })?;
+    }
+
+    // Оформление ключа переносим: комментарий пользователя должен остаться.
+    let entry = table
+        .get_key_value(name)
+        .map(|(k, _)| k.clone())
+        .unwrap_or_else(|| toml_edit::Key::new(name));
+    let suffix = table
+        .get(name)
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.decor().suffix())
+        .map(|s| s.as_str().unwrap_or_default().to_string());
+
+    let mut inline = toml_edit::InlineTable::new();
+    // Пары схемы — основание: переданные переопределяют их, а забытые
+    // остаются, иначе таблица теряла бы половину настроек при правке одной.
+    for (key, value) in def.default {
+        inline.insert(*key, value_for_table(def, value));
+    }
+    for (key, value) in pairs {
+        inline.insert(*key, value_for_table(def, value));
+    }
+    table.insert_formatted(&entry, Item::Value(toml_edit::Value::InlineTable(inline)));
+    if let Some(suffix) = suffix
+        && let Some(v) = table.get_mut(name).and_then(|i| i.as_value_mut())
+    {
+        v.decor_mut().set_suffix(suffix);
+    }
+    // Таблица схемы возвращается по строкам.
+    std::fs::write(&path, expand_schema_tables(&doc.to_string())).map_err(|e| Error::Write {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    })
+}
+
+/// Значение пары таблицы: строка получает кавычки, остальное пишется как есть.
+fn value_for_table(def: &schema::TableDef, value: &str) -> toml_edit::Value {
+    match def.kind {
+        schema::Kind::Str | schema::Kind::Path => toml_edit::Value::from(value),
+        schema::Kind::Bool => value
+            .parse::<bool>()
+            .map_or_else(|_| toml_edit::Value::from(value), toml_edit::Value::from),
+        schema::Kind::U8 | schema::Kind::U16 | schema::Kind::Int => value
+            .parse::<i64>()
+            .map_or_else(|_| toml_edit::Value::from(value), toml_edit::Value::from),
+        schema::Kind::Float => value
+            .parse::<f64>()
+            .map_or_else(|_| toml_edit::Value::from(value), toml_edit::Value::from),
+        schema::Kind::Array => {
+            let mut array = toml_edit::Array::new();
+            for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                array.push(part.trim_matches('"'));
+            }
+            toml_edit::Value::Array(array)
+        }
+    }
+}
+
+/// Значение ключа в виде, который понимает TOML.
+///
+/// Открыто наружу: тем же правилом проверяется тип при разборе, иначе ключ
+/// можно было бы записать не так, как потом разберётся.
+pub fn parse_value(key: &KeyDef, value: &str) -> Item {
     use toml_edit::Value;
     match key.kind {
         schema::Kind::U16 | schema::Kind::U8 => match value.parse::<i64>() {
@@ -327,7 +558,29 @@ fn parse_value(key: &KeyDef, value: &str) -> Item {
             Ok(b) => Item::Value(Value::from(b)),
             Err(_) => Item::Value(Value::from(value)),
         },
-        schema::Kind::Str => Item::Value(Value::from(value)),
+        schema::Kind::Str | schema::Kind::Path => Item::Value(Value::from(value)),
+        // Список приходит текстом через запятую и собирается в массив: так
+        // его можно и показать в конфиге, и положить обратно без потерь.
+        schema::Kind::Array => {
+            // Схема хранит список текстом через запятую и без внешних скобок,
+            // а в TOML он снова список — со скобками и без кавычек внутри.
+            let mut array = toml_edit::Array::new();
+            for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                array.push(part.trim_matches('"'));
+            }
+            Item::Value(Value::Array(array))
+        }
+        schema::Kind::Int => match value.parse::<i64>() {
+            Ok(n) => Item::Value(Value::from(n)),
+            Err(_) => Item::Value(Value::from(value)),
+        },
+        schema::Kind::Float => match value.parse::<f64>() {
+            Ok(f) => Item::Value(Value::from(f)),
+            Err(_) => match value.parse::<i64>() {
+                Ok(n) => Item::Value(Value::from(n)),
+                Err(_) => Item::Value(Value::from(value)),
+            },
+        },
     }
 }
 
@@ -370,6 +623,9 @@ mod tests {
         fn new(name: &str) -> Self {
             let p = std::env::temp_dir().join(format!("claxis-cfg-{name}"));
             let _ = std::fs::remove_dir_all(&p);
+            // Каталога может не быть, а тест пишет в него файл: создаём
+            // сразу, иначе падение будет не про то, что проверяем.
+            std::fs::create_dir_all(&p).expect("каталог создаётся");
             Self(p)
         }
         fn dir(&self) -> &Path {
@@ -539,6 +795,245 @@ mod tests {
                 key.path
             );
         }
+    }
+
+    #[test]
+    fn every_kind_survives_a_round_trip() {
+        // Каждый вид значения обязан и записаться в файл, и пройти проверку
+        // своего типа. Не проверив это, сломанный вид всплыл бы на живом
+        // конфиге.
+        use crate::schema::{ConfigFile as File, KeyDef, Kind};
+        const CASES: &[(Kind, &str, &str)] = &[
+            (Kind::Bool, "true", "flag"),
+            (Kind::U8, "200", "small"),
+            (Kind::U16, "8192", "depth"),
+            (Kind::Int, "-5", "offset"),
+            (Kind::Float, "0.25", "ratio"),
+            (Kind::Str, "hello", "name"),
+            (Kind::Path, "/tmp/x", "file"),
+            (Kind::Array, "\"a\", \"b\"", "list"),
+        ];
+        for (kind, value, name) in CASES {
+            let key = KeyDef {
+                file: File::Global,
+                path: "General.probe",
+                default: value,
+                kind: *kind,
+                comment: "probe",
+                active: true,
+            };
+            assert!(
+                crate::load::value_matches(&key, value),
+                "{name}: значение {value} не прошло проверку своего типа"
+            );
+
+            // И обратно: значение должно записаться в файл и разобраться.
+            let line = format!("probe = {}", value_text(&key));
+            let mut doc = toml_edit::DocumentMut::new();
+            doc["General"]["probe"] = parse_value(&key, value);
+            let written = doc.to_string();
+            assert!(
+                written.contains(line.trim_end()),
+                "{name}: записалось не то, что показано: {written}"
+            );
+            assert!(
+                written.trim().parse::<toml_edit::DocumentMut>().is_ok(),
+                "{name}: записанный файл не разбирается: {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_list_is_not_a_string_and_its_inners_are_checked() {
+        // Список строк не должен проходить проверку, если внутри не строки,
+        // иначе опечатка внутри списка дойдёт до кода как есть.
+        use crate::schema::{ConfigFile as File, KeyDef, Kind};
+        let key = KeyDef {
+            file: File::Global,
+            path: "General.probe",
+            default: "\"a\"",
+            kind: Kind::Array,
+            comment: "probe",
+            active: true,
+        };
+        assert!(crate::load::value_matches(&key, "\"a\", \"b\""));
+        assert!(
+            crate::load::value_matches(&key, ""),
+            "пустой список тоже список"
+        );
+        assert!(!crate::load::value_matches(&key, "a"), "строка не список");
+    }
+
+    #[test]
+    fn a_wrong_type_is_named_with_its_kind() {
+        // Ошибка должна говорить, чего ждали: «список», а не «строка».
+        use crate::schema::Kind;
+        let def = crate::schema::find(ConfigFile::Global, "General.language").unwrap();
+        assert_eq!(def.kind, Kind::Str);
+        assert_eq!(Kind::Array.expected(), "a list of strings");
+        assert_eq!(Kind::Path.expected(), "a path");
+        assert_eq!(Kind::Int.expected(), "a whole number");
+        assert_eq!(Kind::Float.expected(), "a number with a fractional part");
+    }
+
+    #[test]
+    fn a_multiline_table_is_read_the_way_a_person_writes_it() {
+        // Главное ради чего всё затевалось: таблицу, разбитую по строкам,
+        // должно быть можно написать руками. TOML 1.0 её не берёт, поэтому мы
+        // сворачиваем таблицу перед разбором.
+        let text = "[Savescreen.Setting]\nhistory_usage = {\n  percent = \"{used}\",\n  number = \"{remaining}\"\n}\n";
+        let loaded = crate::load::parse(ConfigFile::Global, text);
+        assert!(
+            loaded.issues.is_empty(),
+            "многострочная таблица не разобралась: {:?}",
+            loaded.issues
+        );
+        let table =
+            crate::schema::find_table(ConfigFile::Global, "Savescreen.Setting.history_usage")
+                .unwrap();
+        let got = loaded.config.table(table);
+        // Таблица отдаёт значения как есть в TOML, вместе с кавычками:
+        // подпись нужна сама по себе, без них.
+        let plain: Vec<(String, String)> = got
+            .into_iter()
+            .map(|(k, v)| (k, v.trim_matches('"').to_string()))
+            .collect();
+        assert_eq!(
+            plain,
+            vec![
+                ("percent".to_string(), "{used}".to_string()),
+                ("number".to_string(), "{remaining}".to_string()),
+            ],
+            "подписи прочитались не те"
+        );
+    }
+
+    #[test]
+    fn folding_leaves_everything_else_where_it_was() {
+        // Сворачивание трогает только таблицы: переносы строк снаружи, в
+        // именах и в комментариях обязаны остаться на своих местах, иначе
+        // номер строки в ошибке соврёт.
+        let text = "# шапка\n[General]\nname = \"a { b } c\"  # скобки в строке\nhold = { alt = 200, ctrl = 200 }\nпосле = 1\n";
+        let folded = crate::load::fold_inline_tables(text);
+        assert_eq!(
+            folded.lines().count(),
+            text.lines().count(),
+            "строк не потерялось"
+        );
+        assert!(
+            folded.contains("name = \"a { b } c\""),
+            "скобки в строке не тронуты"
+        );
+        assert!(
+            folded.contains("hold = { alt = 200, ctrl = 200 }"),
+            "таблица не поехала"
+        );
+        assert!(folded.contains("после = 1"), "хвост не тронут");
+    }
+
+    #[test]
+    fn a_multiline_table_survives_a_value_change() {
+        // Точечная запись не должна возвращать файл к однострочному виду:
+        // человек писал по строкам, значит и после правки должно быть так.
+        let tmp = Temp::new("multiline-write");
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[Savescreen.Setting]\nhistory_usage = {\n  percent = \"{used}\",\n  number = \"{remaining}\"\n}\n",
+        )
+        .unwrap();
+        let table =
+            crate::schema::find_table(ConfigFile::Global, "Savescreen.Setting.history_usage")
+                .unwrap();
+        write_table_value(tmp.dir(), table, &[("percent", "{percent}")]).unwrap();
+
+        let after = std::fs::read_to_string(tmp.dir().join("config.toml")).unwrap();
+        assert!(
+            after.contains("percent = \"{percent}\""),
+            "новое значение не записалось: {after}"
+        );
+        assert!(
+            after.contains("{\n"),
+            "таблица схлопнулась в строку: {after}"
+        );
+        assert!(
+            after.contains("number = \"{remaining}\""),
+            "остальное потерялось"
+        );
+
+        // И файл после правки всё ещё разбирается.
+        let loaded = crate::load::parse(ConfigFile::Global, &after);
+        assert!(
+            loaded.issues.is_empty(),
+            "файл после правки не разобрался:\n{after}\nсвёрнуто:\n{}",
+            crate::load::fold_inline_tables(&after)
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_a_multiline_table_stays_visible() {
+        // Комментарий не может остаться в скобках — TOML его там не допускает,
+        // но и пропасть он не должен: человек его написал и должен его видеть.
+        let text = "[Savescreen.Setting]\nhistory_usage = {\n  percent = \"{used}\",  # как показывать проценты\n  number = \"{remaining}\"  # как показывать числа\n}\n";
+        let folded = crate::load::fold_inline_tables(text);
+        assert!(
+            !folded.contains("# как показывать проценты }"),
+            "комментарий остался внутри скобок:\n{folded}"
+        );
+        assert!(
+            folded.contains("history_usage = { percent = \"{used}\", number = \"{remaining}\" }"),
+            "таблица не свернулась:\n{folded}"
+        );
+        assert!(
+            folded.contains("# как показывать проценты"),
+            "комментарий потерялся:\n{folded}"
+        );
+        assert!(
+            folded.contains("# как показывать числа"),
+            "второй комментарий потерялся:\n{folded}"
+        );
+
+        // И такой файл разбирается.
+        let loaded = crate::load::parse(ConfigFile::Global, &folded);
+        assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+    }
+
+    #[test]
+    fn folding_stops_where_the_table_stops() {
+        // Сворачивается только таблица: всё, что после неё, остаётся как
+        // было, включая переносы строк и вложенные фигурные скобки.
+        let text = "a = 1\nb = {\n  x = 2\n}\nc = [1, 2]\nd = 4\n";
+        let folded = crate::load::fold_inline_tables(text);
+        assert_eq!(folded, "a = 1\nb = { x = 2 }\nc = [1, 2]\nd = 4\n");
+    }
+
+    #[test]
+    fn a_brace_outside_a_value_is_not_folded() {
+        // Скобка не на месте значения — не таблица, и сворачивать её незачем:
+        // такой текст разбор и так примет.
+        let text = "name = \"скобка } внутри строки\"\nпосле = 2\n";
+        let folded = crate::load::fold_inline_tables(text);
+        assert_eq!(folded, text);
+    }
+
+    #[test]
+    fn a_nested_table_is_folded_as_a_whole() {
+        let text = "a = {\n  b = {\n    c = 1\n  }\n}\nafter = 2\n";
+        let folded = crate::load::fold_inline_tables(text);
+        assert_eq!(folded, "a = { b = { c = 1 } }\nafter = 2\n");
+        // Ключи выдуманные, поэтому проверяем не схему, а сам TOML.
+        assert!(
+            folded.parse::<toml_edit::DocumentMut>().is_ok(),
+            "свёрнутое не разбирается: {folded}"
+        );
+    }
+
+    #[test]
+    fn the_generated_config_shows_a_table_line_by_line() {
+        let text = render(ConfigFile::Global, &plain());
+        assert!(
+            text.contains("history_usage = {\n"),
+            "таблица в конфиге слита в одну строку:\n{text}"
+        );
     }
 
     #[test]
