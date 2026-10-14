@@ -193,9 +193,16 @@ fn undo_and_redo_are_lifo_stacks() {
     buf.insert(2, b"C").unwrap();
     assert_eq!(buf.undo_stack().len(), 3);
     let id = buf.undo().unwrap().unwrap();
-    assert_eq!(buf.redo_stack().len(), 1);
+    assert_eq!(
+        buf.undo_stack().len(),
+        2,
+        "после отмены путь короче на одну запись"
+    );
     assert_eq!(buf.record(id).unwrap().anchor(), 2);
     assert_eq!(buf.record(id).unwrap().head(), 3);
+    // Повтор возвращает запись обратно в путь.
+    buf.redo().unwrap().unwrap();
+    assert_eq!(buf.undo_stack().len(), 3);
 }
 
 #[test]
@@ -418,7 +425,7 @@ fn arena_blocks_keep_all_records() {
     for _ in 0..3000 {
         buf.insert(0, b"X").unwrap();
         assert!(buf.undo_stack().len() <= DEPTH as usize);
-        for &id in buf.undo_stack() {
+        for id in buf.undo_stack() {
             assert!(buf.record(id).is_some(), "запись пропала");
         }
     }
@@ -758,4 +765,3 @@ fn history_larger_than_the_arena_is_not_half_restored() {
     assert_eq!(undone, 10, "восстановилось {} записей из 10", undone);
     assert_eq!(fresh.read(), b"abc");
 }
-

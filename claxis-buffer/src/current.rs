@@ -606,7 +606,7 @@ impl Current {
                 Record::Insert { anchor, head, text } => {
                     self.apply_insert(anchor, text, head - anchor, id)?;
                 }
-                Record::Delete { anchor, head } => {
+                Record::Delete { anchor, head, .. } => {
                     let len = head - anchor;
                     if len > 0 {
                         self.apply_delete(anchor, len)?;
@@ -751,6 +751,40 @@ impl Current {
     }
 
     /// Все сегменты в порядке документа — для тестов и отладки.
+    /// Кусочки диапазона в порядке документа: `(из added, смещение, длина)`.
+    ///
+    /// Позиция в `Segment` — это место, куда текст вставляли, а не где он
+    /// лежит сейчас: после вставок и удалений она устаревает. Поэтому
+    /// диапазон режется обходом с базой, как это делает `delete_rec`.
+    pub fn range_pieces(&self, start: u32, end: u32, out: &mut Vec<(bool, u32, u32)>) {
+        out.clear();
+        self.pieces(self.root, 0, start, end, out);
+    }
+
+    fn pieces(&self, idx: u32, base: u32, start: u32, end: u32, out: &mut Vec<(bool, u32, u32)>) {
+        if idx == NIL {
+            return;
+        }
+        let node = self.nodes[idx as usize];
+        let node_end = base + self.len_of(idx);
+        if end <= base || start >= node_end {
+            return;
+        }
+        if node.is_leaf() {
+            let seg = node.leaf_seg();
+            let from = start.saturating_sub(base);
+            let to = (end - base).min(seg.len);
+            if from < to {
+                out.push((seg.record != ORIGINAL_ID, seg.off + from, to - from));
+            }
+            return;
+        }
+        let (left, right) = (node.left(), node.right());
+        let right_base = base + self.len_of(left);
+        self.pieces(left, base, start, end, out);
+        self.pieces(right, right_base, start, end, out);
+    }
+
     pub fn segments(&self, out: &mut Vec<Segment>) {
         out.clear();
         self.collect(self.root, out);

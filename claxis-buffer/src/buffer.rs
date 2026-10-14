@@ -113,8 +113,8 @@ fn write_one(out: &mut crate::history::Bytes, record: &Record) {
         Record::Insert { anchor, head, text } => {
             crate::history::write_record(out, crate::history::INSERT_TAG, *anchor, *head, *text)
         }
-        Record::Delete { anchor, head } => {
-            crate::history::write_record(out, crate::history::DELETE_TAG, *anchor, *head, 0)
+        Record::Delete { anchor, head, text } => {
+            crate::history::write_record(out, crate::history::DELETE_TAG, *anchor, *head, *text)
         }
     }
 }
@@ -132,7 +132,7 @@ fn read_all(bytes: &[u8]) -> Vec<Record> {
         };
         out.push(match tag {
             crate::history::INSERT_TAG => Record::Insert { anchor, head, text },
-            crate::history::DELETE_TAG => Record::Delete { anchor, head },
+            crate::history::DELETE_TAG => Record::Delete { anchor, head, text },
             _ => break,
         });
     }
@@ -143,7 +143,17 @@ fn read_all(bytes: &[u8]) -> Vec<Record> {
 #[derive(Debug)]
 pub struct Buffer {
     original: Vec<u8>,
+    // Удалённый текст тоже лежит в `added`: отменить удаление — значит
+    // вставить обратно, а сегмент читает текст по одной ссылке. Второй буфер
+    // означал бы вторую ветку кода и вторую границу памяти.
     added: Vec<u8>,
+    /// Смещения текста, вставленного отменой удаления.
+    ///
+    /// Такой текст не принадлежит ни одной записи истории: запись удаления
+    /// лежит в отброшенной ветке, и её обрезка унесла бы текст, на который
+    /// уже ссылается живой сегмент. Смещения помнятся, чтобы хвост не
+    /// дошёл до них.
+    phantom: Vec<u32>,
     arena: Arena,
     current: Current,
     /// Куда уходят снятые снапшоты. По умолчанию — никуда.
@@ -195,6 +205,7 @@ impl Buffer {
         Ok(Self {
             original,
             added: Vec::new(),
+            phantom: Vec::new(),
             arena,
             current,
             sink: Box::new(NullSink),
@@ -271,12 +282,19 @@ impl Buffer {
         }
     }
 
-    pub fn undo_stack(&self) -> &[RecordId] {
-        self.arena.undo_stack()
+    /// Записи активной ветки, от корня к текущей вершине.
+    pub fn undo_stack(&self) -> Vec<RecordId> {
+        self.arena.path()
     }
 
-    pub fn redo_stack(&self) -> &[RecordId] {
-        self.arena.redo_stack()
+    /// Записи отброшенной ветки, до которых можно повторить.
+    pub fn redo_stack(&self) -> Vec<RecordId> {
+        self.arena.redo_path()
+    }
+
+    /// Отладочный снимок вершин истории.
+    pub fn debug_nodes(&self) -> Vec<(Option<RecordId>, Option<RecordId>, bool)> {
+        self.arena.debug_nodes()
     }
 
     pub fn record(&self, id: RecordId) -> Option<&Record> {
@@ -317,9 +335,38 @@ impl Buffer {
         }
         self.snapshot_if_needed()?;
         self.discard_redo_with_cleanup();
-        let _ = self.arena.push(Record::delete(anchor, len));
+        // Удалённый текст запоминается: без него удаление нечем отменить.
+        let text = self.added.len() as u32;
+        self.cut_into_added(anchor, len);
+        self.arena.push(Record::delete(anchor, len, text));
         self.current.apply_delete(anchor, len)?;
         Ok(())
+    }
+
+    /// Вырезать диапазон документа в конец `added`.
+    ///
+    /// Куски берутся обходом дерева и склеиваются в порядке документа: вернуть
+    /// их — значит вставить обратно ровно этот кусок, посимвольно.
+    fn cut_into_added(&mut self, anchor: u32, len: u32) {
+        let mut pieces = Vec::new();
+        self.current.range_pieces(anchor, anchor + len, &mut pieces);
+        // Копии собираются до записи: источник и приёмник — один и тот же
+        // буфер, и писать в него на ходу обхода нельзя.
+        let chunks: Vec<Vec<u8>> = pieces
+            .iter()
+            .map(|&(from_added, off, len)| {
+                let source = if from_added {
+                    &self.added
+                } else {
+                    &self.original
+                };
+                let at = off as usize;
+                source[at..at + len as usize].to_vec()
+            })
+            .collect();
+        for chunk in chunks {
+            self.added.extend_from_slice(&chunk);
+        }
     }
 
     /// Снапшот, когда история исчерпала свою глубину.
@@ -344,24 +391,74 @@ impl Buffer {
         self.insert(anchor, data)
     }
 
-    /// Отмена: верхняя запись `undo` уходит в `redo`, `Current` пересобирается.
+    /// Отмена одной правки.
+    ///
+    /// Применяется обратная операция, а не пересборка дерева по всей истории:
+    /// стоимость не зависит от того, сколько правок накопилось. Запись, на
+    /// которой мы стоим, уходит к родителю.
     pub fn undo(&mut self) -> Result<Option<RecordId>, Error> {
         let Some(id) = self.arena.undo() else {
             return Ok(None);
         };
-        self.rebuild()?;
-        self.snapshot_if_needed()?;
+        let Some(record) = self.arena.get(id).copied() else {
+            return Ok(None);
+        };
+        self.apply_inverse(record)?;
         Ok(Some(id))
     }
 
-    /// Повтор отменённой правки: запись возвращается из `redo` в `undo`.
+    /// Повтор отменённой правки: возвращаемся к ребёнку и применяем запись.
     pub fn redo(&mut self) -> Result<Option<RecordId>, Error> {
         let Some(id) = self.arena.redo() else {
             return Ok(None);
         };
-        self.rebuild()?;
-        self.snapshot_if_needed()?;
+        let Some(record) = self.arena.get(id).copied() else {
+            return Ok(None);
+        };
+        self.apply_record(record, id)?;
         Ok(Some(id))
+    }
+
+    /// Применить запись как есть: повтор правки.
+    fn apply_record(&mut self, record: Record, id: RecordId) -> Result<(), Error> {
+        match record {
+            Record::Insert { anchor, head, text } => {
+                let len = head - anchor;
+                self.current.apply_insert(anchor, text, len, id)
+            }
+            Record::Delete { anchor, head, .. } => self.current.apply_delete(anchor, head - anchor),
+        }
+    }
+
+    /// Отменить запись обратной операцией.
+    fn apply_inverse(&mut self, record: Record) -> Result<(), Error> {
+        match record {
+            // Отмена вставки — вырезать то, что она вставила.
+            Record::Insert { anchor, head, .. } => self.current.apply_delete(anchor, head - anchor),
+            // Отмена удаления — вернуть то, что было вырезано.
+            Record::Delete { anchor, head, text } => {
+                let len = head - anchor;
+                // Текст копируется в конец `added`, а не берётся по старой
+                // ссылке: он принадлежит записи удаления, а та лежит в
+                // отброшенной ветке и её текст будет срезан при следующей
+                // правке. Ссылка на срезанное место — это битый документ.
+                let at = self.added.len() as u32;
+                let piece: Vec<u8> = self
+                    .added
+                    .get(text as usize..text as usize + len as usize)
+                    .unwrap_or_default()
+                    .to_vec();
+                self.added.extend_from_slice(&piece);
+                // Запоминаем конец фантомного текста: хвост нельзя резать
+                // ниже этой точки, иначе сегмент останется ссылаться на
+                // срезанное место.
+                self.phantom.push(at + len);
+                // Запись в историю не нужна: эта правка лишь возвращает
+                // документ к состоянию до удаления.
+                self.current.apply_insert(anchor, at, len, u32::MAX)?;
+                Ok(())
+            }
+        }
     }
 
     /// Сколько раз буфер брал снапшот — для бенчей и диагностики.
@@ -387,6 +484,7 @@ impl Buffer {
         let history = self.file.as_ref().map(|_| self.collect_history());
         self.original = text;
         self.added.clear();
+        self.phantom.clear();
         self.arena.reset();
         self.current.reset_to_single_leaf(crate::segment::Segment {
             record: crate::arena::ORIGINAL_ID,
@@ -404,19 +502,19 @@ impl Buffer {
         Ok(())
     }
 
-    /// История в виде байт: оба стека и тексты вставок.
+    /// История в виде байт: активная ветка, redo-ветка и тексты.
     ///
-    /// Собирается целиком по стекам от самой старой записи к самой новой, и в
-    /// том же порядке, в каком их читает [`Buffer::restore_history`].
+    /// Активная ветка идёт от корня к текущей вершине — в том же порядке, в
+    /// каком их читает [`Buffer::restore_history`].
     fn collect_history(&self) -> crate::history::History {
         let mut undo = crate::history::Bytes::new();
-        for &id in self.arena.undo_stack() {
+        for &id in &self.arena.path() {
             if let Some(record) = self.arena.get(id) {
                 write_one(&mut undo, record);
             }
         }
         let mut redo = crate::history::Bytes::new();
-        for &id in self.arena.redo_stack() {
+        for id in self.arena.redo_path() {
             if let Some(record) = self.arena.get(id) {
                 write_one(&mut redo, record);
             }
@@ -450,41 +548,38 @@ impl Buffer {
 
     /// Пересборка `Current` линейным проходом по активным записям `undo`.
     fn rebuild(&mut self) -> Result<(), Error> {
-        let records = self
-            .arena
-            .undo_stack()
+        let path = self.arena.path();
+        let records = path
             .iter()
             .filter_map(|&id| self.arena.get(id).map(|r| (id, *r)));
         self.current.rebuild(self.original.len() as u32, records)?;
         Ok(())
     }
 
-    /// Новая правка при непустом `redo`: стек отменённых записей очищается.
+    /// Новая правка отбрасывает redo-ветку.
     ///
-    /// Тексты отменённых вставок не удаляются — `Added` обрезается по хвосту,
-    /// и следующая вставка перезаписывает это место. Отменялись самые поздние
-    /// вставки, поэтому их тексты лежат в самом конце и хвост достаточно
+    /// Тексты отменённых правок не удаляются — `added` обрезается по хвосту,
+    /// и следующая правка перезаписывает это место. Отменялись самые поздние
+    /// правки, поэтому их тексты лежат в самом конце и хвост достаточно
     /// срезать: ни удаления, ни перемещения памяти.
     ///
-    /// Слоты записей в пуле арены не переиспользуются: идентификатор записи
-    /// стабилен, на него ссылаются сегменты.
-    ///
-    /// Стек `redo` очищается на месте: забирать его через `mem::take` значило
-    /// бы угнать вектор в локальную переменную и уронить вместе с ней —
-    /// аллокация и освобождение на каждой правке после отмены.
+    /// Слоты вершин переиспользуются: отброшенная ветка больше не нужна, и её
+    /// вершины уходят в свободный список.
     fn discard_redo_with_cleanup(&mut self) {
-        if self.arena.redo_stack().is_empty() {
-            return;
-        }
-        let tail = self
-            .arena
-            .redo_stack()
-            .iter()
-            .filter_map(|&id| self.arena.get(id))
-            .filter_map(Record::text)
-            .min();
-        self.arena.clear_redo();
-        if let Some(off) = tail {
+        // Ветка обрезается с хвоста текста: обход по детям возвращает
+        // наименьшее смещение, с которого текст больше никому не нужен.
+        let tail = self.arena.discard_child();
+        // Текст, вставленный отменой удаления, резать нельзя: на него уже
+        // ссылаются живые сегменты, а его запись лежит в отброшенной ветке.
+        // Хвост уходит не ниже конца этого текста.
+        let keep = self.phantom.iter().copied().max();
+        self.phantom.clear();
+        let cut = match (tail, keep) {
+            (Some(tail), Some(keep)) => Some(tail.max(keep)),
+            (tail, None) => tail,
+            (None, _) => None,
+        };
+        if let Some(off) = cut {
             self.added.truncate(off as usize);
         }
     }

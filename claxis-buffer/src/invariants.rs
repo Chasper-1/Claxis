@@ -285,9 +285,9 @@ fn arena_chains_blocks_without_losing_records() {
     // Сброс возвращает арену к первому блоку, переиспользуя его буфер.
     arena.reset();
     assert_eq!(arena.len(), 0);
-    assert!(arena.undo_stack().is_empty());
+    assert!(arena.path().is_empty());
     assert_eq!(
-        arena.push(Record::delete(0, 1)),
+        arena.push(Record::delete(0, 1, 0)),
         1,
         "нумерация начинается заново"
     );
@@ -336,8 +336,8 @@ fn record_len_and_text_accessors() {
     let rec = buf.record(id).unwrap();
     assert_eq!(rec.len(), 1);
     assert!(
-        rec.text().is_none(),
-        "удаление текста не добавляет, значит ссылки быть не должно"
+        rec.text().is_some(),
+        "удаление помнит вырезанный текст: без него отменять нечем"
     );
 }
 

@@ -12,8 +12,13 @@ pub const DEFAULT_DEPTH: u32 = MAX_DEPTH;
 pub enum Record {
     /// Вставка. `text` — ссылка на вставленный текст в `Added`.
     Insert { anchor: u32, head: u32, text: u32 },
-    /// Удаление. Текста не добавляет, поэтому текста в записи нет.
-    Delete { anchor: u32, head: u32 },
+    /// Удаление. `text` — ссылка на удалённый текст в `Removed`.
+    ///
+    /// Раньше текста в записи не было: удалённые байты лежали на месте, но
+    /// ссылок на них в дереве уже не оставалось. Теперь отмена удаления
+    /// обходится одной операцией, и для этого нужно помнить, что именно было
+    /// вырезано. Платит ровно те же 16 байт: третье поле уже было.
+    Delete { anchor: u32, head: u32, text: u32 },
 }
 
 impl Record {
@@ -25,10 +30,11 @@ impl Record {
         }
     }
 
-    pub fn delete(anchor: u32, len: u32) -> Self {
+    pub fn delete(anchor: u32, len: u32, text: u32) -> Self {
         Record::Delete {
             anchor,
             head: anchor + len,
+            text,
         }
     }
 
@@ -55,11 +61,10 @@ impl Record {
         self.len() == 0
     }
 
-    /// Ссылка на текст вставки для `Insert`.
+    /// Ссылка на текст: в `Added` для вставки, в `Removed` для удаления.
     pub fn text(&self) -> Option<u32> {
         match self {
-            Record::Insert { text, .. } => Some(*text),
-            Record::Delete { .. } => None,
+            Record::Insert { text, .. } | Record::Delete { text, .. } => Some(*text),
         }
     }
 }
@@ -81,12 +86,29 @@ pub const ORIGINAL_ID: RecordId = 0;
 /// только отменённые записи.
 #[derive(Debug)]
 pub struct Arena {
-    /// Блоки записей. Каждый имеет ёмкость записи в `capacity`.
-    blocks: Vec<Vec<Record>>,
-    /// Ёмкость одного блока в записях.
+    /// Вершины истории, по индексу — ссылка на вершину.
+    ///
+    /// Вершина несёт запись правки и две ссылки: на родителя и на ребёнка.
+    /// Стеков нет: отмена — шаг к родителю, повтор — шаг к ребёнку. Два стека
+    /// занимали бы столько же памяти, но теряли путь, откуда пришли.
+    nodes: Vec<Node>,
+    /// Свободные слоты: индексы вершин, которые больше не нужны.
+    free: Vec<RecordId>,
+    /// Вершина, в которой мы находимся: её запись — последняя применённая.
+    current: RecordId,
+    /// Ёмкость одного блока вершин.
     capacity: usize,
-    undo: Vec<RecordId>,
-    redo: Vec<RecordId>,
+}
+
+/// Вершина истории.
+#[derive(Clone, Copy, Debug)]
+struct Node {
+    /// Запись правки, которой вершина достигнута.
+    record: Record,
+    /// Предыдущая вершина. `None` — корень, до первой правки.
+    parent: Option<RecordId>,
+    /// Следующая вершина: куда возвращает повтор.
+    child: Option<RecordId>,
 }
 
 impl Default for Arena {
@@ -104,15 +126,19 @@ impl Arena {
     pub fn new(depth: u32) -> Self {
         debug_assert!((1..=MAX_DEPTH).contains(&depth));
         let capacity = depth as usize;
-        // Первый слот первого блока зарезервирован под Original (ORIGINAL_ID)
-        // — под него кладётся пустышка, и он не используется.
-        let mut blocks = vec![Vec::with_capacity(capacity)];
-        blocks[0].push(Record::Delete { anchor: 0, head: 0 });
+        let mut nodes = Vec::with_capacity(capacity);
+        // Корень без записи: до первой правки отменять нечего. Он же занимает
+        // слот 0, поэтому первая правка получает идентификатор 1.
+        nodes.push(Node {
+            record: Record::delete(0, 0, 0),
+            parent: None,
+            child: None,
+        });
         Self {
-            blocks,
+            nodes,
+            free: Vec::new(),
+            current: ORIGINAL_ID,
             capacity,
-            undo: Vec::with_capacity(capacity),
-            redo: Vec::new(),
         }
     }
 
@@ -121,49 +147,112 @@ impl Arena {
         self.capacity
     }
 
-    /// Кладёт запись в текущий блок (новый, если тот полон) и в `undo`.
+    /// Сделать запись текущей вершиной истории.
     ///
-    /// Блоков в арене всегда хотя бы один: он создаётся в `new` и `reset`
-    /// ничего не удаляет насовсем. Поэтому обращения идут через `first_mut`
-    /// и `last_mut`, без паники на «должно существовать».
+    /// Новая правка отбрасывает redo-ветку: ребёнок текущей вершины
+    /// заменяется, и отброшенная ветка становится недостижимой из корня.
     pub fn push(&mut self, record: Record) -> RecordId {
-        if self
-            .blocks
-            .last_mut()
-            .is_none_or(|last| last.len() >= self.capacity)
-        {
-            self.blocks.push(Vec::with_capacity(self.capacity));
-        }
-        let block = self.blocks.len() - 1;
-        let slot = self.blocks[block].len();
-        self.blocks[block].push(record);
-        let id = block as RecordId * self.capacity as RecordId + slot as RecordId;
-        self.undo.push(id);
+        let id = self.alloc();
+        let parent = self.current;
+        self.nodes[id as usize] = Node {
+            record,
+            parent: Some(parent),
+            child: None,
+        };
+        self.nodes[parent as usize].child = Some(id);
+        self.current = id;
         id
     }
 
+    /// Запись вершины.
     pub fn get(&self, id: RecordId) -> Option<&Record> {
         if id == ORIGINAL_ID {
             return None;
         }
-        let block = (id / self.capacity as RecordId) as usize;
-        let slot = (id % self.capacity as RecordId) as usize;
-        self.blocks.get(block)?.get(slot)
+        self.nodes.get(id as usize).map(|n| &n.record)
     }
 
-    /// Сколько записей записано (без зарезервированного нулевого слота).
+    /// Вершина, в которой мы находимся.
+    pub fn current(&self) -> RecordId {
+        self.current
+    }
+
+    /// Шаг назад: запись текущей вершины отменяется, курсор идёт к родителю.
+    pub fn undo(&mut self) -> Option<RecordId> {
+        let id = self.current;
+        let parent = self.nodes[id as usize].parent?;
+        self.current = parent;
+        Some(id)
+    }
+
+    /// Шаг вперёд: возвращаемся к ребёнку и применяем его запись.
+    pub fn redo(&mut self) -> Option<RecordId> {
+        let child = self.nodes[self.current as usize].child?;
+        self.current = child;
+        Some(child)
+    }
+
+    /// Отбросить redo-ветку и обрезать `Removed` по хвосту.
+    ///
+    /// Отброшенная ветка — это путь от текущей вершины по детям. Тексты
+    /// удалений, которые она накопила, больше никому не понадобятся, и
+    /// хвост достаточно срезать: ни удаления, ни перемещения памяти.
+    pub fn discard_child(&mut self) -> Option<u32> {
+        let mut tail = None;
+        let mut cursor = self.nodes[self.current as usize].child;
+        while let Some(id) = cursor {
+            let node = self.nodes[id as usize];
+            // Текст держат обе записи: вставка кладёт свой, удаление —
+            // вырезанный. Хвост срезается по наименьшему из них.
+            if let Some(text) = node.record.text() {
+                tail = Some(tail.map_or(text, |t: u32| t.min(text)));
+            }
+            // Отрезаем ветку на ходу: дальше по ней не пойдут.
+            self.release(id);
+            cursor = node.child;
+        }
+        self.nodes[self.current as usize].child = None;
+        tail
+    }
+
+    /// Отпустить слот вершины в свободные.
+    fn release(&mut self, id: RecordId) {
+        self.free.push(id);
+    }
+
+    /// Взять свободный слот или выделить новый.
+    fn alloc(&mut self) -> RecordId {
+        match self.free.pop() {
+            Some(id) => id,
+            None => {
+                self.nodes.push(Node {
+                    record: Record::delete(0, 0, 0),
+                    parent: None,
+                    child: None,
+                });
+                (self.nodes.len() - 1) as RecordId
+            }
+        }
+    }
+
+    /// Сколько записей записано (без корня).
     pub fn len(&self) -> usize {
-        self.blocks.iter().map(Vec::len).sum::<usize>() - 1
+        self.nodes.len() - 1
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Свободных мест в текущем блоке.
+    /// Сколько записей ещё поместится без снапшота.
+    ///
+    /// Считаются живые вершины, а не занятые слоты: отброшенная redo-ветка
+    /// места не занимает, её слоты уже в свободном списке.
     pub fn remaining_records(&self) -> usize {
-        let used = self.blocks.last().map_or(0, Vec::len);
-        self.capacity - used
+        // Живых вершин столько, сколько занято слотов минус свободные:
+        // отброшенная redo-ветка места не занимает.
+        let live = self.nodes.len() - self.free.len();
+        self.capacity.saturating_sub(live)
     }
 
     /// Ёмкость одного блока в записях.
@@ -173,95 +262,86 @@ impl Arena {
 
     /// Сколько блоков выделено.
     pub fn block_count(&self) -> usize {
-        self.blocks.len()
+        self.nodes.len().div_ceil(self.capacity).max(1)
     }
 
     /// Ёмкость пула записанных записей.
     pub fn record_capacity(&self) -> usize {
-        self.blocks.iter().map(Vec::capacity).sum()
+        self.nodes.capacity()
     }
 
-    /// Верхняя запись `undo` переезжает в `redo`.
-    pub fn undo(&mut self) -> Option<RecordId> {
-        let id = self.undo.pop()?;
-        self.redo.push(id);
-        Some(id)
+    /// Путь от текущей вершины по детям: отброшенная redo-ветка.
+    pub fn redo_path(&self) -> Vec<RecordId> {
+        let mut out = Vec::new();
+        let mut cursor = self.nodes[self.current as usize].child;
+        while let Some(id) = cursor {
+            out.push(id);
+            cursor = self.nodes.get(id as usize).and_then(|n| n.child);
+        }
+        out
     }
 
-    /// Верхняя запись `redo` возвращается в `undo`.
-    pub fn redo(&mut self) -> Option<RecordId> {
-        let id = self.redo.pop()?;
-        self.undo.push(id);
-        Some(id)
+    /// Отладочный снимок вершин: для тестов дерева истории.
+    pub fn debug_nodes(&self) -> Vec<(Option<RecordId>, Option<RecordId>, bool)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.parent, n.child, i as RecordId == self.current))
+            .collect()
     }
 
-    /// Очистить redo-ветку на месте, без перемещения вектора.
+    /// Путь от корня до текущей вершины: записи по порядку применения.
     ///
-    /// Ёмкость стека сохраняется и используется следующей веткой отмены —
-    /// освобождать и потом запрашивать память заново незачем.
-    pub fn clear_redo(&mut self) {
-        self.redo.clear();
-    }
-
-    pub fn undo_stack(&self) -> &[RecordId] {
-        &self.undo
-    }
-
-    pub fn redo_stack(&self) -> &[RecordId] {
-        &self.redo
+    /// Нужен для пересборки дерева сегментов и для сохранения снапшота.
+    pub fn path(&self) -> Vec<RecordId> {
+        let mut out = Vec::with_capacity(self.len());
+        let mut cursor = self.current;
+        while cursor != ORIGINAL_ID {
+            out.push(cursor);
+            cursor = match self.nodes.get(cursor as usize).and_then(|n| n.parent) {
+                Some(p) => p,
+                None => break,
+            };
+        }
+        out.reverse();
+        out
     }
 
     /// Заменить историю целиком: восстановление после снапшота.
     ///
     /// Записи приходят уже разобранными и упорядоченными по времени, поэтому
-    /// идентификаторы просто идут подряд, как при обычной правке. Не
-    /// разбираем здесь ничего: формат истории знает только буфер.
+    /// вершины просто идут подряд и связываются родителем. Идентификаторы
+    /// совпадают с порядком: этого требует `Record`, в которой ссылки на
+    /// записи записаны как есть.
     pub fn restore(&mut self, undo: Vec<Record>, redo: Vec<Record>) {
-        self.blocks.truncate(1);
-        let first = &mut self.blocks[0];
-        first.clear();
-        // Слот 0 занят под `Original`, как и в `new`.
-        first.push(Record::Delete { anchor: 0, head: 0 });
-        self.undo.clear();
-        self.redo.clear();
+        self.reset();
         for record in undo {
-            let id = self.push_raw(record);
-            self.undo.push(id);
+            self.push(record);
         }
+        // Отброшенная ветка вешается на текущую вершину: повтор после
+        // перезапуска должен работать так же, как до него.
+        let mut cursor = self.current;
         for record in redo {
-            let id = self.push_raw(record);
-            self.redo.push(id);
+            let id = self.alloc();
+            self.nodes[id as usize] = Node {
+                record,
+                parent: Some(cursor),
+                child: None,
+            };
+            self.nodes[cursor as usize].child = Some(id);
+            cursor = id;
         }
     }
 
-    /// Положить запись в следующий свободный слот, не трогая стеки.
-    fn push_raw(&mut self, record: Record) -> RecordId {
-        if self
-            .blocks
-            .last()
-            .is_none_or(|last| last.len() >= self.capacity)
-        {
-            self.blocks.push(Vec::with_capacity(self.capacity));
-        }
-        let block = self.blocks.len() - 1;
-        let slot = self.blocks[block].len();
-        self.blocks[block].push(record);
-        block as RecordId * self.capacity as RecordId + slot as RecordId
-    }
-
-    /// Полный сброс после снапшота: блоки и стеки очищаются.
-    ///
-    /// Первый блок **переиспользуется**: он держит в себе буфер на
-    /// `capacity` записей, и выбрасывать его с последующим новым выделением
-    /// незачем — снапшот берётся часто, а лишние `free`/`malloc` на 128КБ
-    /// ничего не дают. Дополнительные блоки освобождаются: держать их память
-    /// после схлопывания незачем.
+    /// Полный сброс после снапшота: история начинается заново.
     pub fn reset(&mut self) {
-        self.blocks.truncate(1);
-        let first = &mut self.blocks[0];
-        first.clear();
-        first.push(Record::Delete { anchor: 0, head: 0 });
-        self.undo.clear();
-        self.redo.clear();
+        self.nodes.truncate(1);
+        self.nodes[0] = Node {
+            record: Record::delete(0, 0, 0),
+            parent: None,
+            child: None,
+        };
+        self.free.clear();
+        self.current = ORIGINAL_ID;
     }
 }
