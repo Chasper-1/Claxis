@@ -9,6 +9,7 @@ use std::io::Write;
 use crate::api::buffer;
 use crate::api::config;
 use crate::api::i18n;
+use crate::api::rope;
 use crate::api::store;
 use crate::api::term;
 use crate::main_messages;
@@ -42,7 +43,8 @@ pub fn parse(args: &[String]) -> Command {
 /// Каждое сообщение выводится с настоящими значениями вместо имён в
 /// фигурных скобках, иначе переводчик не поймёт, что подставляется.
 pub fn print_messages(out: &mut impl Write) -> std::io::Result<()> {
-    let crates: [(&str, Vec<(&str, String)>); 6] = [
+    let crates: [(&str, Vec<(&str, String)>); 7] = [
+        ("claxis-rope", rope::messages::samples()),
         ("claxis-buffer", buffer::messages::samples()),
         ("claxis-store", store::messages::samples()),
         ("claxis-term", term::messages::samples()),
@@ -137,6 +139,7 @@ mod tests {
     #[test]
     fn every_crate_has_samples() {
         // Пустой список — значит сообщения забыли перечислить.
+        assert!(!rope::messages::samples().is_empty());
         assert!(!buffer::messages::samples().is_empty());
         assert!(!store::messages::samples().is_empty());
         assert!(!term::messages::samples().is_empty());

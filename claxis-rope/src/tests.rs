@@ -1,0 +1,504 @@
+//! Проверки документа: тот же функционал, что у `claxis-buffer`.
+//!
+//! Главная проверка — сверка с эталоном на длинной случайной
+//! последовательности правок с перемешиванием отмен и повторов. Эталон —
+//! обычная строка, и любое расхождение означает битый документ.
+
+use crate::document::{DEFAULT_DEPTH, Document, Error, Record};
+
+fn d(text: &str) -> Document {
+    Document::new(text.as_bytes())
+}
+
+/// Генератор чисел: детерминированный, чтобы падение воспроизводилось.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % n as u64) as usize
+    }
+}
+
+#[test]
+fn insert_splits_and_reads_back() {
+    let mut doc = d("abcdefghij");
+    doc.insert(5, b"XXXXX").unwrap();
+    assert_eq!(doc.read(), b"abcdeXXXXXfghij");
+}
+
+#[test]
+fn delete_cuts_middle() {
+    let mut doc = d("The quick brown fox");
+    doc.delete(4, 6).unwrap();
+    assert_eq!(doc.read(), b"The brown fox");
+}
+
+#[test]
+fn replace_is_delete_then_insert() {
+    let mut doc = d("The quick brown fox");
+    doc.replace(4, 5, b"slow").unwrap();
+    assert_eq!(doc.read(), b"The slow brown fox");
+}
+
+#[test]
+fn undo_and_redo_walk_the_history() {
+    let mut doc = d("abc");
+    doc.insert(3, b"XY").unwrap();
+    assert_eq!(doc.read(), b"abcXY");
+
+    doc.undo().unwrap().expect("есть что отменять");
+    assert_eq!(doc.read(), b"abc");
+    assert!(doc.undo().unwrap().is_none(), "дальше нечего");
+
+    doc.redo().unwrap().expect("есть что повторять");
+    assert_eq!(doc.read(), b"abcXY");
+    assert!(doc.redo().unwrap().is_none());
+}
+
+#[test]
+fn undo_of_delete_puts_the_text_back() {
+    // Главное: удалённый текст должен вернуться целиком и на своё место.
+    let mut doc = d("The quick brown fox");
+    doc.delete(4, 5).unwrap();
+    assert_eq!(doc.read(), b"The  brown fox");
+    doc.undo().unwrap().expect("удаление отменяемо");
+    assert_eq!(doc.read(), b"The quick brown fox");
+}
+
+#[test]
+fn undo_of_a_wide_delete_puts_everything_back() {
+    // Удаление через границы листьев — самый частый случай потери текста.
+    let mut doc = d("aaa bbb ccc ddd");
+    for i in 0..20 {
+        doc.insert(i as u32, b"xyz").unwrap();
+    }
+    let before = doc.read();
+    doc.delete(5, 20).unwrap();
+    assert_ne!(doc.read(), before);
+    doc.undo().unwrap().expect("отменяемо");
+    assert_eq!(doc.read(), before, "широкое удаление вернулось не целиком");
+}
+
+#[test]
+fn a_new_edit_after_undo_drops_the_redo_branch() {
+    let mut doc = d("");
+    doc.insert(0, b"A").unwrap();
+    doc.insert(1, b"B").unwrap();
+    doc.undo().unwrap();
+    doc.undo().unwrap();
+    assert_eq!(doc.read(), b"");
+
+    doc.insert(0, b"X").unwrap();
+    assert_eq!(doc.read(), b"X");
+    assert!(doc.redo().unwrap().is_none(), "ветка отброшена");
+    assert_eq!(doc.read(), b"X");
+}
+
+#[test]
+fn repeated_undo_redo_keeps_the_document_intact() {
+    let mut doc = d("base");
+    for i in 0..10 {
+        doc.insert(i as u32, b"ab").unwrap();
+    }
+    for _ in 0..10 {
+        doc.delete(0, 1).unwrap();
+    }
+    let end = doc.read();
+    // Двадцать правок: десять вставок и десять удалений. Отменить надо все.
+    for _ in 0..20 {
+        doc.undo().unwrap().expect("отменяемо");
+    }
+    assert_eq!(doc.read(), b"base");
+    assert!(doc.undo().unwrap().is_none());
+    for _ in 0..20 {
+        doc.redo().unwrap().expect("повторяемо");
+    }
+    assert_eq!(doc.read(), end);
+    assert!(doc.redo().unwrap().is_none());
+}
+
+#[test]
+fn out_of_range_is_an_error_not_a_panic() {
+    let mut doc = d("abc");
+    assert!(doc.delete(2, 5).is_err());
+    assert!(doc.insert(99, b"x").is_err());
+    assert_eq!(doc.read(), b"abc");
+}
+
+#[test]
+fn history_depth_has_no_ceiling() {
+    // Потолка нет: история растёт вместе с правками, память добирается сама.
+    // Отвергается только ноль — с ним снимался бы снапшот после каждой правки.
+    assert!(Document::with_depth(b"x", 0).is_err());
+    assert!(Document::with_depth(b"x", 1).is_ok());
+    assert!(Document::with_depth(b"x", u32::MAX).is_ok());
+
+    // И правок может быть больше, чем любое разумное число.
+    let mut doc = Document::with_depth(b"x", u32::MAX / 2).unwrap();
+    for i in 0..50_000u32 {
+        doc.insert(0, b"y").unwrap();
+        let _ = i;
+    }
+    assert_eq!(doc.path().len(), 50_000, "история росла вместе с правками");
+    assert_eq!(doc.snapshots_taken(), 0, "снапшот брать было не пора");
+}
+
+#[test]
+fn a_snapshot_carries_text_and_history() {
+    // Снапшот уносит состояние целиком: и текст, и историю. Без истории
+    // документ верный, а отменять нечего.
+    let (text, history) = {
+        let mut doc = d("abc");
+        doc.set_sink(
+            std::path::PathBuf::from("/tmp/d.txt"),
+            Box::new(crate::document::NullSink),
+        );
+        doc.insert(3, b"XY").unwrap();
+        doc.delete(0, 1).unwrap();
+        // История снимается до снапшота: снимок её уводит, это его смысл.
+        let history = crate::history::History::capture(&doc);
+        let text = doc.read();
+        doc.snapshot();
+        assert_eq!(doc.read(), text, "снапшот текст не меняет");
+        (text, history)
+    };
+    assert_eq!(text, b"bcXY");
+
+    let mut back = history.restore().expect("снапшот разбирается");
+    assert_eq!(back.read(), text);
+    back.undo().unwrap().expect("история восстановлена");
+    assert_eq!(back.read(), b"abcXY");
+}
+
+#[test]
+fn a_snapshot_fires_when_history_runs_out() {
+    // Глубина 4: первый слот под корень, значит полезных записей три.
+    let mut doc = Document::with_depth(b"abc", 4).unwrap();
+    doc.set_sink(
+        std::path::PathBuf::from("/tmp/d.txt"),
+        Box::new(crate::document::NullSink),
+    );
+    for i in 0..3 {
+        doc.insert(i as u32, b"x").unwrap();
+    }
+    assert_eq!(doc.snapshots_taken(), 0);
+    doc.insert(0, b"y").unwrap();
+    assert_eq!(doc.snapshots_taken(), 1, "арена кончилась, снапшот снят");
+}
+
+#[test]
+fn reading_is_consistent_after_many_edits() {
+    let mut doc = d("");
+    for i in 0..300u32 {
+        doc.insert(doc.len(), b"line\n").unwrap();
+        if i % 3 == 0 && doc.len() > 10 {
+            doc.delete(0, 5).unwrap();
+        }
+    }
+    let full = doc.read();
+    assert_eq!(doc.read_range(0, doc.len()), full);
+    assert_eq!(doc.read_range(5, 5), Vec::<u8>::new());
+    let mid = doc.read_range(2, 10);
+    assert_eq!(mid, full[2..10].to_vec());
+}
+
+#[test]
+fn the_path_is_the_active_branch_in_order() {
+    let mut doc = d("");
+    doc.insert(0, b"A").unwrap();
+    doc.insert(1, b"B").unwrap();
+    doc.undo().unwrap();
+    doc.insert(1, b"C").unwrap();
+
+    let path = doc.path();
+    assert_eq!(path.len(), 2);
+    assert!(matches!(path[0], Record::Insert { head: 1, .. }));
+    assert!(matches!(path[1], Record::Insert { head: 2, .. }));
+    assert_eq!(doc.read(), b"AC");
+}
+
+#[test]
+fn against_a_reference_string_with_undo_redo_mix() {
+    // Эталон — обычная строка. Случайная последовательность правок, отмен и
+    // повторов: любое расхождение означает битый документ.
+    for seed in 0..8u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x2545F4914F6CDD1D).wrapping_add(7));
+        let mut doc = Document::new(b"seed");
+        let mut text = String::from("seed");
+        let mut history: Vec<Op> = Vec::new();
+        let mut cursor = 0usize;
+
+        for step in 0..1200 {
+            let roll = rng.below(10);
+            if roll < 5 && !text.is_empty() {
+                let pos = rng.below(text.len());
+                let len = rng.below((text.len() - pos).min(40)) + 1;
+                let removed = text.as_bytes()[pos..pos + len].to_vec();
+                doc.delete(pos as u32, len as u32).unwrap();
+                text.replace_range(pos..pos + len, "");
+                history.truncate(cursor);
+                history.push(Op::Delete { pos, removed });
+                cursor = history.len();
+            } else if roll < 8 {
+                let pos = rng.below(text.len() + 1);
+                let piece: String = (0..rng.below(30) + 1)
+                    .map(|_| (b'a' + rng.below(26) as u8) as char)
+                    .collect();
+                doc.insert(pos as u32, piece.as_bytes()).unwrap();
+                text.insert_str(pos, &piece);
+                history.truncate(cursor);
+                history.push(Op::Insert {
+                    pos,
+                    text: piece.into_bytes(),
+                });
+                cursor = history.len();
+            } else if roll == 8 && cursor > 0 {
+                cursor -= 1;
+                doc.undo()
+                    .unwrap()
+                    .expect("история должна была быть непустой");
+                match &history[cursor] {
+                    Op::Insert { pos, text: t } => text.replace_range(*pos..*pos + t.len(), ""),
+                    Op::Delete { pos, removed } => {
+                        text.insert_str(*pos, &String::from_utf8_lossy(removed))
+                    }
+                }
+            } else if cursor < history.len() {
+                doc.redo()
+                    .unwrap()
+                    .expect("повтор должен был быть доступен");
+                match &history[cursor] {
+                    Op::Insert { pos, text: t } => {
+                        text.insert_str(*pos, &String::from_utf8_lossy(t))
+                    }
+                    Op::Delete { pos, removed } => {
+                        text.replace_range(*pos..*pos + removed.len(), "")
+                    }
+                }
+                cursor += 1;
+            }
+
+            assert_eq!(
+                doc.read(),
+                text.as_bytes(),
+                "seed {seed} step {step}: текст разошёлся"
+            );
+            assert_eq!(doc.len() as usize, text.len(), "seed {seed} step {step}");
+            assert_eq!(doc.path().len(), cursor, "seed {seed} step {step}");
+        }
+    }
+}
+
+enum Op {
+    Insert { pos: usize, text: Vec<u8> },
+    Delete { pos: usize, removed: Vec<u8> },
+}
+
+#[test]
+fn tree_stays_balanced_under_churn() {
+    // Баланс держится при любом порядке правок: иначе спуск перестаёт быть
+    // логарифмическим.
+    let mut doc = Document::new(b"a");
+    let mut rng = Rng(99);
+    for _ in 0..2000 {
+        let pos = rng.below(doc.len() as usize + 1) as u32;
+        if rng.below(2) == 0 && !doc.read().is_empty() {
+            let len = rng.below(doc.len() as usize) + 1;
+            let _ = doc.delete(pos.min(doc.len() - 1), len as u32);
+        } else {
+            doc.insert(pos, b"xy").unwrap();
+        }
+    }
+    let (nodes, height, worst_skew, height_mismatch) = doc.tree_debug_stats();
+    let leaves = doc.leaves().len();
+    if leaves > 0 {
+        // Сплошное дерево из n листьев всегда ровно 2n − 1 узлов.
+        assert_eq!(nodes, leaves * 2 - 1, "дерево не сплошное");
+    }
+    assert_eq!(
+        height_mismatch, 0,
+        "высота в узле разошлась с настоящей: баланс считается не по тому"
+    );
+    assert!(worst_skew <= 1, "перекос {worst_skew} при {nodes} узлах");
+    assert_eq!(height, doc.height(), "высота в корне не совпадает");
+    // Высота AVL: не больше примерно 1.44 от log2(листьев) плюс запас.
+    let bound = (leaves.max(2) as f64).log2() * 1.5 + 2.0;
+    assert!(
+        height as f64 <= bound,
+        "высота {height} при {leaves} листьях превышает {bound:.1}"
+    );
+}
+
+#[test]
+fn memory_does_not_run_away() {
+    let mut doc = Document::new(b"");
+    for i in 0..8000u32 {
+        doc.insert(i % (doc.len() + 1), b"xyz").unwrap();
+    }
+    let m = doc.memory();
+    eprintln!(
+        "ROPE 8000 правок | листьев {:>5} | узлов {:>5}/{} | вершин {:>5} | текст {:>6}/{} | ПУЛ {:>7} | вершины {:>7} | всего {:>7}",
+        m.leaves,
+        m.nodes,
+        m.capacity,
+        m.versions,
+        m.text_len,
+        m.text_capacity,
+        m.tree_bytes(),
+        m.versions * m.version_size,
+        m.tree_bytes() + m.text_capacity + m.versions * m.version_size,
+    );
+    assert_eq!(doc.read().len(), 24_000);
+    assert_eq!(Document::new(b"").history_depth(), DEFAULT_DEPTH);
+}
+
+#[test]
+fn a_snapshot_survives_a_random_history() {
+    // Снапшот снимается в произвольный момент под нагрузкой: восстановленный
+    // документ должен совпасть и текстом, и историей.
+    for seed in 0..4u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
+        let mut doc = Document::new("начало".as_bytes());
+        for _ in 0..200 {
+            let len = doc.len() as usize;
+            let pos = rng.below(len + 1) as u32;
+            if rng.below(2) == 0 {
+                let _ = doc.delete(
+                    pos.min(doc.len().saturating_sub(1)),
+                    1 + rng.below(20) as u32,
+                );
+            } else {
+                doc.insert(pos, b"qq").unwrap();
+            }
+            if rng.below(7) == 0 {
+                let _ = doc.undo().unwrap();
+            }
+        }
+        let text = doc.read();
+        let history = crate::history::History::capture(&doc);
+        let mut back = history.restore().expect("снапшот разбирается");
+        assert_eq!(back.read(), text, "seed {seed}: текст разошёлся");
+        assert_eq!(
+            back.path().len(),
+            doc.path().len(),
+            "seed {seed}: история разошлась"
+        );
+
+        // Отмена в восстановленном документе идёт по той же ветке.
+        for _ in 0..doc.path().len() {
+            back.undo().unwrap().expect("история восстановлена");
+        }
+        assert_eq!(
+            back.read(),
+            "начало".as_bytes(),
+            "seed {seed}: откат до начала не сошёлся"
+        );
+    }
+}
+
+#[test]
+fn a_foreign_blob_is_not_read_as_our_history() {
+    // Прежний буфер писал в ту же колонку свой формат. Такой блоб обязан быть
+    // распознан как чужой, а не разобран как родной.
+    let mut old = Vec::new();
+    old.extend_from_slice(b"BUFH");
+    old.extend_from_slice(&[0u8; 32]);
+    assert_eq!(
+        crate::history::History::decode(&old).unwrap_err(),
+        Error::NotOurHistory
+    );
+    assert!(crate::history::History::decode(&[]).is_err());
+}
+
+#[test]
+fn a_history_from_another_version_is_refused() {
+    let mut doc = d("abc");
+    doc.insert(3, b"XY").unwrap();
+    let history = crate::history::History::capture(&doc);
+    let mut bytes = history.as_bytes().to_vec();
+    bytes[4] = 99;
+    assert_eq!(
+        crate::history::History::decode(&bytes).unwrap_err(),
+        Error::UnknownHistoryVersion { version: 99 }
+    );
+}
+
+#[test]
+fn a_truncated_history_is_refused_not_panicked() {
+    // Снапшот может прийти битым: обрыв, обрезка, чужой мусор. Всё это —
+    // ошибка с текстом, а не паника.
+    let mut doc = d("abc");
+    doc.insert(3, b"XY").unwrap();
+    doc.delete(0, 1).unwrap();
+    let history = crate::history::History::capture(&doc);
+    let bytes = history.as_bytes().to_vec();
+    for cut in 1..bytes.len() {
+        let err = crate::history::History::decode(&bytes[..cut]);
+        assert!(err.is_err(), "обрыв на {cut} байте разобрался как целый");
+    }
+}
+
+#[test]
+fn an_unknown_record_kind_is_refused() {
+    let mut doc = d("abc");
+    doc.insert(3, b"XY").unwrap();
+    let mut bytes = crate::history::History::capture(&doc).as_bytes().to_vec();
+    let last = bytes.len() - 13;
+    bytes[last] = 7;
+    assert_eq!(
+        crate::history::History::decode(&bytes).unwrap_err(),
+        Error::UnknownRecordKind { kind: 7 }
+    );
+}
+
+#[test]
+fn errors_speak_through_the_catalog() {
+    // Ошибка не несёт готовой строки: текст собирает каталог, иначе её нельзя
+    // будет перевести.
+    let e = Error::OutOfBounds {
+        anchor: 10,
+        len: 5,
+        doc_len: 12,
+    };
+    let text = e.message(&crate::messages::En);
+    assert!(
+        text.contains("15"),
+        "в тексте должно быть место значения: {text}"
+    );
+    assert!(
+        text.contains("12"),
+        "в тексте должно быть место значения: {text}"
+    );
+    assert_eq!(e.text(), text);
+    assert_eq!(format!("{e}"), text);
+}
+
+#[test]
+fn the_history_survives_the_database_round_trip() {
+    // Ровно то, что делает редактор: снапшот уходит в база байтами и приходит
+    // байтами же.
+    let mut doc = d("начало");
+    for i in 0..50u32 {
+        if i % 3 == 0 {
+            doc.insert(i % (doc.len() + 1), b"pq").unwrap();
+        } else if !doc.is_empty() {
+            let at = i % doc.len();
+            doc.delete(at, 1).unwrap();
+        }
+    }
+    let text = doc.read();
+    let stored = crate::history::History::capture(&doc).as_bytes().to_vec();
+
+    let back = crate::history::History::decode(&stored)
+        .expect("блоб из базы разбирается")
+        .restore()
+        .expect("документ собирается");
+    assert_eq!(back.read(), text);
+    assert_eq!(back.path().len(), doc.path().len());
+}

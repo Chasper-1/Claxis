@@ -13,7 +13,7 @@ pub trait Messages {
     /// Файл документа не прочитан.
     fn read_file_failed(&self, path: &str, reason: &str) -> String;
     /// Ошибка буфера: делегирует в каталог буфера.
-    fn buffer_error(&self, error: &crate::api::buffer::Error) -> String;
+    fn buffer_error(&self, error: &crate::api::rope::Error) -> String;
     /// Каталог конфига недоступен: `{path}`, `{reason}`.
     fn config_dir_failed(&self, path: &str, reason: &str) -> String;
     /// Сломано столько проблем, что работать не с чем: `{issues}`.
@@ -47,8 +47,8 @@ impl Messages for En {
         )
     }
 
-    fn buffer_error(&self, error: &crate::api::buffer::Error) -> String {
-        error.message(&crate::api::buffer::En)
+    fn buffer_error(&self, error: &crate::api::rope::Error) -> String {
+        error.message(&crate::api::rope::En)
     }
 
     fn config_dir_failed(&self, path: &str, reason: &str) -> String {

@@ -467,21 +467,20 @@ fn every_default_is_present_and_documented() {
     use crate::defaults::buffer;
 
     // Ключ не пустой, комментарий полный — у всех настроек.
-    for (name, key, comment) in [(
+    let (name, key, comment) = (
         "Buffer.history_depth",
         buffer::HISTORY_DEPTH.key,
         buffer::HISTORY_DEPTH.comment,
-    )] {
-        assert!(!key.is_empty(), "{name}: ключ не может быть пустым");
-        assert!(
-            !comment.is_empty(),
-            "{name}: без комментария непонятно, что это"
-        );
-        assert!(
-            comment.contains('.'),
-            "{name}: комментарий должен быть полным"
-        );
-    }
+    );
+    assert!(!key.is_empty(), "{name}: ключ не может быть пустым");
+    assert!(
+        !comment.is_empty(),
+        "{name}: без комментария непонятно, что это"
+    );
+    assert!(
+        comment.contains('.'),
+        "{name}: комментарий должен быть полным"
+    );
 
     // Какая настройка подключена, а какая задумана — проверяется при компиляции.
     //

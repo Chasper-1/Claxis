@@ -1,22 +1,23 @@
-//! Связывает буфер с хранилищем снапшотов.
+//! Связывает документ с хранилищем снапшотов.
 //!
-//! Оба крейта по отдельности ничего не знают друг о друге: `claxis-buffer`
-//! отдаёт текст приёмнику и не знает, куда он уйдёт, `claxis-store` умеет
-//! только складывать и доставать. Соединяются они здесь — это и есть работа
-//! маршрутизатора.
+//! Оба крейта по отдельности ничего не знают друг о друге: `claxis-rope`
+//! отдаёт текст и историю приёмнику и не знает, куда они уйдут,
+//! `claxis-store` умеет только складывать и доставать байты. Соединяются они
+//! здесь — это и есть работа маршрутизатора.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::api::buffer::{Buffer, HISTORY_DEPTH, History, SnapshotSink};
+use crate::api::rope::defaults::buffer::HISTORY_DEPTH;
+use crate::api::rope::{Document as Rope, History, SnapshotSink};
 use crate::api::store::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::messages::Messages;
 
 /// Что пошло не так в сессии.
 #[derive(Debug)]
 pub enum SessionError {
-    /// Буфер не создан: глубина истории недопустима.
-    Buffer(crate::api::buffer::Error),
+    /// Документ не создан: глубина истории недопустима.
+    Buffer(crate::api::rope::Error),
     /// Хранилище не открылось.
     Store { path: String, reason: String },
     /// Файл документа не прочитан.
@@ -57,28 +58,29 @@ impl std::error::Error for SessionError {}
 
 /// Приёмник снапшота, пишущий в хранилище.
 ///
-/// Это тот самый стык: буфер отдаёт текст, дальше он уходит в sqlite.
+/// Это тот самый стык: документ отдаёт текст и историю, дальше они уходят в
+/// sqlite байтами, в том формате, в котором их собрал rope.
 #[derive(Debug)]
 struct StoreSink {
     store: SnapshotStore,
 }
 
 impl SnapshotSink for StoreSink {
-    fn accept(&mut self, file: &Path, text: &[u8], history: &History) {
+    fn accept(&mut self, file: &Path, text: &[u8], history: &[u8]) {
         // Ошибка сохранения снапшота не ломает правку: потеря кеша не должна
         // стоить пользователю работы.
         //
         // История идёт вместе с текстом: без неё после перезапуска отменять
         // было бы нечего, то есть снапшот сохранил бы половину работы.
-        let _ = self.store.put(file, text, &history.encode());
+        let _ = self.store.put(file, text, history);
     }
 }
 
-/// Открытый документ: буфер плюс привязка к файлу.
+/// Открытый документ: rope плюс привязка к файлу.
 #[derive(Debug)]
 pub struct Document {
     path: PathBuf,
-    buffer: Buffer,
+    buffer: Rope,
 }
 
 impl Document {
@@ -87,8 +89,8 @@ impl Document {
         &self.path
     }
 
-    /// Буфер документа.
-    pub fn buffer(&mut self) -> &mut Buffer {
+    /// Документ: правки, чтение и история.
+    pub fn buffer(&mut self) -> &mut Rope {
         &mut self.buffer
     }
 
@@ -277,7 +279,7 @@ impl Session {
             }
         };
         let mut buffer =
-            Buffer::with_history_depth(text, self.history_depth).map_err(SessionError::Buffer)?;
+            Rope::with_depth(text, self.history_depth).map_err(SessionError::Buffer)?;
         // Снапшот под документом копит не только текст, но и историю правок.
         // Восстанавливаем её: после перезапуска отменять должно быть можно,
         // иначе половина работы пользователя просто исчезает.
@@ -285,7 +287,12 @@ impl Session {
             && let Ok(store) = self.store.reopen()
             && let Ok(Some(snapshot)) = store.latest(&path)
         {
-            let _ = buffer.restore_history(&History::decode(&snapshot.history));
+            // Чужой или битый блоб историю не восстановит — и не должен:
+            // текст-то из базы верный, терять его из-за испорченного хвоста
+            // незачем.
+            if let Ok(restored) = History::decode(&snapshot.history).and_then(|h| h.restore()) {
+                buffer = restored;
+            }
         }
         // Приёмник вешается только если снапшоты положено хранить. Иначе
         // буфер работает без диска и настройка `persist` что-то значит.

@@ -8,6 +8,7 @@ pub mod buffer;
 pub mod config;
 pub mod i18n;
 pub mod input;
+pub mod rope;
 pub mod store;
 pub mod term;
 pub mod text;

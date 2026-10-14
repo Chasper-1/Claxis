@@ -1,5 +1,5 @@
 [workspace]
-members = ["claxis-text", "claxis-buffer", "claxis-store", "claxis-input", "claxis-term", "claxis-i18n", "claxis-theme", "claxis-config"]
+members = ["claxis-text", "claxis-buffer", "claxis-store", "claxis-input", "claxis-term", "claxis-i18n", "claxis-theme", "claxis-rope", "claxis-config"]
 
 [package]
 name = "Claxis"
@@ -19,6 +19,7 @@ claxis-config = { path = "claxis-config" }                # Claxis
 claxis-term = { path = "claxis-term" }                    # Claxis
 
 claxis-buffer = { path = "claxis-buffer" }                # claxis-config
+claxis-rope = { path = "claxis-rope" }                      # Claxis
 claxis-store = { path = "claxis-store" }                  # claxis-config
 claxis-input = { path = "claxis-input" }                  # claxis-config
 claxis-i18n = { path = "claxis-i18n" }                    # claxis-config

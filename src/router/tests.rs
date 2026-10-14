@@ -193,16 +193,16 @@ fn unreadable_file_reports_error() {
 #[test]
 fn buffer_and_store_do_not_know_each_other() {
     // Стык сделан в роутере: крейты не зависят друг от друга.
-    // Проверяем, что буфер работает и без приёмника вообще.
-    let mut buf = crate::api::buffer::Buffer::new("начало".as_bytes());
+    // Проверяем, что документ работает и без приёмника вообще.
+    let mut doc = crate::api::rope::Document::new("начало".as_bytes());
     for _ in 0..9000 {
-        buf.insert(buf.len(), b"x").unwrap();
+        doc.insert(doc.len(), b"x").unwrap();
     }
     assert!(
-        buf.snapshots_taken() > 0,
+        doc.snapshots_taken() > 0,
         "снапшоты берутся и без приёмника"
     );
-    assert_eq!(buf.read().len(), 9000 + "начало".len());
+    assert_eq!(doc.read().len(), 9000 + "начало".len());
 }
 
 #[test]
@@ -338,7 +338,7 @@ fn defaults_come_from_crate_settings() {
     let session = Session::open_at(tmp.dir.clone(), crate::api::store::KEEP).unwrap();
     assert_eq!(
         session.history_depth(),
-        crate::api::buffer::HISTORY_DEPTH.value
+        crate::api::rope::defaults::buffer::HISTORY_DEPTH.value
     );
     assert_eq!(session.persist(), crate::api::store::PERSIST);
 }
@@ -1169,7 +1169,7 @@ fn history_survives_reopening_the_document() {
         doc.buffer().delete(0, 1).unwrap();
         assert_eq!(doc.text(), b"bcXY\n");
         // Снапшот уносит историю на диск.
-        doc.buffer().snapshot().unwrap();
+        doc.buffer().snapshot();
     }
 
     // Новый процесс читает тот же файл.
@@ -1184,4 +1184,80 @@ fn history_survives_reopening_the_document() {
         .unwrap()
         .expect("отмена доступна после перезапуска");
     assert_eq!(doc.text(), b"abcXY\n");
+}
+
+#[test]
+fn a_foreign_history_blob_does_not_break_the_file() {
+    // В базе может лежать блоб прежнего буфера: он писал в ту же колонку свой
+    // формат. Такой блоб историю не восстановит, но файл обязан открыться, а
+    // текст — оказаться на месте.
+    let tmp = Temp::new("foreign-blob");
+    let file = tmp.dir().join("doc.txt");
+    std::fs::write(&file, "abc\n").unwrap();
+
+    let session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    {
+        let mut store = session.store().reopen().unwrap();
+        let mut old = b"BUFH".to_vec();
+        old.extend_from_slice(&[0u8; 40]);
+        store.put(&file, b"abc\n", &old).unwrap();
+    }
+
+    let session2 = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    let mut doc = session2.open_file(&file).unwrap();
+    assert_eq!(doc.text(), b"abc\n", "текст из снапшота на месте");
+    // Истории нет — отменять нечего, и это не ошибка.
+    assert!(doc.buffer().undo().unwrap().is_none());
+    doc.buffer().insert(3, b"Z").unwrap();
+    assert_eq!(doc.text(), b"abcZ\n", "документ рабочий");
+}
+
+#[test]
+fn a_rope_snapshot_is_written_in_the_rope_format() {
+    // Что уходит в базу, обязан быть форматом rope: с магией и версией.
+    // Иначе следующий запуск не поймёт, что там лежит.
+    let tmp = Temp::new("rope-format");
+    let file = tmp.dir().join("doc.txt");
+    std::fs::write(&file, "abc\n").unwrap();
+
+    let session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    {
+        let mut doc = session.open_file(&file).unwrap();
+        doc.buffer().insert(3, b"XY").unwrap();
+        doc.buffer().snapshot();
+    }
+
+    let store = session.store().reopen().unwrap();
+    let snapshot = store.latest(&file).unwrap().expect("снапшот записан");
+    assert_eq!(&snapshot.history[..4], b"CLRP", "магия формата rope");
+    assert!(snapshot.history.len() > 5, "в блобе есть версия");
+
+    // И разбирается тем же кодом, без потерь.
+    let restored = crate::api::rope::History::decode(&snapshot.history)
+        .expect("блоб из базы — наш")
+        .restore()
+        .expect("документ собирается");
+    assert_eq!(restored.read(), b"abcXY\n");
+}
+
+#[test]
+fn a_document_works_after_more_edits_than_the_history_depth() {
+    // Потолка у истории нет: правок может быть больше, чем задано глубиной.
+    // Снапшот просто снимется по исчерпании и работа продолжится.
+    let tmp = Temp::new("deep-history");
+    let file = tmp.dir().join("doc.txt");
+    std::fs::write(&file, "x\n").unwrap();
+
+    let session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 4).unwrap();
+    let mut doc = session.open_file(&file).unwrap();
+    for _ in 0..500 {
+        let at = doc.buffer().len() - 1;
+        doc.buffer().insert(at, b"y").unwrap();
+    }
+    // Файл из двух байт плюс пятьсот вставок по одному байту.
+    assert_eq!(doc.text().len(), 502);
+    assert!(
+        doc.buffer().snapshots_taken() > 0,
+        "глубина 4 при 500 правках обязана была кончиться"
+    );
 }

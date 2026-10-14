@@ -564,21 +564,6 @@ fn differential_against_reference_string() {
 
 // ── История переживает снапшот ───────────────────────────────────────────────
 
-/// Приёмник, который помнит последнюю принятую историю.
-struct Keeper(std::cell::RefCell<Option<crate::history::History>>);
-
-impl std::fmt::Debug for Keeper {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Keeper")
-    }
-}
-
-impl crate::snapshot::SnapshotSink for Keeper {
-    fn accept(&mut self, _file: &std::path::Path, _text: &[u8], history: &crate::history::History) {
-        *self.0.borrow_mut() = Some(history.clone());
-    }
-}
-
 /// Буфер со снапшотом, который помнит историю.
 fn with_keeper(
     text: &str,
