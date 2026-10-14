@@ -194,13 +194,22 @@ impl TableDef {
 }
 
 /// Настройки, значение которых — таблица.
-pub const TABLES: &[TableDef] = &[TableDef {
-    file: ConfigFile::Global,
-    path: "General.hold",
-    kind: Kind::U16,
-    default: &[("alt", "200"), ("ctrl", "200")],
-    comment: "Keys with two meanings, and how long a press counts as held, in milliseconds.",
-}];
+pub const TABLES: &[TableDef] = &[
+    TableDef {
+        file: ConfigFile::Global,
+        path: "General.hold",
+        kind: Kind::U16,
+        default: &[("alt", "200"), ("ctrl", "200")],
+        comment: "Keys with two meanings, and how long a press counts as held, in milliseconds.",
+    },
+    TableDef {
+        file: ConfigFile::Global,
+        path: "Savescreen.Setting.history_usage",
+        kind: Kind::Str,
+        default: &[("percent", "{used}"), ("number", "{remaining}")],
+        comment: "How history usage is written: percent or number. remaining = limit - used.",
+    },
+];
 
 /// Найти табличную настройку по файлу и пути.
 pub fn find_table(file: ConfigFile, path: &str) -> Option<&'static TableDef> {
@@ -259,6 +268,59 @@ pub const KEYS: &[KeyDef] = &[
     // Ключ, который появился в схеме раньше, чем код, который его читает.
     // Он есть и понятен, но по умолчанию не применяется: пользователь может
     // раскомментировать его, и тогда он заработает.
+    KeyDef {
+        file: ConfigFile::Files,
+        path: "General.snapshots_interval",
+        default: "300",
+        kind: Kind::U16,
+        comment: "Seconds between snapshots of one document. Zero means snapshot on every edit.",
+        active: true,
+    },
+    // ── экран статистики после сохранения ────────────────────────────────
+    //
+    // Как в демо-конфиге: своя секция с подсекциями, а не плоские ключи в
+    // `General`. Экран — не режим правки, а отдельная сущность со своими
+    // настройками, и прятать их в общий список значит потерять этот смысл.
+    KeyDef {
+        file: ConfigFile::Global,
+        path: "Savescreen.include",
+        default: "true",
+        kind: Kind::Bool,
+        comment: "Show the statistics screen after saving.",
+        active: true,
+    },
+    KeyDef {
+        file: ConfigFile::Global,
+        path: "Savescreen.mode",
+        default: "fullscreen",
+        kind: Kind::Str,
+        comment: "How the statistics screen shows: one of fullscreen, message, window.",
+        active: true,
+    },
+    KeyDef {
+        file: ConfigFile::Global,
+        path: "Savescreen.Statistic.input_char",
+        default: "true",
+        kind: Kind::Bool,
+        comment: "Show how many characters were typed.",
+        active: true,
+    },
+    KeyDef {
+        file: ConfigFile::Global,
+        path: "Savescreen.Statistic.delete_char",
+        default: "true",
+        kind: Kind::Bool,
+        comment: "Show how many characters were deleted.",
+        active: true,
+    },
+    KeyDef {
+        file: ConfigFile::Global,
+        path: "Savescreen.Statistic.history_usage",
+        default: "true",
+        kind: Kind::Bool,
+        comment: "Show how much of the undo history is used.",
+        active: true,
+    },
     KeyDef {
         file: ConfigFile::Files,
         path: "General.snapshots_compression",
@@ -361,6 +423,17 @@ mod tests {
         "git",
     ];
 
+    /// Секции, которые не режимы: у них своя причина быть.
+    ///
+    /// Экран статистики — не режим правки, а отдельная сущность со своими
+    /// подсекциями, и в списке режимов его быть не должно.
+    const NOT_MODES: &[&str] = &[
+        "Savescreen",
+        "Savescreen.Statistic",
+        "Savescreen.Setting",
+        "Savescreen.Setting.history_usage",
+    ];
+
     #[test]
     fn every_section_is_a_mode_that_exists() {
         // Секция конфига называет режим. Режима, которого нет, быть не может:
@@ -368,7 +441,7 @@ mod tests {
         // пользователь гадает, что оно значит.
         for key in KEYS {
             let section = key.section();
-            if section == GENERAL {
+            if section == GENERAL || NOT_MODES.contains(&section) {
                 continue;
             }
             assert!(
@@ -386,7 +459,7 @@ mod tests {
         // или выдумка — плохое имя, каким бы коротким оно ни было.
         for key in KEYS {
             let section = key.section();
-            if section == GENERAL {
+            if section == GENERAL || NOT_MODES.contains(&section) {
                 continue;
             }
             assert!(
@@ -408,8 +481,13 @@ mod tests {
         // навсегда, если бы его не убрали. Внутри режима режимов не бывает.
         for key in KEYS {
             let parts: Vec<&str> = key.path.split('.').collect();
+            let limit = if NOT_MODES.contains(&key.section()) {
+                4
+            } else {
+                2
+            };
             assert!(
-                parts.len() <= 2,
+                parts.len() <= limit,
                 "{}: лишний уровень вложенности: {}",
                 key.path,
                 key.path
@@ -444,7 +522,9 @@ mod tests {
         // В `[General]` режимов не бывает, вложенность там лишняя.
         for key in KEYS {
             let depth = key.section().split('.').count();
-            if key.is_general() {
+            if NOT_MODES.contains(&key.section()) {
+                assert!(depth <= 3, "ключ {} слишком глубок", key.path);
+            } else if key.is_general() {
                 assert_eq!(depth, 1, "ключ {} лишней вложенности в General", key.path);
             } else {
                 assert!(depth <= 2, "ключ {} слишком глубок для режима", key.path);

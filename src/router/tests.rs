@@ -4,8 +4,9 @@
 //! снапшотов на диске и переживают перезапуск редактора.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use crate::router::{Session, SessionError};
+use crate::router::session::{FixedClock, Session, SessionError};
 
 /// Отдельный каталог под каждый тест: базы не делятся.
 struct Temp {
@@ -60,16 +61,22 @@ impl Drop for Temp {
     }
 }
 
-/// Набрать текст, пока глубина истории не кончится и не сработает снапшот.
+/// Набрать текст и снять снапшот, дождавшись интервала на поддельных часах.
 fn type_until_snapshot(session: &Session, file: &std::path::Path, chunk: &str) -> usize {
     let mut doc = session.open_file(file).unwrap();
+    // Пока часы стоят, снапшот не снимется ни при какой правке.
+    doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
     let mut i = 0usize;
-    while doc.buffer().snapshots_taken() == 0 {
+    while doc.buffer().snapshots_taken() == 0 && i < 40 {
         let pos = doc.buffer().len();
         doc.buffer().insert(pos, chunk.as_bytes()).unwrap();
+        doc.snapshot_if_due();
         i += 1;
-        assert!(i < 100_000, "снапшот так и не сработал");
     }
+    // Пять минут прошли — снимок снимает всё, что набрано.
+    doc.set_clock(Box::new(FixedClock::at(Duration::from_secs(600))));
+    doc.snapshot_if_due();
+    assert_eq!(doc.buffer().snapshots_taken(), 1, "снапшот не сработал");
     i
 }
 
@@ -87,8 +94,8 @@ fn snapshot_reaches_disk() {
     assert!(!snaps.is_empty(), "снапшот должен оказаться в базе");
     assert_eq!(
         snaps[0].text,
-        "abc".repeat(typed - 1).into_bytes(),
-        "в базе лежит текст на момент снапшота, то есть без последнего куска"
+        "abc".repeat(typed).into_bytes(),
+        "в базе лежит всё, что набрано к моменту снапшота"
     );
 }
 
@@ -105,7 +112,7 @@ fn snapshots_survive_restart() {
         let session = tmp.session(3);
         let snaps = session.store().list(&file).unwrap();
         assert!(!snaps.is_empty(), "после перезапуска снапшоты должны быть");
-        assert_eq!(snaps[0].text.len(), (typed - 1) * 2);
+        assert_eq!(snaps[0].text.len(), typed * 2);
     }
 }
 
@@ -157,13 +164,17 @@ fn keep_limit_applies_through_session() {
     let session = tmp.short_session(2, 8);
 
     let mut doc = session.open_file(&file).unwrap();
+    // Часы стоят: ни одна из сорока вставок не успевает за интервал.
+    doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
     for _ in 0..40 {
         let end = doc.buffer().len();
         doc.buffer().insert(end, b"z").unwrap();
+        doc.snapshot_if_due();
     }
-    assert!(
-        doc.buffer().snapshots_taken() > 1,
-        "при глубине 8 за 40 вставок снапшот обязан был сработать"
+    assert_eq!(
+        doc.buffer().snapshots_taken(),
+        0,
+        "за сорок вставок подряд снапшот не заслужили"
     );
     drop(doc);
 
@@ -198,10 +209,13 @@ fn buffer_and_store_do_not_know_each_other() {
     for _ in 0..9000 {
         doc.insert(doc.len(), b"x").unwrap();
     }
-    assert!(
-        doc.snapshots_taken() > 0,
-        "снапшоты берутся и без приёмника"
+    assert_eq!(
+        doc.snapshots_taken(),
+        0,
+        "документ сам снимает только по прямой просьбе"
     );
+    doc.snapshot();
+    assert!(doc.snapshots_taken() > 0, "снапшот берётся и без приёмника");
     assert_eq!(doc.read().len(), 9000 + "начало".len());
 }
 
@@ -310,15 +324,14 @@ fn persist_false_keeps_snapshots_in_memory_only() {
     let session = tmp.no_persist_session(3, 8);
 
     let mut doc = session.open_file(&file).unwrap();
+    doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
     for _ in 0..40 {
         let end = doc.buffer().len();
         doc.buffer().insert(end, b"z").unwrap();
     }
-    // Снапшоты берутся, текст в буфере есть.
-    assert!(
-        doc.buffer().snapshots_taken() > 1,
-        "снапшоты должны браться"
-    );
+    doc.snapshot();
+    // Снапшот взят, текст в буфере есть.
+    assert_eq!(doc.buffer().snapshots_taken(), 1, "снапшот взят");
     assert_eq!(doc.buffer().len(), 40, "правки на месте");
     drop(doc);
 
@@ -1241,23 +1254,149 @@ fn a_rope_snapshot_is_written_in_the_rope_format() {
 }
 
 #[test]
-fn a_document_works_after_more_edits_than_the_history_depth() {
-    // Потолка у истории нет: правок может быть больше, чем задано глубиной.
-    // Снапшот просто снимется по исчерпании и работа продолжится.
-    let tmp = Temp::new("deep-history");
+fn a_snapshot_is_taken_by_the_clock_and_not_by_the_edit_count() {
+    // Снапшот снимает время. Правок может быть сколько угодно, и лимит на
+    // них не влияет: интервал честно отсчитывается часами.
+    let tmp = Temp::new("snapshot-by-time");
     let file = tmp.dir().join("doc.txt");
     std::fs::write(&file, "x\n").unwrap();
 
-    let session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 4).unwrap();
+    let mut session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    session.set_snapshot_interval(Duration::from_secs(300));
+
+    // Часы стоят: сколько правок ни сделай, пяти минут не прошло.
     let mut doc = session.open_file(&file).unwrap();
+    doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
     for _ in 0..500 {
         let at = doc.buffer().len() - 1;
         doc.buffer().insert(at, b"y").unwrap();
+        doc.snapshot_if_due();
     }
-    // Файл из двух байт плюс пятьсот вставок по одному байту.
-    assert_eq!(doc.text().len(), 502);
-    assert!(
-        doc.buffer().snapshots_taken() > 0,
-        "глубина 4 при 500 правках обязана была кончиться"
+    assert_eq!(doc.text().len(), 502, "правки на месте");
+    assert_eq!(doc.buffer().snapshots_taken(), 0, "время не шло");
+
+    // Часы пошли: пять минут прошло, и первая же проверка снимает снапшот.
+    doc.set_clock(Box::new(FixedClock::at(Duration::from_secs(299))));
+    doc.snapshot_if_due();
+    assert_eq!(doc.buffer().snapshots_taken(), 0, "до интервала рано");
+
+    doc.set_clock(Box::new(FixedClock::at(Duration::from_secs(300))));
+    doc.snapshot_if_due();
+    assert_eq!(
+        doc.buffer().snapshots_taken(),
+        1,
+        "интервал вышел, снимок есть"
     );
+
+    // И отсчёт начинается заново: следующий снимок ещё не через пять минут.
+    doc.set_clock(Box::new(FixedClock::at(Duration::from_secs(420))));
+    doc.snapshot_if_due();
+    assert_eq!(doc.buffer().snapshots_taken(), 1, "отсчёт пошёл заново");
+}
+
+#[test]
+fn the_interval_comes_from_the_settings() {
+    // Интервал из конфига доходит до сессии и до документа.
+    let tmp = Temp::new("interval-setting");
+    let file = tmp.file("a.rs");
+    let mut session = tmp.session(3);
+    session.set_snapshot_interval(Duration::from_secs(60));
+    assert_eq!(session.snapshot_interval(), Duration::from_secs(60));
+
+    let doc = session.open_file(&file).unwrap();
+    assert_eq!(doc.snapshot_interval(), Duration::from_secs(60));
+}
+
+#[test]
+fn the_statistics_counts_what_the_user_did() {
+    // Счётчик живёт в документе сессии: он видит правки, документ — нет.
+    let tmp = Temp::new("stats");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+
+    doc.insert(0, "абв".as_bytes()).unwrap();
+    doc.insert(3, "г".as_bytes()).unwrap();
+    doc.delete(0, 1).unwrap();
+    // «абв» — три буквы, а не шесть байт.
+    assert_eq!(doc.stats().input_chars, 4);
+    assert_eq!(doc.stats().deleted_chars, 1);
+    assert_eq!(doc.stats().edits, 3);
+}
+
+#[test]
+fn the_statistics_count_only_the_time_a_key_was_held() {
+    // Секунды между нажатиями — это размышление, а не печать.
+    let tmp = Temp::new("presses");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+
+    doc.note_press(Duration::from_millis(70));
+    // Между нажатиями прошло двадцать секунд: они сюда не попадают.
+    doc.note_press(Duration::from_millis(130));
+    doc.note_press(Duration::ZERO);
+
+    assert_eq!(doc.stats().presses, 3, "нажатий три");
+    assert_eq!(
+        doc.stats().pressed,
+        Duration::from_millis(200),
+        "время заняли сами нажатия"
+    );
+}
+
+#[test]
+fn history_usage_never_passes_a_hundred() {
+    let s = crate::router::session::Stats::default();
+    assert_eq!(
+        s.history_percent(900, 100),
+        100,
+        "процент упирается в сотню"
+    );
+    assert_eq!(
+        s.history_remaining(900, 100),
+        -800,
+        "остаток бывает отрицательным"
+    );
+    assert_eq!(s.history_percent(10, 0), 0, "без размера процент нулевой");
+    assert_eq!(s.history_percent(40, 100), 40);
+}
+
+#[test]
+fn the_statistics_screen_is_configurable() {
+    // Настройки экрана доходят из конфига до редактора.
+    let tmp = Temp::new("savescreen");
+    std::fs::write(
+        tmp.dir.join("config.toml"),
+        "[Savescreen]\ninclude = false\nmode = \"message\"\n",
+    )
+    .unwrap();
+    let editor = crate::router::Editor::open_in(&tmp.dir, &tmp.store).unwrap();
+    assert!(!editor.settings().savescreen_include, "экран выключен");
+    assert_eq!(editor.settings().savescreen_mode, "message");
+}
+
+#[test]
+fn the_history_usage_signature_is_an_inline_table() {
+    // Подписи истории лежат во встроенной таблице, а не плоскими ключами: их
+    // пишут и читают по именам `percent` и `number`.
+    let tmp = Temp::new("history-usage-table");
+    std::fs::write(
+        tmp.dir.join("config.toml"),
+        "[Savescreen.Setting]\nhistory_usage = { percent = \"{percent}\", number = \"{remaining}\" }\n",
+    )
+    .unwrap();
+    let editor = crate::router::Editor::open_in(&tmp.dir, &tmp.store).unwrap();
+    let settings = editor.settings();
+    assert_eq!(settings.savescreen_history_usage_percent, "{percent}");
+    assert_eq!(settings.savescreen_history_usage_number, "{remaining}");
+}
+
+#[test]
+fn the_history_signature_defaults_to_what_the_schema_says() {
+    let settings = crate::router::Settings::defaults();
+    assert!(settings.savescreen_include);
+    assert_eq!(settings.savescreen_mode, "fullscreen");
+    assert_eq!(settings.savescreen_history_usage_percent, "{used}");
+    assert_eq!(settings.savescreen_history_usage_number, "{remaining}");
 }

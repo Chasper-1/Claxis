@@ -7,9 +7,10 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::api::rope::defaults::buffer::HISTORY_DEPTH;
-use crate::api::rope::{Document as Rope, History, SnapshotSink};
+use crate::api::rope::{Document as Rope, Error as RopeError, History, SnapshotSink};
 use crate::api::store::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::messages::Messages;
 
@@ -76,11 +77,112 @@ impl SnapshotSink for StoreSink {
     }
 }
 
+/// Источник времени.
+///
+/// Отдельный тип, а не `Instant::now()` в коде: иначе проверить, что сработало
+/// правильно, можно было бы только ожиданием вживую.
+pub trait Clock: std::fmt::Debug {
+    /// Сколько прошло с начала работы процесса.
+    fn elapsed(&self) -> Duration;
+}
+
+/// Что собрано о работе над документом за сеанс.
+///
+/// Косметика: ничего из этого не влияет на правку и не решает за пользователя,
+/// что хорошо. Время нажатия — сумма промежутков «нажал — отпустил», а не время
+/// с открытия файла: секунды на размышление между нажатиями сюда не попадают.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Сколько байт введено.
+    pub input_chars: u64,
+    /// Сколько байт удалено.
+    pub deleted_chars: u64,
+    /// Сколько нажатий клавиш сделано.
+    pub presses: u64,
+    /// Сколько времени заняли сами нажатия.
+    pub pressed: Duration,
+    /// Сколько правок сделано.
+    pub edits: u64,
+}
+
+/// Сколько символов в куске байт.
+///
+/// Символов, а не байт: русская буква — два байта, и по байтам статистика
+/// врала бы вдвое на всём, кроме латиницы. Разбор делается на вставленном
+/// куске, он мелкий; если это не текст, считаются байты.
+fn chars(data: &[u8]) -> u64 {
+    match std::str::from_utf8(data) {
+        Ok(text) => text.chars().count() as u64,
+        Err(_) => data.len() as u64,
+    }
+}
+
+impl Stats {
+    /// Занято истории, процент. Больше сотни не бывает: сколько бы правок ни
+    /// сделано, сотня уже значит, что историю пора сбрасывать.
+    pub fn history_percent(&self, used: u32, limit: u32) -> u32 {
+        if limit == 0 {
+            return 0;
+        }
+        (used * 100 / limit).min(100)
+    }
+
+    /// Сколько записей истории ещё можно положить, без дна.
+    ///
+    /// Остаток бывает отрицательным, и это правда: история растёт по мере
+    /// правок, а не вмещается в отведённое заранее место.
+    pub fn history_remaining(&self, used: u32, limit: u32) -> i64 {
+        i64::from(limit) - i64::from(used)
+    }
+}
+
+/// Часы, которые двигает тест: ждать настоящие пять минут нельзя.
+#[derive(Clone, Copy, Debug)]
+pub struct FixedClock(pub Duration);
+
+impl FixedClock {
+    /// Часы, стоящие на указанной отметке.
+    pub fn at(at: Duration) -> Self {
+        Self(at)
+    }
+}
+
+impl Clock for FixedClock {
+    fn elapsed(&self) -> Duration {
+        self.0
+    }
+}
+
+/// Настоящие часы.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn elapsed(&self) -> Duration {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed()
+    }
+}
+
 /// Открытый документ: rope плюс привязка к файлу.
+///
+/// Время живёт здесь, а не в документе: снапшот — это решение сессии, у неё
+/// есть и документ, и хранилище. Сам документ про часы не знает и снимает
+/// снапшот только по прямой просьбе.
 #[derive(Debug)]
 pub struct Document {
     path: PathBuf,
     buffer: Rope,
+    /// Через сколько снимать следующий снапшот.
+    interval: Duration,
+    /// Сколько прошло с начала работы, когда снят последний снапшот.
+    last_snapshot: Duration,
+    /// Откуда берётся время.
+    clock: Box<dyn Clock>,
+    /// Что набрано за сеанс работы над этим документом.
+    stats: Stats,
 }
 
 impl Document {
@@ -98,7 +200,79 @@ impl Document {
     pub fn text(&self) -> Vec<u8> {
         self.buffer.read()
     }
+
+    /// Что собрано за сеанс: символы, нажатия, правки.
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
+    /// Вставить текст и посчитать введённые символы.
+    pub fn insert(&mut self, anchor: u32, data: &[u8]) -> Result<(), RopeError> {
+        self.buffer.insert(anchor, data)?;
+        self.stats.input_chars += chars(data);
+        self.stats.edits += 1;
+        Ok(())
+    }
+
+    /// Вырезать диапазон и посчитать удалённые символы.
+    pub fn delete(&mut self, anchor: u32, len: u32) -> Result<(), RopeError> {
+        self.buffer.delete(anchor, len)?;
+        self.stats.deleted_chars += u64::from(len);
+        self.stats.edits += 1;
+        Ok(())
+    }
+
+    /// Заменить диапазон: вставка и удаление одной операцией.
+    pub fn replace(&mut self, anchor: u32, len: u32, data: &[u8]) -> Result<(), RopeError> {
+        self.buffer.replace(anchor, len, data)?;
+        self.stats.input_chars += chars(data);
+        self.stats.deleted_chars += u64::from(len);
+        self.stats.edits += 1;
+        Ok(())
+    }
+
+    /// Записать одно нажатие вместе со временем, которое оно заняло.
+    ///
+    /// Нажатие без отпускания — обычное дело: палец на клавише или потерянное
+    /// событие. Такое нажатие засчитывается, но времени не добавляет.
+    pub fn note_press(&mut self, held: Duration) {
+        self.stats.presses += 1;
+        self.stats.pressed += held;
+    }
+
+    /// Через сколько после последнего снапшота снимать следующий.
+    pub fn snapshot_interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Подменить часы: тестам нужно время, которое они двигают сами.
+    ///
+    /// Отсчёт не сбрасывается: иначе перевести часы вперёд было бы нельзя —
+    /// документ решил бы, что только что снял снапшот.
+    pub fn set_clock(&mut self, clock: Box<dyn Clock>) {
+        self.clock = clock;
+    }
+
+    /// Снять снапшот, если с последнего прошло достаточно времени.
+    ///
+    /// Время, а не число правок: человек может править один и тот же абзац
+    /// десять минут, и снапшот каждые пять минут отдаст память обратно. И
+    /// наоборот — сто правок подряд за минуту снапшот не заслужили.
+    pub fn snapshot_if_due(&mut self) {
+        if self.clock.elapsed().saturating_sub(self.last_snapshot) >= self.interval {
+            self.snapshot();
+        }
+    }
+
+    /// Снять снапшот и отсчитать время заново.
+    pub fn snapshot(&mut self) {
+        self.buffer.snapshot();
+        self.last_snapshot = self.clock.elapsed();
+    }
 }
+
+/// Снапшот по умолчанию: раз в пять минут.
+pub const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Редакторская сессия: хранилище снапшотов и открытые документы.
 #[derive(Debug)]
@@ -109,6 +283,8 @@ pub struct Session {
     history_depth: u32,
     /// Писать ли снапшоты на диск. Из конфига.
     persist: bool,
+    /// Через сколько снимать следующий снапшот. Из конфига.
+    interval: Duration,
     /// Глубина, с которой сессия открыта и под которую созданы буферы.
     ///
     /// Отличается от `history_depth`, если конфиг поменяли на лету: буферы
@@ -161,6 +337,7 @@ impl Session {
             paths,
             history_depth,
             persist,
+            interval: DEFAULT_SNAPSHOT_INTERVAL,
             opened_depth: history_depth,
         })
     }
@@ -198,6 +375,17 @@ impl Session {
     /// Пишутся ли снапшоты на диск.
     pub fn persist(&self) -> bool {
         self.persist
+    }
+
+    /// Через сколько после последнего снапшота снимать следующий.
+    pub fn snapshot_interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Задать интервал между снапшотами. Применяется к документам, которые
+    /// откроются дальше; уже открытые держат то, что получили при открытии.
+    pub fn set_snapshot_interval(&mut self, interval: Duration) {
+        self.interval = interval;
     }
 
     /// Глубина истории из последнего прочитанного конфига.
@@ -304,6 +492,13 @@ impl Session {
             })?;
             buffer.set_sink(path.clone(), Box::new(StoreSink { store }));
         }
-        Ok(Document { path, buffer })
+        Ok(Document {
+            path,
+            buffer,
+            interval: self.interval,
+            last_snapshot: Duration::ZERO,
+            clock: Box::new(SystemClock),
+            stats: Stats::default(),
+        })
     }
 }

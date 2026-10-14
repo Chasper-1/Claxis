@@ -310,7 +310,6 @@ impl Document {
         if data.is_empty() {
             return Ok(());
         }
-        self.snapshot_if_needed()?;
         self.discard_redo();
         let start = self.text.len() as u32;
         self.text.extend_from_slice(data);
@@ -330,7 +329,6 @@ impl Document {
         if len == 0 {
             return Ok(());
         }
-        self.snapshot_if_needed()?;
         self.discard_redo();
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а
         // второго буфера быть не должно.
@@ -466,20 +464,9 @@ impl Document {
         }
     }
 
-    /// Сколько вершин ещё поместится без снапшота.
-    fn remaining(&self) -> u32 {
-        self.depth.saturating_sub(self.live_versions())
-    }
-
-    fn live_versions(&self) -> u32 {
+    /// Сколько записей истории занято.
+    pub fn history_used(&self) -> u32 {
         self.versions.len() as u32 - self.free.len() as u32
-    }
-
-    fn snapshot_if_needed(&mut self) -> Result<()> {
-        if self.remaining() == 0 {
-            self.snapshot();
-        }
-        Ok(())
     }
 
     // ── чтение ───────────────────────────────────────────────────────────
@@ -586,7 +573,7 @@ impl Document {
             node_size: Node::size(),
             text_len: self.text.len(),
             text_capacity: self.text.capacity(),
-            versions: self.live_versions() as usize,
+            versions: self.history_used() as usize,
             version_size: std::mem::size_of::<Version>(),
         }
     }

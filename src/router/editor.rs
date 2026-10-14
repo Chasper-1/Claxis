@@ -5,6 +5,7 @@
 //! уходит в буфер, `keep` и `persist` — в хранилище снапшотов.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::api::config::schema::ConfigFile;
 use crate::api::config::{Issue, generate};
@@ -178,13 +179,14 @@ impl Editor {
         // вместо редактора.
         let language_error = settings.load_language(config_dir).err();
         let theme_error = settings.check_theme(config_dir).err();
-        let session = Session::open_at_with(
+        let mut session = Session::open_at_with(
             store_dir,
             settings.snapshots_keep,
             settings.snapshots_persist,
             settings.history_depth,
         )
         .map_err(StartError::Session)?;
+        session.set_snapshot_interval(Duration::from_secs(u64::from(settings.snapshots_interval)));
 
         Ok(Self {
             settings,
@@ -201,12 +203,13 @@ impl Editor {
 
     /// Собрать редактор с готовыми настройками, без чтения файлов.
     pub fn with_settings(dir: impl AsRef<Path>, settings: Settings) -> Result<Self, SessionError> {
-        let session = Session::open_at_with(
+        let mut session = Session::open_at_with(
             dir.as_ref(),
             settings.snapshots_keep,
             settings.snapshots_persist,
             settings.history_depth,
         )?;
+        session.set_snapshot_interval(Duration::from_secs(u64::from(settings.snapshots_interval)));
         Ok(Self {
             session,
             settings,
@@ -275,6 +278,8 @@ impl Editor {
         // этом честно сообщаем.
         let language_error = settings.load_language(&self.config_dir).err();
         let theme_error = settings.check_theme(&self.config_dir).err();
+        self.session
+            .set_snapshot_interval(Duration::from_secs(u64::from(settings.snapshots_interval)));
         let applied = self.session.apply(&settings);
         self.settings = settings;
         self.issues = Vec::new();

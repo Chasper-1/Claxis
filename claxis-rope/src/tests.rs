@@ -177,19 +177,26 @@ fn a_snapshot_carries_text_and_history() {
 }
 
 #[test]
-fn a_snapshot_fires_when_history_runs_out() {
-    // Глубина 4: первый слот под корень, значит полезных записей три.
+fn history_never_snapshots_on_its_own() {
+    // Снапшот снимает время, а не число правок: документ сам ничего не решает
+    // и ждёт прямой просьбы.
     let mut doc = Document::with_depth(b"abc", 4).unwrap();
     doc.set_sink(
         std::path::PathBuf::from("/tmp/d.txt"),
         Box::new(crate::document::NullSink),
     );
-    for i in 0..3 {
+    for i in 0..100 {
         doc.insert(i as u32, b"x").unwrap();
     }
-    assert_eq!(doc.snapshots_taken(), 0);
-    doc.insert(0, b"y").unwrap();
-    assert_eq!(doc.snapshots_taken(), 1, "арена кончилась, снапшот снят");
+    assert_eq!(doc.snapshots_taken(), 0, "сто правок снапшота не заслужили");
+    assert_eq!(doc.path().len(), 100, "история росла вместе с правками");
+
+    doc.snapshot();
+    assert_eq!(doc.snapshots_taken(), 1, "по прямой просьбе снимается");
+    assert!(
+        doc.path().is_empty(),
+        "после снапшота история начинается заново"
+    );
 }
 
 #[test]

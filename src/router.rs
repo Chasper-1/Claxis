@@ -34,7 +34,7 @@
 //! | [`editor`] | всё вместе: то, с чего начинается запуск |
 
 mod editor;
-mod session;
+pub mod session;
 mod settings;
 
 pub use editor::{Editor, Reloaded, StartError};

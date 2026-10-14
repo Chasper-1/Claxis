@@ -86,10 +86,15 @@ pub fn ensure_files(
 pub fn render(file: ConfigFile, catalog: &claxis_i18n::Catalog) -> String {
     let mut out = String::new();
     let mut section = "";
+    // Секции, которые уже выведены: секция с встроенной таблицей может иметь
+    // и обычные ключи, и тогда она печатается дважды, а TOML такой файл не
+    // разбирает.
+    let mut shown: Vec<&str> = Vec::new();
 
     for key in KEYS.iter().filter(|k| k.file == file) {
         if key.section() != section {
             section = key.section();
+            shown.push(section);
             out.push_str(&format!("\n[{section}]\n\n"));
             out.push_str(&table_body(key.file, section, catalog));
         }
@@ -110,6 +115,19 @@ pub fn render(file: ConfigFile, catalog: &claxis_i18n::Catalog) -> String {
             out.push_str(&format!("#{} = {value}  # {comment}\n\n", key.key()));
         }
     }
+
+    // Секция может состоять только из встроенной таблицы: обычных ключей в
+    // ней нет, а сама настройка обязана попасть в файл, иначе пользователю
+    // нечем её настроить.
+    for table in schema::TABLES.iter().filter(|t| t.file == file) {
+        let table_section = section_prefix(table);
+        if shown.contains(&table_section) {
+            continue;
+        }
+        out.push_str(&format!("\n[{table_section}]\n\n"));
+        out.push_str(&table_body(file, table_section, catalog));
+        shown.push(table_section);
+    }
     out
 }
 
@@ -127,7 +145,12 @@ fn table_body(file: schema::ConfigFile, section: &str, catalog: &claxis_i18n::Ca
     let pairs: Vec<String> = table
         .default
         .iter()
-        .map(|(k, v)| format!("{k} = {v}"))
+        // Строковое значение пишется в кавычках, иначе это будет не строка,
+        // а имя: `percent = {used}` разбор отвергнет.
+        .map(|(k, v)| match table.kind {
+            schema::Kind::Str => format!("{k} = \"{v}\""),
+            _ => format!("{k} = {v}"),
+        })
         .collect();
     // Inline table обязана быть в одну строку: многострочная невалидна по
     // спецификации TOML, и разбор её отвергнет.
@@ -444,6 +467,12 @@ mod tests {
             "General.history_depth",
             "General.snapshots_keep",
             "General.snapshots_persist",
+            "General.snapshots_interval",
+            "Savescreen.include",
+            "Savescreen.mode",
+            "Savescreen.Statistic.input_char",
+            "Savescreen.Statistic.delete_char",
+            "Savescreen.Statistic.history_usage",
         ];
         for key in KEYS {
             let should = READ.contains(&key.path);
@@ -644,3 +673,4 @@ mod sn9 {
         );
     }
 }
+

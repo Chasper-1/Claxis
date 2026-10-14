@@ -17,6 +17,30 @@ use crate::api::i18n::load::load;
 use crate::api::i18n::{Catalog, DEFAULT_LANGUAGE, Error as LangError};
 use crate::api::theme::DEFAULT_THEME;
 
+/// Путь настройки, значение которой — встроенная таблица подписей истории.
+const HISTORY_USAGE_TABLE: &str = "Savescreen.Setting.history_usage";
+
+/// Значение ключа из встроенной таблицы, иначе значение по умолчанию.
+fn table_string(config: &Config, key: &str, path: &str) -> String {
+    let Some(def) = schema::find_table(ConfigFile::Global, path) else {
+        return String::new();
+    };
+    config
+        .table(def)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        // Таблица отдаёт значение как оно в TOML, вместе с кавычками: подпись
+        // нужна сама по себе, без них.
+        .map(|(_, v)| v.trim_matches('"').to_string())
+        .or_else(|| {
+            def.default
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+        .unwrap_or_default()
+}
+
 /// Настройки редактора вместе с языком интерфейса.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -26,6 +50,22 @@ pub struct Settings {
     pub snapshots_keep: u8,
     /// Писать ли снапшоты на диск между запусками.
     pub snapshots_persist: bool,
+    /// Через сколько секунд снимать снапшот. Ноль — на каждой правке.
+    pub snapshots_interval: u16,
+    /// Показывать ли экран статистики после сохранения.
+    pub savescreen_include: bool,
+    /// Как показывать: `fullscreen`, `message`, `window`.
+    pub savescreen_mode: String,
+    /// Показывать ли введённые символы.
+    pub savescreen_input_char: bool,
+    /// Показывать ли удалённые символы.
+    pub savescreen_delete_char: bool,
+    /// Показывать ли занятую историю.
+    pub savescreen_history_usage: bool,
+    /// Подпись занятой истории в процентах. Места: `{used}`, `{percent}`.
+    pub savescreen_history_usage_percent: String,
+    /// Подпись занятой истории числами. Места: `{used}`, `{remaining}`.
+    pub savescreen_history_usage_number: String,
     /// Активный язык.
     pub language: String,
     /// Каталог перевода для этого языка.
@@ -41,10 +81,19 @@ impl Settings {
             history_depth: 0,
             snapshots_keep: 0,
             snapshots_persist: false,
+            snapshots_interval: 0,
+            savescreen_include: false,
+            savescreen_mode: String::new(),
+            savescreen_input_char: false,
+            savescreen_delete_char: false,
+            savescreen_history_usage: false,
+            savescreen_history_usage_percent: String::new(),
+            savescreen_history_usage_number: String::new(),
             language: DEFAULT_LANGUAGE.to_string(),
             catalog: Catalog::new(),
             theme: DEFAULT_THEME.to_string(),
         };
+        settings.apply_defaults_table();
         settings.apply_defaults();
         settings
     }
@@ -78,6 +127,28 @@ impl Settings {
         if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_persist") {
             settings.snapshots_persist = config.bool_or_default(def);
         }
+        if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_interval") {
+            settings.snapshots_interval = config.u16_or_default(def);
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.mode") {
+            settings.savescreen_mode = config.string_or_default(def);
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.include") {
+            settings.savescreen_include = config.bool_or_default(def);
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.input_char") {
+            settings.savescreen_input_char = config.bool_or_default(def);
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.delete_char") {
+            settings.savescreen_delete_char = config.bool_or_default(def);
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.history_usage") {
+            settings.savescreen_history_usage = config.bool_or_default(def);
+        }
+        settings.savescreen_history_usage_percent =
+            table_string(config, "percent", HISTORY_USAGE_TABLE);
+        settings.savescreen_history_usage_number =
+            table_string(config, "number", HISTORY_USAGE_TABLE);
         settings
     }
 
@@ -105,6 +176,18 @@ impl Settings {
     }
 
     /// Заполнить незаданные значения дефолтами из схемы.
+    fn apply_defaults_table(&mut self) {
+        if let Some(def) = schema::find_table(ConfigFile::Global, HISTORY_USAGE_TABLE) {
+            for (key, value) in def.default {
+                match *key {
+                    "percent" => self.savescreen_history_usage_percent = value.to_string(),
+                    "number" => self.savescreen_history_usage_number = value.to_string(),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn apply_defaults(&mut self) {
         if let Some(def) = schema::find(ConfigFile::Edit, "General.history_depth") {
             self.history_depth = def.default.parse().unwrap_or(0);
@@ -114,6 +197,24 @@ impl Settings {
         }
         if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_persist") {
             self.snapshots_persist = def.default == "true";
+        }
+        if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_interval") {
+            self.snapshots_interval = def.default.parse().unwrap_or(0);
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.mode") {
+            self.savescreen_mode = def.default.to_string();
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.include") {
+            self.savescreen_include = def.default == "true";
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.input_char") {
+            self.savescreen_input_char = def.default == "true";
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.delete_char") {
+            self.savescreen_delete_char = def.default == "true";
+        }
+        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.history_usage") {
+            self.savescreen_history_usage = def.default == "true";
         }
     }
 }
