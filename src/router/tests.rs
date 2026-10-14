@@ -607,7 +607,7 @@ fn editing_one_key_keeps_the_rest_of_the_file() {
     let text = std::fs::read_to_string(tmp.dir().join("edit.toml")).unwrap();
     assert!(text.contains("history_depth = 256"), "{text}");
     assert!(text.contains(key.comment), "комментарий пропал: {text}");
-    assert!(text.contains("indent_size"), "соседний ключ пропал");
+    assert!(text.contains("0 to 65535"), "диапазон пропал: {text}");
 }
 
 // ── Динамический конфиг: сохранил — применилось ──────────────────────────────
@@ -1150,4 +1150,38 @@ fn the_config_crate_resolves_every_folder() {
     assert!(theme.ends_with("theme"), "{theme:?}");
     assert!(lang.ends_with("lang"), "{lang:?}");
     assert_ne!(theme, lang);
+}
+
+#[test]
+fn history_survives_reopening_the_document() {
+    // Главное: правки и снапшот переживают перезапуск. Текст верный, но без
+    // истории отменять нечего — половина работы пользователя исчезает.
+    let tmp = Temp::new("history-survives");
+    std::fs::create_dir_all(tmp.dir()).unwrap();
+    let file = tmp.dir().join("doc.txt");
+    std::fs::write(&file, "abc\n").unwrap();
+
+    let session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+
+    {
+        let mut doc = session.open_file(&file).unwrap();
+        doc.buffer().insert(3, b"XY").unwrap();
+        doc.buffer().delete(0, 1).unwrap();
+        assert_eq!(doc.text(), b"bcXY\n");
+        // Снапшот уносит историю на диск.
+        doc.buffer().snapshot().unwrap();
+    }
+
+    // Новый процесс читает тот же файл.
+    let session2 = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    let mut doc = session2.open_file(&file).unwrap();
+
+    // Текст на месте.
+    assert_eq!(doc.text(), b"bcXY\n");
+    // И история на месте: отмена работает после перезапуска.
+    doc.buffer()
+        .undo()
+        .unwrap()
+        .expect("отмена доступна после перезапуска");
+    assert_eq!(doc.text(), b"abcXY\n");
 }

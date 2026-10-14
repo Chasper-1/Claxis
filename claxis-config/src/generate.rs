@@ -93,39 +93,21 @@ pub fn render(file: ConfigFile, catalog: &claxis_i18n::Catalog) -> String {
             out.push_str(&format!("\n[{section}]\n\n"));
             out.push_str(&table_body(key.file, section, catalog));
         }
-        // Табличная настройка: значение само является таблицей.
-        if let Some(table) = schema::find_table(key.file, key.path) {
-            let name = key.key();
-            out.push_str(&format!("# {}\n", tr(catalog, table.comment)));
-            out.push_str(&format!(
-                "# Value: {}.\n",
-                tr(catalog, kind_hint(table.kind))
-            ));
-            let pairs: Vec<String> = table
-                .default
-                .iter()
-                .map(|(k, v)| format!("{k} = {v}"))
-                .collect();
-            let inner = pairs.join(",\n    ");
-            out.push_str(&format!("{name} = {{\n    {inner},\n}}\n\n"));
-            continue;
-        }
-
         // Комментарий — тоже текст для пользователя, значит тоже переводится.
         // Ключом служит английская фраза: каталог ищет её как есть.
-        out.push_str(&format!("# {}\n", tr(catalog, key.comment)));
-        out.push_str(&format!("{}\n", comment_body(key, catalog)));
-        // Строка обязана быть в кавычках: раскомментированный ключ должен
-        // остаться корректным, иначе файл перестанет читаться.
+        //
+        // Комментарий стоит на той же строке, что ключ: так видно, к чему он
+        // относится, и файл не раздувается вдвое. Одна строка — одно
+        // предложение плюс допустимые значения, больше ничего.
         let value = value_text(key);
+        let comment = key_comment(key, catalog);
         if key.active {
-            out.push_str(&format!("{} = {value}\n\n", key.key()));
+            out.push_str(&format!("{} = {value}  # {comment}\n\n", key.key()));
         } else {
             // Ключ есть и понятен, но значения ему не назначено, поэтому он
             // не действует. Причина в самом ключе, а не в коде: пользователю
             // не нужно знать, что внутри.
-            out.push_str(&format!("# {}\n", tr(catalog, NOT_SET)));
-            out.push_str(&format!("#{} = {value}\n\n", key.key()));
+            out.push_str(&format!("#{} = {value}  # {comment}\n\n", key.key()));
         }
     }
     out
@@ -150,11 +132,10 @@ fn table_body(file: schema::ConfigFile, section: &str, catalog: &claxis_i18n::Ca
     // Inline table обязана быть в одну строку: многострочная невалидна по
     // спецификации TOML, и разбор её отвергнет.
     format!(
-        "# {}\n# Value: {}.\n{} = {{ {} }}\n\n",
-        tr(catalog, table.comment),
-        tr(catalog, kind_hint(table.kind)),
+        "{} = {{ {} }}  # {}\n\n",
         table_name(table),
         pairs.join(", "),
+        tr(catalog, table.comment),
     )
 }
 
@@ -168,21 +149,23 @@ fn table_name(table: &schema::TableDef) -> &str {
     table.path.rsplit('.').next().unwrap_or(table.path)
 }
 
-/// Простое: ключ перевода — английская фраза, как её писал переводчик.
-pub const NOT_SET: &str = "Not set: no value is assigned to this key.";
+/// Ключ есть в конфиге, но не применяется.
+pub const NOT_USED: &str = "Not in use.";
 
 /// Перевод английской фразы. Без перевода остаётся английский.
 fn tr<'a>(catalog: &'a claxis_i18n::Catalog, text: &'a str) -> &'a str {
     catalog.get(text).unwrap_or(text)
 }
 
-/// Подсказка о типе значения для каталога.
-fn kind_hint(kind: schema::Kind) -> &'static str {
+/// Допустимые значения для каталога.
+///
+/// Только диапазон: человек проверит — получит ошибку, которая подтвердит.
+fn range_hint(kind: schema::Kind) -> &'static str {
     match kind {
         schema::Kind::Bool => "true or false",
-        schema::Kind::U16 => "a number from 0 to 65535",
-        schema::Kind::U8 => "a number from 0 to 255",
-        schema::Kind::Str => "a string",
+        schema::Kind::U16 => "0 to 65535",
+        schema::Kind::U8 => "0 to 255",
+        schema::Kind::Str => "",
     }
 }
 
@@ -194,17 +177,20 @@ fn value_text(key: &KeyDef) -> String {
     }
 }
 
-/// Комментарий под ключом: тип и допустимые значения.
-fn comment_body(key: &KeyDef, catalog: &claxis_i18n::Catalog) -> String {
-    // Вся фраза целиком идёт через каталог: переводчик сам решает, где у него
-    // стоит слово «значение», а где название типа.
-    let phrase = match key.kind {
-        schema::Kind::Bool => "Value: true or false.",
-        schema::Kind::U16 => "Value: a number from 0 to 65535.",
-        schema::Kind::U8 => "Value: a number from 0 to 255.",
-        schema::Kind::Str => "Value: a string.",
-    };
-    format!("# {}", tr(catalog, phrase))
+/// Комментарий на строке с ключом: что значит и какие значения принимает.
+///
+/// Одно предложение плюс диапазон. Всё целиком идёт через каталог:
+/// переводчик сам решает, где у него стоит слово «значение».
+fn key_comment(key: &KeyDef, catalog: &claxis_i18n::Catalog) -> String {
+    let mut text = tr(catalog, key.comment).to_string();
+    let range = range_hint(key.kind);
+    if !range.is_empty() {
+        text.push_str(&format!(" {}", tr(catalog, range)));
+    }
+    if !key.active {
+        text.push_str(&format!(". {}", tr(catalog, NOT_USED)));
+    }
+    text
 }
 
 /// Прочитать все файлы конфига из `dir`.
@@ -288,7 +274,19 @@ pub fn write_value(
         .get_key_value(key.key())
         .map(|(k, _)| k.clone())
         .unwrap_or_else(|| toml_edit::Key::new(key.key()));
+    // Комментарий стоит на строке с ключом, а вставка значения его стирает.
+    // Забираем суффикс до вставки и возвращаем после: меняется только число.
+    let suffix = table
+        .get(key.key())
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.decor().suffix())
+        .map(|s| s.as_str().unwrap_or_default().to_string());
     table.insert_formatted(&entry, parse_value(key, value));
+    if let Some(suffix) = suffix
+        && let Some(v) = table.get_mut(key.key()).and_then(|i| i.as_value_mut())
+    {
+        v.decor_mut().set_suffix(suffix);
+    }
     std::fs::write(&path, doc.to_string()).map_err(|e| Error::Write {
         path: path.display().to_string(),
         reason: e.to_string(),
@@ -329,15 +327,15 @@ mod tests {
         claxis_i18n::Catalog::from_entries(
             [
                 (
-                    "Keys that mean two things, and how long a press counts as held. The key is the key itself, the value is the window in milliseconds. Add as many keys as you like.",
+                    "Keys with two meanings, and how long a press counts as held, in milliseconds.",
                     "Клавиши со значением, и окно удержания для каждой.",
                 ),
+                ("Not in use.", "Не используется."),
                 (
-                    "Not set: no value is assigned to this key.",
-                    "Не задано: ключу не назначено значение.",
+                    "Edits kept in memory before taking a snapshot.",
+                    "Правок в памяти до снапшота.",
                 ),
-                ("Value: a number from 0 to 65535.", "Значение: число от 0 до 65535."),
-                ("a number from 0 to 65535", "число от 0 до 65535"),
+                ("0 to 65535", "от 0 до 65535"),
             ]
             .map(|(k, v)| (k.to_string(), v.to_string())),
         )
@@ -436,15 +434,25 @@ mod tests {
     }
 
     #[test]
-    fn unused_keys_are_written_commented_out() {
-        // Неподключённый ключ есть и понятен, но выключен: пользователь не
-        // должен править настройку, которая ничего не делает, не зная об этом.
-        let text = render(ConfigFile::Edit, &plain());
-        assert!(text.contains("#indent_size = 4"), "{text}");
-        assert!(
-            !text.contains("\nindent_size ="),
-            "выключенный ключ не активен"
-        );
+    fn active_flag_matches_the_code() {
+        // Правдивость флага: подключено ровно то, что код читает. Список
+        // читается руками, но тест заставит его обновить, когда читать
+        // станет больше.
+        const READ: &[&str] = &[
+            "General.language",
+            "General.theme",
+            "General.history_depth",
+            "General.snapshots_keep",
+            "General.snapshots_persist",
+        ];
+        for key in KEYS {
+            let should = READ.contains(&key.path);
+            assert_eq!(
+                key.active, should,
+                "{}: код читает, а флаг говорит {:?}. Список READ в тесте обновить.",
+                key.path, key.active
+            );
+        }
     }
 
     #[test]
@@ -505,41 +513,19 @@ mod tests {
     }
 
     #[test]
-    fn active_flag_matches_the_code() {
-        // Правдивость флага: подключено ровно то, что код читает. Список
-        // читается руками, но тест заставит его обновить, когда читать
-        // станет больше.
-        const READ: &[&str] = &[
-            "General.language",
-            "General.theme",
-            "General.history_depth",
-            "General.snapshots_keep",
-            "General.snapshots_persist",
-        ];
-        for key in KEYS {
-            let should = READ.contains(&key.path);
-            assert_eq!(
-                key.active, should,
-                "{}: код читает, а флаг говорит {:?}. Список READ в тесте обновить.",
-                key.path, key.active
-            );
-        }
-    }
-
-    #[test]
     fn comments_are_translated() {
         // Комментарий в конфиге — такой же текст для пользователя, как и всё
         // остальное, значит он переводится. Надпись о неназначенном значении
         // проверяется на файле, где такие ключи ещё есть: в `config.toml` все
         // ключи подключены, и она там не появляется.
-        let text = render(ConfigFile::Global, &russian());
+        let text = render(ConfigFile::Edit, &russian());
         assert!(
-            text.contains("Клавиши со значением, и окно удержания для каждой."),
+            text.contains("Правок в памяти до снапшота."),
             "перевод комментария не попал в файл: {text}"
         );
         assert!(
-            text.contains("число от 0 до 65535"),
-            "перевод типа не попал: {text}"
+            text.contains("от 0 до 65535"),
+            "перевод диапазона не попал: {text}"
         );
     }
 
@@ -553,10 +539,13 @@ mod tests {
             text.push_str(&render(file, &plain()));
         }
         for phrase in [
-            NOT_SET,
-            "Value: a number from 0 to 65535.",
-            "Value: true or false.",
-            "Value: a string.",
+            NOT_USED,
+            "Edits kept in memory before taking a snapshot.",
+            "Snapshots of one file to keep, oldest dropped first. Zero means memory only.",
+            "Keep snapshots between runs.",
+            "Interface language. File name in the lang folder.",
+            "Colours and attributes. File name in the theme folder.",
+            "Keys with two meanings, and how long a press counts as held, in milliseconds.",
         ] {
             assert!(
                 text.contains(phrase),

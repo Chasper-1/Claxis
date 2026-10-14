@@ -211,6 +211,44 @@ impl Arena {
         &self.redo
     }
 
+    /// Заменить историю целиком: восстановление после снапшота.
+    ///
+    /// Записи приходят уже разобранными и упорядоченными по времени, поэтому
+    /// идентификаторы просто идут подряд, как при обычной правке. Не
+    /// разбираем здесь ничего: формат истории знает только буфер.
+    pub fn restore(&mut self, undo: Vec<Record>, redo: Vec<Record>) {
+        self.blocks.truncate(1);
+        let first = &mut self.blocks[0];
+        first.clear();
+        // Слот 0 занят под `Original`, как и в `new`.
+        first.push(Record::Delete { anchor: 0, head: 0 });
+        self.undo.clear();
+        self.redo.clear();
+        for record in undo {
+            let id = self.push_raw(record);
+            self.undo.push(id);
+        }
+        for record in redo {
+            let id = self.push_raw(record);
+            self.redo.push(id);
+        }
+    }
+
+    /// Положить запись в следующий свободный слот, не трогая стеки.
+    fn push_raw(&mut self, record: Record) -> RecordId {
+        if self
+            .blocks
+            .last()
+            .is_none_or(|last| last.len() >= self.capacity)
+        {
+            self.blocks.push(Vec::with_capacity(self.capacity));
+        }
+        let block = self.blocks.len() - 1;
+        let slot = self.blocks[block].len();
+        self.blocks[block].push(record);
+        block as RecordId * self.capacity as RecordId + slot as RecordId
+    }
+
     /// Полный сброс после снапшота: блоки и стеки очищаются.
     ///
     /// Первый блок **переиспользуется**: он держит в себе буфер на

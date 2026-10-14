@@ -19,22 +19,9 @@
 //! [General]
 //! history_depth = 8192
 //!
-//! [Word]
+//! [type]
 //! indent_size = 4
 //! ```
-//!
-//! # Глубина
-//!
-//! Внутри режима можно уйти на уровень ниже, если иначе настройку не выразить
-//! честно:
-//!
-//! ```toml
-//! [Word.Word]
-//! keep_indent = true
-//! ```
-//!
-//! Вне режимов третьего уровня нет: в `[General]` лишняя вложенность ничего
-//! не значит, режимов там не бывает.
 //!
 //! # Ключи
 //!
@@ -135,7 +122,7 @@ impl Kind {
 pub struct KeyDef {
     /// Файл-состояние, в котором ключ живёт.
     pub file: ConfigFile,
-    /// Путь внутри файла: `General.history_depth` или `Word.Word.keep_indent`.
+    /// Путь внутри файла: `General.history_depth` или `type.indent_size`.
     pub path: &'static str,
     /// Значение по умолчанию, как его запишет генератор.
     pub default: &'static str,
@@ -144,7 +131,11 @@ pub struct KeyDef {
     /// Комментарий к ключу. Он же ключ в каталоге перевода: английский текст
     /// и есть то, что переводится.
     pub comment: &'static str,
-    /// Читает ли код это значение сейчас.
+    /// Применяется ли значение сейчас.
+    ///
+    /// Нужен для ключей, которые появились в схеме раньше, чем код, который их
+    /// читает. Такой ключ есть и понятен, но по умолчанию не применяется:
+    /// пользователь может раскомментировать его, и тогда он заработает.
     ///
     /// Правдивость этого поля проверяется тестом: если ключ помечен как
     /// подключённый, а его никто не читает, пользователь правит настройку и
@@ -153,7 +144,7 @@ pub struct KeyDef {
 }
 
 impl KeyDef {
-    /// Секция ключа: `General` или `Word.Word`.
+    /// Секция ключа: `General` или `type`.
     pub fn section(&self) -> &str {
         match self.path.rfind('.') {
             Some(i) => &self.path[..i],
@@ -208,7 +199,7 @@ pub const TABLES: &[TableDef] = &[TableDef {
     path: "General.hold",
     kind: Kind::U16,
     default: &[("alt", "200"), ("ctrl", "200")],
-    comment: "Keys that mean two things, and how long a press counts as held. The key is the key itself, the value is the window in milliseconds. Add as many keys as you like.",
+    comment: "Keys with two meanings, and how long a press counts as held, in milliseconds.",
 }];
 
 /// Найти табличную настройку по файлу и пути.
@@ -228,7 +219,7 @@ pub const KEYS: &[KeyDef] = &[
         path: "General.language",
         default: claxis_i18n::defaults::DEFAULT_LANGUAGE,
         kind: Kind::Str,
-        comment: "Active language. The file name in the lang folder is the language code.",
+        comment: "Interface language. File name in the lang folder.",
         active: true,
     },
     KeyDef {
@@ -236,7 +227,7 @@ pub const KEYS: &[KeyDef] = &[
         path: "General.theme",
         default: "default",
         kind: Kind::Str,
-        comment: "Active theme. The file name in the theme folder is the theme name.",
+        comment: "Colours and attributes. File name in the theme folder.",
         active: true,
     },
     // ── edit.toml ──────────────────────────────────────────────────────
@@ -245,35 +236,8 @@ pub const KEYS: &[KeyDef] = &[
         path: "General.history_depth",
         default: "8192",
         kind: Kind::U16,
-        comment: "How many edits to keep in memory before taking a snapshot.",
+        comment: "Edits kept in memory before taking a snapshot.",
         active: true,
-    },
-    // Режим: секция названа режимом, ключ внутри неё.
-    KeyDef {
-        file: ConfigFile::Edit,
-        path: "Word.indent_size",
-        default: "4",
-        kind: Kind::U16,
-        comment: "How many spaces one indent level is worth.",
-        active: false,
-    },
-    // Третий уровень разрешён внутри режима, когда иначе не выразить.
-    KeyDef {
-        file: ConfigFile::Edit,
-        path: "Word.Word.keep_indent_on_blank_line",
-        default: "true",
-        kind: Kind::Bool,
-        comment: "Keep the indent on a line that has no other text.",
-        active: false,
-    },
-    // ── command.toml ───────────────────────────────────────────────────
-    KeyDef {
-        file: ConfigFile::Command,
-        path: "General.complete",
-        default: "true",
-        kind: Kind::Bool,
-        comment: "Show completion suggestions while typing a command.",
-        active: false,
     },
     // ── files.toml ─────────────────────────────────────────────────────
     KeyDef {
@@ -281,7 +245,7 @@ pub const KEYS: &[KeyDef] = &[
         path: "General.snapshots_keep",
         default: "3",
         kind: Kind::U8,
-        comment: "How many snapshots of one file to keep in the cache. Older ones are dropped. Zero keeps the history in memory only, nothing is written to disk and the history is not destroyed. More than 255 makes no sense.",
+        comment: "Snapshots of one file to keep, oldest dropped first. Zero means memory only.",
         active: true,
     },
     KeyDef {
@@ -289,8 +253,19 @@ pub const KEYS: &[KeyDef] = &[
         path: "General.snapshots_persist",
         default: "true",
         kind: Kind::Bool,
-        comment: "Keep snapshots in the cache between runs.",
+        comment: "Keep snapshots between runs.",
         active: true,
+    },
+    // Ключ, который появился в схеме раньше, чем код, который его читает.
+    // Он есть и понятен, но по умолчанию не применяется: пользователь может
+    // раскомментировать его, и тогда он заработает.
+    KeyDef {
+        file: ConfigFile::Files,
+        path: "General.snapshots_compression",
+        default: "true",
+        kind: Kind::Bool,
+        comment: "Compress snapshots on disk.",
+        active: false,
     },
 ];
 
@@ -367,6 +342,79 @@ mod tests {
         // Выбор темы и языка — обычные настройки в общем файле.
         assert!(find(ConfigFile::Global, "General.theme").is_some());
         assert!(find(ConfigFile::Global, "General.language").is_some());
+    }
+
+    /// Режимы, названные в `docs/Ru/modes.md`.
+    ///
+    /// Секция конфига — это режим, и имя секции обязано быть именем режима.
+    /// Список взят оттуда, а не выдуман: секция `[word]` годами стояла в схеме
+    /// без единого основания, и по файлу было невозможно понять, что это.
+    const MODES: &[&str] = &[
+        // Режимы edit: type, view, replace, selection, search.
+        "type",
+        "view",
+        "replace",
+        "selection",
+        "search",
+        // Режимы files: browse, git, search, selection.
+        "browse",
+        "git",
+    ];
+
+    #[test]
+    fn every_section_is_a_mode_that_exists() {
+        // Секция конфига называет режим. Режима, которого нет, быть не может:
+        // иначе в конфиге появляется имя, которому ничто не соответствует, и
+        // пользователь гадает, что оно значит.
+        for key in KEYS {
+            let section = key.section();
+            if section == GENERAL {
+                continue;
+            }
+            assert!(
+                MODES.contains(&section),
+                "{}: секция `{section}` не режим из docs/Ru/modes.md: {:?}",
+                key.path,
+                MODES
+            );
+        }
+    }
+
+    #[test]
+    fn every_section_name_is_readable() {
+        // Имя секции читает человек в конфиге. Одно слово без понятного смысла
+        // или выдумка — плохое имя, каким бы коротким оно ни было.
+        for key in KEYS {
+            let section = key.section();
+            if section == GENERAL {
+                continue;
+            }
+            assert!(
+                section.chars().all(|c| c.is_ascii_lowercase()),
+                "{}: секция `{section}` должна быть одним словом латиницей",
+                key.path
+            );
+            assert!(
+                section.len() >= 2,
+                "{}: секция `{section}` короче двух букв — однобуквенные оставлены под алиасы",
+                key.path
+            );
+        }
+    }
+
+    #[test]
+    fn a_mode_section_is_never_nested_into_itself() {
+        // Третий уровень был заведён ради секции `[word.word]` и остался бы
+        // навсегда, если бы его не убрали. Внутри режима режимов не бывает.
+        for key in KEYS {
+            let parts: Vec<&str> = key.path.split('.').collect();
+            assert!(
+                parts.len() <= 2,
+                "{}: лишний уровень вложенности: {}",
+                key.path,
+                key.path
+            );
+        }
     }
 
     #[test]

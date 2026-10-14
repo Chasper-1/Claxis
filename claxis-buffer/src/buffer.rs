@@ -107,6 +107,38 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Записать запись правки в историю.
+fn write_one(out: &mut crate::history::Bytes, record: &Record) {
+    match record {
+        Record::Insert { anchor, head, text } => {
+            crate::history::write_record(out, crate::history::INSERT_TAG, *anchor, *head, *text)
+        }
+        Record::Delete { anchor, head } => {
+            crate::history::write_record(out, crate::history::DELETE_TAG, *anchor, *head, 0)
+        }
+    }
+}
+
+/// Разобрать стек истории в записи правок.
+///
+/// Мусор на входе обрывается, а не ломает документ: неполная запись — это
+/// потеря одной записи отмены, а не битый текст.
+fn read_all(bytes: &[u8]) -> Vec<Record> {
+    let len = crate::history::RECORD_LEN;
+    let mut out = Vec::with_capacity(bytes.len() / len);
+    for part in bytes.chunks_exact(len) {
+        let Some((tag, anchor, head, text)) = crate::history::read_record(part) else {
+            break;
+        };
+        out.push(match tag {
+            crate::history::INSERT_TAG => Record::Insert { anchor, head, text },
+            crate::history::DELETE_TAG => Record::Delete { anchor, head },
+            _ => break,
+        });
+    }
+    out
+}
+
 /// Буфер Claxis: `Original`, `Added`, арена с двумя стеками и `Current`.
 #[derive(Debug)]
 pub struct Buffer {
@@ -344,8 +376,15 @@ impl Buffer {
     }
 
     /// Снапшот: текст из `Current` становится новым `Original`, всё обнуляется.
+    ///
+    /// История уходит вместе со снапшотом: текст без истории бесполезен —
+    /// после перезапуска отменять было бы нечего. Поэтому она собирается
+    /// **до** сброса арены и передаётся приёмнику вместе с текстом.
     pub fn snapshot(&mut self) -> Result<(), Error> {
         let text = self.read();
+        // История собирается только когда есть куда её положить: сборка
+        // копирует тексты вставок, а без приёмника они сразу никому не нужны.
+        let history = self.file.as_ref().map(|_| self.collect_history());
         self.original = text;
         self.added.clear();
         self.arena.reset();
@@ -359,10 +398,54 @@ impl Buffer {
         // Отдать снапшот приёмнику: буфер про диск не знает и просто передаёт
         // текст. Ошибка сохранения не ломает правку — потеря кеша не должна
         // стоить пользователю работы.
-        if let Some(file) = self.file.clone() {
-            self.sink.accept(&file, &self.original);
+        if let (Some(file), Some(history)) = (self.file.clone(), history) {
+            self.sink.accept(&file, &self.original, &history);
         }
         Ok(())
+    }
+
+    /// История в виде байт: оба стека и тексты вставок.
+    ///
+    /// Собирается целиком по стекам от самой старой записи к самой новой, и в
+    /// том же порядке, в каком их читает [`Buffer::restore_history`].
+    fn collect_history(&self) -> crate::history::History {
+        let mut undo = crate::history::Bytes::new();
+        for &id in self.arena.undo_stack() {
+            if let Some(record) = self.arena.get(id) {
+                write_one(&mut undo, record);
+            }
+        }
+        let mut redo = crate::history::Bytes::new();
+        for &id in self.arena.redo_stack() {
+            if let Some(record) = self.arena.get(id) {
+                write_one(&mut redo, record);
+            }
+        }
+        crate::history::History::new(self.original.clone(), undo, redo, self.added.clone())
+    }
+
+    /// Вернуть историю, сохранённую снапшотом.
+    ///
+    /// Записи кладутся в арену как есть, а дерево строится заново по ним:
+    /// иначе после перезапуска документ был бы верным, а отменять было бы
+    /// нечего. Тексты вставок приходят из снапшота — здесь `Added` пуст, и он
+    /// заполняется ими до пересборки дерева.
+    pub fn restore_history(&mut self, history: &crate::history::History) -> Result<(), Error> {
+        if history.is_empty() {
+            return Ok(());
+        }
+        // База из истории становится новым `Original`: записи описывают
+        // переход именно от него, и применять их к чему-то другому — значит
+        // получить другой документ.
+        self.original = history.base().to_vec();
+        self.added.clear();
+        self.added.extend_from_slice(history.added());
+        let undo = read_all(history.undo());
+        let redo = read_all(history.redo());
+        self.arena.restore(undo, redo);
+        // Дерево собирается заново по активным записям: `Original` уже
+        // содержит текст снапшота, а записи объясняют, чем он стал.
+        self.rebuild()
     }
 
     /// Пересборка `Current` линейным проходом по активным записям `undo`.

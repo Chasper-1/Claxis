@@ -130,10 +130,10 @@ pub fn parse(file: ConfigFile, text: &str) -> Loaded {
     }
 }
 
-/// Обойти все ключи файла, включая вложенные секции режимов.
+/// Обойти все ключи файла, включая секции режимов.
 ///
-/// Секция может быть вложенной (`[Word.Word]`), поэтому обход идёт вглубь, а
-/// путь ключа собирается по дороге.
+/// Обход идёт вглубь, путь ключа собирается по дороге: секция режима даёт
+/// уровень `[type]`, а ключ в ней — `type.indent_size`.
 fn walk(
     file: ConfigFile,
     table: &toml_edit::Table,
@@ -294,9 +294,9 @@ mod tests {
 
     #[test]
     fn line_of_finds_the_key() {
-        let text = "[General]\nhistory_depth = 64\n\n[Word]\nindent_size = 4\n";
+        let text = "[General]\nhistory_depth = 64\n\n[type]\nindent_size = 4\n";
         assert_eq!(line_of(text, "General", "history_depth"), Some(2));
-        assert_eq!(line_of(text, "Word", "indent_size"), Some(5));
+        assert_eq!(line_of(text, "type", "indent_size"), Some(5));
         assert_eq!(line_of(text, "General", "indent_size"), None);
         assert_eq!(line_of(text, "Nope", "history_depth"), None);
     }
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn bad_section_is_dropped_but_others_survive() {
         // Одна плохая секция не должна отключать остальные.
-        let text = "[General]\nhistory_depth = \"нет\"\n\n[Word]\nindent_size = 4\n";
+        let text = "[General]\nhistory_depth = \"нет\"\n\n[type]\nindent_size = 4\n";
         let loaded = parse(ConfigFile::Edit, text);
         assert!(!loaded.is_ok());
         // Плохая секция выключена.
@@ -374,16 +374,16 @@ mod tests {
     }
 
     #[test]
-    fn good_section_survives_a_bad_neighbour() {
-        // В одном файле плохая и хорошая секции рядом.
-        let text = "[General]\nhistory_dept = 1\n\n[Word]\nindent_size = 8\n";
+    fn an_unknown_section_does_not_break_the_file() {
+        // Секция, которой нет в схеме, — ошибка, но остальной файл читается.
+        let text = "[General]\nhistory_depth = 64\n\n[Word]\nindent_size = 8\n";
         let loaded = parse(ConfigFile::Edit, text);
         assert_eq!(loaded.issues.len(), 1, "проблемы: {:?}", loaded.issues);
         let doc = loaded.config.doc(ConfigFile::Edit).unwrap();
         assert!(
-            doc.get("General").is_none(),
-            "плохая секция должна быть выключена"
+            doc.get("General").is_some(),
+            "хорошая секция должна остаться"
         );
-        assert!(doc.get("Word").is_some(), "хорошая секция должна остаться");
+        assert!(doc.get("Word").is_none(), "неизвестная секция выключена");
     }
 }

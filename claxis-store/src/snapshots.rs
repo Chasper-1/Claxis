@@ -14,6 +14,8 @@ pub struct Snapshot {
     pub seq: u64,
     /// Текст документа на момент снятия.
     pub text: Vec<u8>,
+    /// История правок, чтобы отменять было что после перезапуска.
+    pub history: Vec<u8>,
 }
 
 /// Хранилище снапшотов.
@@ -88,17 +90,22 @@ impl SnapshotStore {
         self.conn
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS snapshots (
-                    seq    INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file   TEXT NOT NULL,
-                    text   BLOB NOT NULL
+                    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file    TEXT NOT NULL,
+                    text    BLOB NOT NULL,
+                    history BLOB NOT NULL DEFAULT x''
                  );
+
                  CREATE INDEX IF NOT EXISTS snapshots_file ON snapshots(file, seq);
                  CREATE TABLE IF NOT EXISTS last_good (
                     name TEXT PRIMARY KEY,
                     body TEXT NOT NULL
                  );",
             )
-            .map_err(query)
+            .map_err(query)?;
+        // Колонка истории появляется после таблицы: на старой базе таблица уже
+        // есть, на новой её только что создали, и `ALTER` добавит недостающее.
+        self.add_history_column()
     }
 
     /// Сохранить последний корректный конфиг.
@@ -143,12 +150,12 @@ impl SnapshotStore {
     ///
     /// Всё в одной транзакции: либо снапшот записан и старый удалён, либо не
     /// сделано ничего.
-    pub fn put(&mut self, file: &Path, text: &[u8]) -> Result<u64> {
+    pub fn put(&mut self, file: &Path, text: &[u8], history: &[u8]) -> Result<u64> {
         let file = file.display().to_string();
         let tx = self.conn.transaction().map_err(query)?;
         tx.execute(
-            "INSERT INTO snapshots (file, text) VALUES (?1, ?2)",
-            params![file, text],
+            "INSERT INTO snapshots (file, text, history) VALUES (?1, ?2, ?3)",
+            params![file, text, history],
         )
         .map_err(query)?;
 
@@ -179,18 +186,36 @@ impl SnapshotStore {
         Ok(last as u64)
     }
 
+    /// Добавить колонку истории в базу, созданную до её появления.
+    ///
+    /// Миграция идёт на месте: старая база лежит у пользователя, и терять её
+    /// из-за нового столбца нельзя. Проверка нужна, потому что `ALTER` падает
+    /// на уже существующей колонке, а выполняется он на каждом запуске.
+    fn add_history_column(&self) -> Result<()> {
+        let sql = "ALTER TABLE snapshots ADD COLUMN history BLOB NOT NULL DEFAULT x''";
+        match self.conn.execute_batch(sql) {
+            Ok(()) => Ok(()),
+            // Колонка уже есть: база не старше миграции, всё в порядке.
+            Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+            Err(e) => Err(Error::Query {
+                reason: e.to_string(),
+            }),
+        }
+    }
+
     /// Самый свежий снапшот файла.
     pub fn latest(&self, file: &Path) -> Result<Option<Snapshot>> {
         let file = file.display().to_string();
         self.conn
             .query_row(
-                "SELECT seq, text FROM snapshots WHERE file = ?1 ORDER BY seq DESC LIMIT 1",
+                "SELECT seq, text, history FROM snapshots WHERE file = ?1 ORDER BY seq DESC LIMIT 1",
                 params![file],
                 |r| {
                     Ok(Snapshot {
                         file: file.clone(),
                         seq: r.get::<_, i64>(0)? as u64,
                         text: r.get(1)?,
+                        history: r.get(2)?,
                     })
                 },
             )
@@ -203,13 +228,14 @@ impl SnapshotStore {
         let file = file.display().to_string();
         self.conn
             .query_row(
-                "SELECT seq, text FROM snapshots WHERE file = ?1 AND seq = ?2",
+                "SELECT seq, text, history FROM snapshots WHERE file = ?1 AND seq = ?2",
                 params![file, seq as i64],
                 |r| {
                     Ok(Snapshot {
                         file: file.clone(),
                         seq: r.get::<_, i64>(0)? as u64,
                         text: r.get(1)?,
+                        history: r.get(2)?,
                     })
                 },
             )
@@ -222,7 +248,7 @@ impl SnapshotStore {
         let file = file.display().to_string();
         let mut stmt = self
             .conn
-            .prepare("SELECT seq, text FROM snapshots WHERE file = ?1 ORDER BY seq DESC")
+            .prepare("SELECT seq, text, history FROM snapshots WHERE file = ?1 ORDER BY seq DESC")
             .map_err(query)?;
         let rows = stmt
             .query_map(params![file], |r| {
@@ -230,6 +256,7 @@ impl SnapshotStore {
                     file: file.clone(),
                     seq: r.get::<_, i64>(0)? as u64,
                     text: r.get(1)?,
+                    history: r.get(2)?,
                 })
             })
             .map_err(query)?;

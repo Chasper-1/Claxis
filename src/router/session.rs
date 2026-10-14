@@ -8,7 +8,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::api::buffer::{Buffer, HISTORY_DEPTH, SnapshotSink};
+use crate::api::buffer::{Buffer, HISTORY_DEPTH, History, SnapshotSink};
 use crate::api::store::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::messages::Messages;
 
@@ -64,10 +64,13 @@ struct StoreSink {
 }
 
 impl SnapshotSink for StoreSink {
-    fn accept(&mut self, file: &Path, text: &[u8]) {
+    fn accept(&mut self, file: &Path, text: &[u8], history: &History) {
         // Ошибка сохранения снапшота не ломает правку: потеря кеша не должна
         // стоить пользователю работы.
-        let _ = self.store.put(file, text);
+        //
+        // История идёт вместе с текстом: без неё после перезапуска отменять
+        // было бы нечего, то есть снапшот сохранил бы половину работы.
+        let _ = self.store.put(file, text, &history.encode());
     }
 }
 
@@ -275,6 +278,15 @@ impl Session {
         };
         let mut buffer =
             Buffer::with_history_depth(text, self.history_depth).map_err(SessionError::Buffer)?;
+        // Снапшот под документом копит не только текст, но и историю правок.
+        // Восстанавливаем её: после перезапуска отменять должно быть можно,
+        // иначе половина работы пользователя просто исчезает.
+        if self.persist
+            && let Ok(store) = self.store.reopen()
+            && let Ok(Some(snapshot)) = store.latest(&path)
+        {
+            let _ = buffer.restore_history(&History::decode(&snapshot.history));
+        }
         // Приёмник вешается только если снапшоты положено хранить. Иначе
         // буфер работает без диска и настройка `persist` что-то значит.
         if self.persist {

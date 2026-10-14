@@ -214,14 +214,14 @@ mod tests {
 
     #[test]
     fn known_keys_are_not_reported() {
-        let config = edit_config("[General]\nhistory_depth = 64\n\n[Word]\nindent_size = 4\n");
+        let config = edit_config("[General]\nhistory_depth = 64\n");
         assert!(config.unknown_keys(ConfigFile::Edit).is_empty());
     }
 
     #[test]
-    fn nested_section_inside_a_mode() {
-        // `[Word.Word]` — третий уровень, он разрешён внутри режима.
-        let config = edit_config("[Word]\nindent_size = 4\n\n[Word.Word]\nkeep_indent = true\n");
+    fn a_mode_section_is_read() {
+        // Секция режима разбирается и остаётся в документе.
+        let config = edit_config("[type]\nindent_size = 4\n");
         assert_eq!(config.open_files(), vec![ConfigFile::Edit]);
         assert!(config.doc(ConfigFile::Edit).is_some());
     }

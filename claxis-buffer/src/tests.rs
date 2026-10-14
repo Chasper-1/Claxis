@@ -554,3 +554,208 @@ fn differential_against_reference_string() {
         assert_eq!(buf.read(), ref_text.as_bytes(), "состояния разошлись");
     }
 }
+
+// ── История переживает снапшот ───────────────────────────────────────────────
+
+/// Приёмник, который помнит последнюю принятую историю.
+struct Keeper(std::cell::RefCell<Option<crate::history::History>>);
+
+impl std::fmt::Debug for Keeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Keeper")
+    }
+}
+
+impl crate::snapshot::SnapshotSink for Keeper {
+    fn accept(&mut self, _file: &std::path::Path, _text: &[u8], history: &crate::history::History) {
+        *self.0.borrow_mut() = Some(history.clone());
+    }
+}
+
+/// Буфер со снапшотом, который помнит историю.
+fn with_keeper(
+    text: &str,
+) -> (
+    Buffer,
+    std::sync::Arc<std::sync::Mutex<Option<crate::history::History>>>,
+) {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut buf = Buffer::new(text.as_bytes());
+    buf.set_sink("/tmp/doc.txt", Box::new(Shared(slot.clone())));
+    (buf, slot)
+}
+
+/// Приёмник, пишущий в общую ячейку: `Keeper` живёт внутри буфера и наружу
+/// не отдаётся, а тесту история нужна после снапшота.
+struct Shared(std::sync::Arc<std::sync::Mutex<Option<crate::history::History>>>);
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Shared")
+    }
+}
+
+impl crate::snapshot::SnapshotSink for Shared {
+    fn accept(&mut self, _file: &std::path::Path, _text: &[u8], history: &crate::history::History) {
+        *self.0.lock().unwrap() = Some(history.clone());
+    }
+}
+
+#[test]
+fn a_snapshot_carries_the_history_with_it() {
+    // Главное: снапшот уносит историю. Текст после перезапуска верный, но без
+    // истории отменять было бы нечего.
+    let (mut buf, slot) = with_keeper("abc");
+    buf.insert(1, b"XY").unwrap();
+    buf.delete(0, 1).unwrap();
+    let text_before = buf.read();
+
+    buf.snapshot().unwrap();
+
+    let history = slot.lock().unwrap().clone().expect("снапшот отдал историю");
+    assert!(!history.is_empty(), "история снапшота пуста");
+
+    let mut fresh = Buffer::new(b"");
+    fresh.restore_history(&history).unwrap();
+    assert_eq!(
+        fresh.read(),
+        text_before,
+        "текст после восстановления разошёлся"
+    );
+}
+
+#[test]
+fn restored_history_can_be_undone() {
+    // Восстановленная история отменяется, как обычная: откат назад до
+    // состояния до снапшота работает.
+    let (mut buf, slot) = with_keeper("abc");
+    buf.insert(3, b"XY").unwrap();
+    buf.snapshot().unwrap();
+    let history = slot.lock().unwrap().clone().expect("снапшот отдал историю");
+
+    let mut fresh = Buffer::new(b"");
+    fresh.restore_history(&history).unwrap();
+    assert_eq!(fresh.read(), b"abcXY");
+
+    fresh.undo().unwrap().expect("отмена доступна");
+    assert_eq!(fresh.read(), b"abc");
+}
+
+#[test]
+fn restored_history_can_be_redone() {
+    let (mut buf, slot) = with_keeper("abc");
+    buf.insert(3, b"XY").unwrap();
+    buf.undo().unwrap();
+    buf.snapshot().unwrap();
+    let history = slot.lock().unwrap().clone().expect("снапшот отдал историю");
+
+    let mut fresh = Buffer::new(b"");
+    fresh.restore_history(&history).unwrap();
+    assert_eq!(fresh.read(), b"abc");
+    fresh.redo().unwrap().expect("повтор доступен");
+    assert_eq!(fresh.read(), b"abcXY");
+}
+
+#[test]
+fn an_empty_history_changes_nothing() {
+    let mut fresh = Buffer::new(b"abc");
+    fresh.restore_history(&crate::history::empty()).unwrap();
+    assert_eq!(fresh.read(), b"abc");
+    assert!(fresh.undo().unwrap().is_none(), "отменять нечего");
+}
+
+// ── Проверка: автоснапшот не должен резать историю ───────────────────────────
+
+/// Приёмник, отдающий последнюю историю снапшота.
+#[derive(Debug, Clone)]
+struct Grab(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+impl crate::snapshot::SnapshotSink for Grab {
+    fn accept(&mut self, _file: &std::path::Path, _text: &[u8], history: &crate::history::History) {
+        let mut slot = self.0.lock().unwrap();
+        slot.push(history.encode());
+    }
+}
+
+#[test]
+fn an_automatic_snapshot_carries_the_history_it_had() {
+    // Арена кончилась, буфер снял снапшот сам. Унести он должен всё, что к
+    // этому моменту было, иначе отменять после перезапуска будет нечего.
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Первый слот арены зарезервирован под `Original`, поэтому при глубине 4
+    // полезных записей три, а не четыре.
+    let mut buf = Buffer::with_history_depth(b"abc", 4).unwrap();
+    buf.set_sink("/tmp/doc.txt", Box::new(Grab(slot.clone())));
+
+    for i in 0..3 {
+        buf.insert(i as u32, b"x").unwrap();
+    }
+    // Четвёртая правка: арена полна, снапшот снимается ДО неё.
+    buf.insert(0, b"y").unwrap();
+
+    let saved = slot.lock().unwrap().clone();
+    assert_eq!(
+        saved.len(),
+        1,
+        "автоснапшот должен быть один, получили {}",
+        saved.len()
+    );
+
+    let history = crate::history::History::decode(&saved[0]);
+    let mut fresh = Buffer::new(b"");
+    fresh.restore_history(&history).unwrap();
+    assert_eq!(fresh.read(), b"xxxabc", "в снапшоте должны быть три правки");
+
+    // Все три записи на месте: откат доходит до исходного текста.
+    let mut undone = 0;
+    while fresh.undo().unwrap().is_some() {
+        undone += 1;
+    }
+    assert_eq!(undone, 3, "восстановилось {} записей из 3", undone);
+    assert_eq!(fresh.read(), b"abc");
+}
+
+#[test]
+fn a_file_without_history_still_opens() {
+    // Старая база лежит без колонки истории: снапшот без неё должен читаться,
+    // просто отменять в нём нечего.
+    let history = crate::history::History::decode(&[]);
+    assert!(history.is_empty());
+    let mut buf = Buffer::new(b"abc");
+    buf.restore_history(&history).unwrap();
+    assert_eq!(buf.read(), b"abc");
+    assert!(buf.undo().unwrap().is_none());
+}
+
+#[test]
+fn history_larger_than_the_arena_is_not_half_restored() {
+    // Глубину истории уменьшили в конфиге: арена стала меньше, чем была при
+    // записи. Часть записей в неё не поместится — и если молча обрезать,
+    // документ получится не тот, что был. Лучше не восстанавливать вовсе.
+    let (mut buf, slot) = with_keeper("abc");
+    for i in 0..10 {
+        buf.insert(i as u32, b"x").unwrap();
+    }
+    let text = buf.read();
+    buf.snapshot().unwrap();
+    let history = slot.lock().unwrap().clone().expect("снапшот отдал историю");
+    assert_eq!(history.undo().len() / 13, 10);
+
+    // Открываем с глубиной 4: десять записей не поместятся.
+    let mut fresh = Buffer::with_history_depth(b"", 4).unwrap();
+    fresh.restore_history(&history).unwrap();
+
+    // Документ остаётся таким, каким был, и откатывается целиком.
+    assert_eq!(
+        fresh.read(),
+        text,
+        "документ разошёлся после уменьшения глубины"
+    );
+    let mut undone = 0;
+    while fresh.undo().unwrap().is_some() {
+        undone += 1;
+    }
+    assert_eq!(undone, 10, "восстановилось {} записей из 10", undone);
+    assert_eq!(fresh.read(), b"abc");
+}
+
