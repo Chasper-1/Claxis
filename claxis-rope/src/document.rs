@@ -395,13 +395,12 @@ impl Document {
             return Ok(());
         }
         self.discard_redo();
-        let start = self.text.len() as u32;
-        self.text.extend_from_slice(data);
+        let text = self.append(data);
         let len = data.len() as u32;
         let record = Record::Insert {
             anchor,
             head: anchor + len,
-            text: start,
+            text,
         };
         self.apply(record);
         Ok(())
@@ -416,20 +415,18 @@ impl Document {
         self.discard_redo();
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а
         // второго буфера быть не должно.
-        let start = self.text.len() as u32;
         let removed = self.slice(anchor, anchor + len);
-        self.text.extend_from_slice(&removed);
+        let text = self.append(&removed);
         let record = Record::Delete {
             anchor,
             head: anchor + len,
-            text: start,
+            text,
         };
         self.apply(record);
         Ok(())
     }
 
     /// Заменить диапазон: удаление и вставка.
-    /// Заменить диапазон на новый текст.
     ///
     /// Одна запись в истории и один проход по дереву: вырезание и вставка
     /// делаются за один раз, а не как две отдельные правки.
@@ -443,11 +440,8 @@ impl Document {
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а второго
         // буфера быть не должно.
         let removed = self.slice(anchor, anchor + len);
-        let removed_at = self.text.len() as u32;
-        self.text.extend_from_slice(&removed);
-
-        let text = self.text.len() as u32;
-        self.text.extend_from_slice(data);
+        let removed_at = self.append(&removed);
+        let text = self.append(data);
 
         let record = Record::Replace {
             anchor,
@@ -456,10 +450,18 @@ impl Document {
             removed: removed_at,
             removed_len: len,
         };
-        let new_leaf = self.tree.alloc(Node::leaf(text, data.len() as u32));
-        self.tree.replace(anchor, len, new_leaf);
-        self.push(record);
+        self.apply_replace(record);
         Ok(())
+    }
+
+    /// Положить текст в хвост буфера и сказать, с какого места он лежит.
+    ///
+    /// Буфер только растёт и переезжать не любит: запись правки хранит
+    /// смещение, и оно обязано пережить всё, что случится с деревом.
+    fn append(&mut self, data: &[u8]) -> u32 {
+        let at = self.text.len() as u32;
+        self.text.extend_from_slice(data);
+        at
     }
 
     /// Отменить одну правку обратной операцией.
@@ -516,8 +518,7 @@ impl Document {
     /// Положить кусок в хвост буфера и вставить его на место.
     fn restore_at(&mut self, anchor: u32, restored: Vec<u8>) {
         let len = restored.len() as u32;
-        let start = self.text.len() as u32;
-        self.text.extend_from_slice(&restored);
+        let start = self.append(&restored);
         let leaf = self.tree.alloc(Node::leaf(start, len));
         self.tree.insert_leaf(anchor, leaf);
     }
@@ -559,8 +560,7 @@ impl Document {
     pub fn apply(&mut self, record: Record) {
         match record {
             Record::Insert { anchor, head, text } => {
-                let len = head - anchor;
-                let leaf = self.tree.alloc(Node::leaf(text, len));
+                let leaf = self.tree.alloc(Node::leaf(text, head - anchor));
                 self.tree.insert_leaf(anchor, leaf);
             }
             Record::Delete { anchor, head, .. } => self.tree.cut(anchor, head),
@@ -571,11 +571,33 @@ impl Document {
                 removed_len,
                 ..
             } => {
-                self.tree.cut(anchor, anchor + removed_len);
+                // Вырезание и вставка одним проходом: так дерево перестраивается
+                // один раз, а не два. Разбор истории идёт тем же путём.
                 let leaf = self.tree.alloc(Node::leaf(text, head - anchor));
-                self.tree.insert_leaf(anchor, leaf);
+                self.tree.replace(anchor, removed_len, leaf);
             }
         }
+        self.push(record);
+    }
+
+    /// Применить замену изнутри: дерево трогается здесь, история — в записи.
+    ///
+    /// Отдельный метод не для красоты: `apply` разбирает записи, пришедшие из
+    /// базы, где у замены вырезанное лежит по своему смещению. Здесь же
+    /// вырезанное уже в буфере, и путь другой — одним проходом.
+    fn apply_replace(&mut self, record: Record) {
+        let Record::Replace {
+            anchor,
+            head,
+            text,
+            removed_len,
+            ..
+        } = record
+        else {
+            return;
+        };
+        let leaf = self.tree.alloc(Node::leaf(text, head - anchor));
+        self.tree.replace(anchor, removed_len, leaf);
         self.push(record);
     }
 

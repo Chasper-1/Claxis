@@ -397,83 +397,57 @@ pub fn write_value(
     value: &str,
 ) -> std::result::Result<(), Error> {
     let path = dir.join(key.file.file_name());
-    let text = std::fs::read_to_string(&path).map_err(|e| Error::Read {
+    let mut doc = open_for_edit(&path)?;
+    let table = section_mut(&mut doc, &path, key.section())?;
+
+    // Оформление ключа переносим: комментарий пользователя и его порядок в
+    // файле должны остаться, мы меняем только значение.
+    let entry = keep_formatting(table, key.key());
+    // Комментарий стоит на строке с ключом, а вставка значения его стирает.
+    // Забираем суффикс до вставки и возвращаем после: меняется только число.
+    let suffix = take_suffix(table, key.key());
+    table.insert_formatted(&entry, parse_value(key, value));
+    if let Some(suffix) = suffix
+        && let Some(v) = table.get_mut(key.key()).and_then(Item::as_value_mut)
+    {
+        v.decor_mut().set_suffix(suffix);
+    }
+    save(&path, &doc)
+}
+
+/// Прочитать файл конфига на правку.
+///
+/// Многострочные таблицы схемы перед разбором сворачиваются в строку: так их
+/// удобно разбирать. Обратно они расправляются при записи.
+fn open_for_edit(path: &Path) -> std::result::Result<DocumentMut, Error> {
+    let text = std::fs::read_to_string(path).map_err(|e| Error::Read {
         path: path.display().to_string(),
         reason: e.to_string(),
     })?;
-    let mut doc = crate::load::fold_inline_tables(&text)
+    crate::load::fold_inline_tables(&text)
         .parse::<DocumentMut>()
         .map_err(|e: toml_edit::TomlError| Error::Parse {
             path: path.display().to_string(),
             reason: e.message().to_string(),
-        })?;
+        })
+}
 
-    let mut table: &mut Table = doc.as_table_mut();
-    for part in key.section().split('.') {
-        if !table.contains_key(part) {
-            table[part] = toml_edit::table();
-        }
-        table = table
-            .get_mut(part)
-            .and_then(Item::as_table_mut)
-            .ok_or_else(|| Error::NotASection {
-                path: path.display().to_string(),
-                part: part.to_string(),
-            })?;
-    }
-
-    // Оформление ключа переносим: комментарий пользователя и его порядок в
-    // файле должны остаться, мы меняем только значение.
-    let entry = table
-        .get_key_value(key.key())
-        .map(|(k, _)| k.clone())
-        .unwrap_or_else(|| toml_edit::Key::new(key.key()));
-    // Комментарий стоит на строке с ключом, а вставка значения его стирает.
-    // Забираем суффикс до вставки и возвращаем после: меняется только число.
-    let suffix = table
-        .get(key.key())
-        .and_then(|i| i.as_value())
-        .and_then(|v| v.decor().suffix())
-        .map(|s| s.as_str().unwrap_or_default().to_string());
-    table.insert_formatted(&entry, parse_value(key, value));
-    if let Some(suffix) = suffix
-        && let Some(v) = table.get_mut(key.key()).and_then(|i| i.as_value_mut())
-    {
-        v.decor_mut().set_suffix(suffix);
-    }
-    // Таблицы схемы возвращаем по строкам: перед разбором они были свёрнуты,
-    // и в файле они должны выглядеть так же, как их пишет генератор.
+/// Записать документ обратно, расправив свёрнутые таблицы схемы.
+fn save(path: &Path, doc: &DocumentMut) -> std::result::Result<(), Error> {
     let written = expand_schema_tables(&doc.to_string());
-    std::fs::write(&path, written).map_err(|e| Error::Write {
+    std::fs::write(path, written).map_err(|e| Error::Write {
         path: path.display().to_string(),
         reason: e.to_string(),
     })
 }
 
-/// Записать пары табличной настройки, не трогая остальной файл.
-///
-/// Таблица читается человеком по строкам, значит и записывается по строкам,
-/// а комментарий ключа остаётся на месте.
-pub fn write_table_value(
-    dir: &Path,
-    def: &'static schema::TableDef,
-    pairs: &[(&str, &str)],
-) -> std::result::Result<(), Error> {
-    let path = dir.join(def.file.file_name());
-    let text = std::fs::read_to_string(&path).map_err(|e| Error::Read {
-        path: path.display().to_string(),
-        reason: e.to_string(),
-    })?;
-    let mut doc = crate::load::fold_inline_tables(&text)
-        .parse::<DocumentMut>()
-        .map_err(|e: toml_edit::TomlError| Error::Parse {
-            path: path.display().to_string(),
-            reason: e.message().to_string(),
-        })?;
-
-    let section = section_prefix(def);
-    let name = table_name(def);
-    let mut table: &mut Table = doc.as_table_mut();
+/// Спуститься по пути секции, создавая недостающие таблицы на ходу.
+fn section_mut<'a>(
+    doc: &'a mut DocumentMut,
+    path: &Path,
+    section: &str,
+) -> std::result::Result<&'a mut Table, Error> {
+    let mut table = doc.as_table_mut();
     for part in section.split('.') {
         if !table.contains_key(part) {
             table[part] = toml_edit::table();
@@ -486,17 +460,44 @@ pub fn write_table_value(
                 part: part.to_string(),
             })?;
     }
+    Ok(table)
+}
+
+/// Ключ в его нынешнем виде: с комментарием и порядком, как у человека.
+fn keep_formatting(table: &Table, name: &str) -> toml_edit::Key {
+    table
+        .get_key_value(name)
+        .map(|(key, _)| key.clone())
+        .unwrap_or_else(|| toml_edit::Key::new(name))
+}
+
+/// Комментарий на строке ключа: без него правка стёрла бы пояснение.
+fn take_suffix(table: &Table, name: &str) -> Option<String> {
+    table
+        .get(name)
+        .and_then(Item::as_value)
+        .and_then(|v| v.decor().suffix())
+        .map(|s| s.as_str().unwrap_or_default().to_string())
+}
+
+/// Записать пары табличной настройки, не трогая остальной файл.
+///
+/// Таблица читается человеком по строкам, значит и записывается по строкам,
+/// а комментарий ключа остаётся на месте.
+pub fn write_table_value(
+    dir: &Path,
+    def: &'static schema::TableDef,
+    pairs: &[(&str, &str)],
+) -> std::result::Result<(), Error> {
+    let path = dir.join(def.file.file_name());
+    let mut doc = open_for_edit(&path)?;
+    let section = section_prefix(def);
+    let name = table_name(def);
+    let table = section_mut(&mut doc, &path, section)?;
 
     // Оформление ключа переносим: комментарий пользователя должен остаться.
-    let entry = table
-        .get_key_value(name)
-        .map(|(k, _)| k.clone())
-        .unwrap_or_else(|| toml_edit::Key::new(name));
-    let suffix = table
-        .get(name)
-        .and_then(|i| i.as_value())
-        .and_then(|v| v.decor().suffix())
-        .map(|s| s.as_str().unwrap_or_default().to_string());
+    let entry = keep_formatting(table, name);
+    let suffix = take_suffix(table, name);
 
     let mut inline = toml_edit::InlineTable::new();
     // Пары схемы — основание: переданные переопределяют их, а забытые
@@ -509,15 +510,11 @@ pub fn write_table_value(
     }
     table.insert_formatted(&entry, Item::Value(toml_edit::Value::InlineTable(inline)));
     if let Some(suffix) = suffix
-        && let Some(v) = table.get_mut(name).and_then(|i| i.as_value_mut())
+        && let Some(v) = table.get_mut(name).and_then(Item::as_value_mut)
     {
         v.decor_mut().set_suffix(suffix);
     }
-    // Таблица схемы возвращается по строкам.
-    std::fs::write(&path, expand_schema_tables(&doc.to_string())).map_err(|e| Error::Write {
-        path: path.display().to_string(),
-        reason: e.to_string(),
-    })
+    save(&path, &doc)
 }
 
 /// Значение пары таблицы: строка получает кавычки, остальное пишется как есть.

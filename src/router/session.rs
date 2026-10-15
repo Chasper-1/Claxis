@@ -227,11 +227,20 @@ impl Document {
     /// Заменить диапазон: вставка и удаление одной операцией.
     pub fn replace(&mut self, anchor: u32, len: u32, data: &[u8]) -> Result<(), RopeError> {
         self.buffer.replace(anchor, len, data)?;
-        // Вырезанное ушло из карты, вставленное пришло.
-        self.lines.delete(anchor, anchor + len);
-        self.lines.insert(anchor, data);
+        self.replace_in_lines(anchor, len, data);
         stats::note_replace(&mut self.stats, data, len);
         Ok(())
+    }
+
+    /// Провести карту строк по правке: диапазон исчез, на его место пришёл текст.
+    ///
+    /// Один ход на оба действия, а не два вызова карты: между ними не должно
+    /// быть места, где документ уже изменён, а карта ещё нет.
+    fn replace_in_lines(&mut self, anchor: u32, len: u32, data: &[u8]) {
+        if len > 0 {
+            self.lines.delete(anchor, anchor + len);
+        }
+        self.lines.insert(anchor, data);
     }
 
     /// Отменить правку. Карта строк едет вместе с текстом.
@@ -256,19 +265,25 @@ impl Document {
             RopeRecord::Delete { anchor, .. } => self.restore_lines(*anchor, record),
             // Отмена замены: вырезать вставленное и вернуть вырезанное.
             RopeRecord::Replace { anchor, head, .. } => {
-                self.lines.delete(*anchor, *head);
+                if *head > *anchor {
+                    self.lines.delete(*anchor, *head);
+                }
                 self.restore_lines(*anchor, record);
             }
         }
     }
 
-    /// Вернуть в карту кусок, который лежит в буфере документа.
+    /// Вернуть в карту текст, который запись вырезала из документа.
+    ///
+    /// Смещение берётся из самой записи: после отмены на прежнем месте может
+    /// стоять совсем другое. Нет текста — значит отменять было нечего: пустая
+    /// замена оставляет карту как есть.
     fn restore_lines(&mut self, anchor: u32, record: &RopeRecord) {
-        let Some(piece) = self.buffer.removed_text(record) else {
+        let Some(removed) = self.buffer.removed_text(record) else {
             return;
         };
-        let piece = piece.to_vec();
-        self.lines.insert(anchor, &piece);
+        let removed = removed.to_vec();
+        self.lines.insert(anchor, &removed);
     }
 
     /// Повторить отменённую правку. Карта строк едет вместе с текстом.
