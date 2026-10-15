@@ -96,12 +96,14 @@ pub struct Editor {
     ///
     /// `None`, если система не смогла подписаться: конфиг перестанет
     /// применяться сам, и об этом честно скажем, а не промолчим.
-    pub watch: Option<crate::api::config::Watch>,
+    pub watch: Option<crate::api::disk::Watch>,
     /// Папки, за которыми следить не вышло, с причинами.
     ///
     /// Правки внутри них не применятся сами: только перезапуск. Пользователю
     /// об этом сказано, иначе он ищет ошибку там, где её нет.
     pub blind_spots: Vec<String>,
+    /// Поломки наблюдения за файлами, ждущие показа.
+    watch_failures: Vec<String>,
 }
 
 /// Что вышло из перечитывания конфига.
@@ -131,13 +133,13 @@ impl Editor {
     /// Открыть редактор с конфигом пользователя и хранилищем в кеше.
     pub fn open() -> Result<Self, StartError> {
         let dir = crate::api::config::path::user_dir().ok_or(StartError::NoHomeDir)?;
-        let store_dir = crate::api::store::StorePaths::from_env().dir;
+        let store_dir = crate::api::disk::StorePaths::from_env().dir;
         Self::open_in(&dir, &store_dir)
     }
 
     /// Конфиг задан явно, хранилище — кеш пользователя.
     pub fn open_at(dir: &Path) -> Result<Self, StartError> {
-        let store_dir = crate::api::store::StorePaths::from_env().dir;
+        let store_dir = crate::api::disk::StorePaths::from_env().dir;
         Self::open_in(dir, &store_dir)
     }
 
@@ -173,26 +175,25 @@ impl Editor {
         };
 
         // Подписка на каталог: конфиг могут поменять снаружи, и открытый
-        // редактор обязан это увидеть. Отписка не удаляет подписку, а лишь
-        // говорит, что следить не вышло.
-        let mut watch = crate::api::config::Watch::new(config_dir).ok();
-        if let Some(w) = watch.as_mut() {
-            // Подписка случилась до отметки: события между ними не считаются
-            // изменением, а то первый же запуск сочтётся правкой конфига.
-            w.mark_current(config_dir);
-        }
+        // редактор обязан это увидеть. Наблюдение — дело крейта диска, здесь
+        // только подписка на то, что этому редактору интересно.
+        let watched_dirs = [
+            crate::api::config::path::theme_dir(config_dir),
+            crate::api::config::path::lang_dir(config_dir),
+        ];
+        let watch = crate::api::disk::Watch::new(config_dir, &watched_dirs).ok();
+
         // Папки, за которыми следить не вышло: смена темы или языка в них не
         // применится сама. Пользователь должен знать про это, иначе он будет
         // искать ошибку в конфиге, которого никто не прочитал.
-        // Папка без причины выглядит как «что-то сломалось в системе», а с причиной
-        // человек сразу видит, куда смотреть.
+        // Папка без причины выглядит как «что-то сломалось в системе», а с
+        // причиной человек сразу видит, куда смотреть.
         let blind_spots: Vec<String> = watch
             .as_ref()
             .map(|w| {
                 w.blind_spots()
                     .iter()
-                    .zip(w.blind_reasons())
-                    .map(|(p, reason)| format!("{}: {reason}", p.display()))
+                    .map(|b| format!("{}: {}", b.dir.display(), b.reason))
                     .collect()
             })
             .unwrap_or_default();
@@ -231,6 +232,7 @@ impl Editor {
             config_dir: config_dir.to_path_buf(),
             watch,
             blind_spots,
+            watch_failures: Vec::new(),
         })
     }
 
@@ -255,6 +257,7 @@ impl Editor {
             config_dir: dir.as_ref().to_path_buf(),
             watch: None,
             blind_spots: Vec::new(),
+            watch_failures: Vec::new(),
         })
     }
 
@@ -343,12 +346,63 @@ impl Editor {
     ///
     /// Вызывается из цикла редактора. Возвращает `None`, если изменений нет,
     /// иначе результат применения.
+    ///
+    /// Наблюдение умеет само сломаться — например, переполнилась очередь
+    /// событий. Молчать об этом нельзя: правки перестали применяться, а
+    /// выглядит всё так же, поэтому такое возвращается проблемой, а человек
+    /// видит сообщение.
     pub fn poll_watch(&mut self) -> Option<Reloaded> {
-        let changed = self.watch.as_mut()?.changed();
-        if changed.is_empty() {
+        let mut changed = self.watch.as_mut()?.changed();
+        if changed.failures.is_empty() && changed.paths.is_empty() {
+            return None;
+        }
+        // Наблюдение умеет само сломаться, и это не проблема конфига: файлы
+        // могут быть в порядке, а применяться перестанут. Такое лежит
+        // отдельно, чтобы не выдавать за ошибку в чужом файле.
+        self.watch_failures.append(&mut changed.failures);
+
+        // Крейт диска сообщает обо всём под корнем, а чьи это файлы — знает
+        // редактор: чужая заметка рядом с конфигом не должна вызывать
+        // перечитывание.
+        let mine = self.config_files_changed(&changed.paths);
+        if mine.is_empty() {
             return None;
         }
         Some(self.reload())
+    }
+
+    /// Какие из изменившихся путей относятся к конфигу.
+    ///
+    /// Свои — файлы настроек и всё, что лежит в папках тем и переводов: там
+    /// каждая новая тема или новый язык появляются сами собой. Остальное в
+    /// каталоге конфига к делу не относится.
+    fn config_files_changed(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let theme = crate::api::config::path::theme_dir(&self.config_dir);
+        let lang = crate::api::config::path::lang_dir(&self.config_dir);
+        let own_file = |path: &PathBuf| {
+            ConfigFile::ALL
+                .iter()
+                .any(|f| *path == self.config_dir.join(f.file_name()))
+        };
+        paths
+            .iter()
+            .filter(|path| own_file(path) || path.starts_with(&theme) || path.starts_with(&lang))
+            .cloned()
+            .collect()
+    }
+
+    /// Что сломалось в наблюдении за файлами.
+    ///
+    /// Наблюдение может молча перестать работать: правки перестают
+    /// применяться, а выглядит всё как обычно. Такое пользователю
+    /// показывается, иначе он будет искать ошибку не там.
+    pub fn watch_failures(&self) -> &[String] {
+        &self.watch_failures
+    }
+
+    /// Забрать накопленные поломки наблюдения: показаны один раз.
+    pub fn take_watch_failures(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.watch_failures)
     }
 
     /// Следит ли редактор за каталогом конфига.
@@ -363,7 +417,7 @@ impl Editor {
 /// и работа не должна вставать из-за кеша.
 fn save_last_good(store_dir: &Path, dir: &Path) {
     let Ok(mut store) =
-        crate::api::store::SnapshotStore::open(&crate::api::store::StorePaths::new(store_dir), 1)
+        crate::api::disk::SnapshotStore::open(&crate::api::disk::StorePaths::new(store_dir), 1)
     else {
         return;
     };
@@ -378,7 +432,7 @@ fn save_last_good(store_dir: &Path, dir: &Path) {
 /// Забрать последний корректный конфиг из кеша.
 fn load_last_good(store_dir: &Path) -> Option<crate::api::config::Config> {
     let store =
-        crate::api::store::SnapshotStore::open(&crate::api::store::StorePaths::new(store_dir), 1)
+        crate::api::disk::SnapshotStore::open(&crate::api::disk::StorePaths::new(store_dir), 1)
             .ok()?;
     let mut docs = Vec::new();
     for &file in ConfigFile::ALL {
@@ -754,6 +808,90 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_broken_watcher_is_reported_and_not_shown_twice() {
+        // Наблюдение может сломаться само: правки перестают применяться, а
+        // выглядит всё как обычно. Молчать об этом нельзя, но и повторять одно
+        // и то же сообщение на каждый кадр — тоже.
+        let tmp = Temp::new("watch-failure");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        assert!(
+            editor.watch_failures().is_empty(),
+            "на свежем редакторе тихо"
+        );
+
+        // Подсовываем поломку так, как её приносит крейт диска.
+        editor.watch_failures = vec!["очередь событий переполнилась".to_string()];
+        editor.poll_watch();
+
+        let shown = editor.take_watch_failures();
+        assert_eq!(shown, vec!["очередь событий переполнилась".to_string()]);
+        assert!(
+            editor.watch_failures().is_empty(),
+            "одна поломка — одно сообщение"
+        );
+        assert!(
+            editor.take_watch_failures().is_empty(),
+            "второй раз показывать нечего"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_our_business_is_filtered_out_before_the_config() {
+        // Крейт диска сообщает обо всём под корнем, а чьи это файлы — знает
+        // редактор: чужая правка рядом с конфигом не должна вызывать
+        // перечитывание.
+        let tmp = Temp::new("foreign-file");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        std::fs::write(tmp.dir().join("заметки.txt"), "не конфиг").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if editor.poll_watch().is_some() {
+                panic!("чужой файл не должен считаться изменением конфига");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn only_config_files_and_their_folders_count_as_ours() {
+        // Проверка самого отбора: кто наш, а кто мимо.
+        let tmp = Temp::new("which-files");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        let theme = crate::api::config::path::theme_dir(tmp.dir());
+        let lang = crate::api::config::path::lang_dir(tmp.dir());
+
+        let ours = vec![
+            tmp.dir().join("config.toml"),
+            tmp.dir().join("edit.toml"),
+            tmp.dir().join("command.toml"),
+            tmp.dir().join("files.toml"),
+            theme.join("everforest.toml"),
+            lang.join("ru.toml"),
+        ];
+        let mine = editor.config_files_changed(&ours);
+        assert_eq!(mine.len(), ours.len(), "свои файлы отсеяны: {mine:?}");
+
+        let foreign = vec![
+            tmp.dir().join("заметки.txt"),
+            tmp.dir().join(".config.toml.swp"),
+            tmp.dir().join("просто-папка"),
+        ];
+        assert!(
+            editor.config_files_changed(&foreign).is_empty(),
+            "чужие приняты за наши"
+        );
+        assert!(
+            editor.config_files_changed(&[]).is_empty(),
+            "пустой список остаётся пустым"
+        );
     }
 
     // ── Язык интерфейса ─────────────────────────────────────────────────────────

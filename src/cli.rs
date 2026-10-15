@@ -8,9 +8,9 @@ use std::io::Write;
 
 use crate::api::buffer;
 use crate::api::config;
+use crate::api::disk;
 use crate::api::i18n;
 use crate::api::rope;
-use crate::api::store;
 use crate::api::term;
 use crate::main_messages;
 
@@ -60,7 +60,7 @@ pub fn print_messages(out: &mut impl Write) -> std::io::Result<()> {
     let crates: [(&str, Vec<(&str, String)>); 8] = [
         ("claxis-rope", rope::messages::samples()),
         ("claxis-buffer", buffer::messages::samples()),
-        ("claxis-store", store::messages::samples()),
+        ("claxis-disk", disk::messages::samples()),
         ("claxis-term", term::messages::samples()),
         ("claxis-i18n", i18n::messages::samples()),
         ("claxis-config", config::messages::samples()),
@@ -122,7 +122,7 @@ pub fn what(m: &dyn main_messages::Messages, what: What) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{i18n, store, term};
+    use crate::api::{i18n, term};
 
     fn out_of(command: Command) -> String {
         use crate::main_messages::En;
@@ -231,7 +231,7 @@ mod tests {
         let text = out_of(Command::Messages);
         for crate_name in [
             "claxis-buffer",
-            "claxis-store",
+            "claxis-disk",
             "claxis-term",
             "claxis-i18n",
             "claxis-config",
@@ -257,7 +257,7 @@ mod tests {
         // Пустой список — значит сообщения забыли перечислить.
         assert!(!rope::messages::samples().is_empty());
         assert!(!buffer::messages::samples().is_empty());
-        assert!(!store::messages::samples().is_empty());
+        assert!(!disk::messages::samples().is_empty());
         assert!(!term::messages::samples().is_empty());
         assert!(!i18n::messages::samples().is_empty());
         assert!(!config::messages::samples().is_empty());

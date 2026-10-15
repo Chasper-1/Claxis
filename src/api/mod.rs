@@ -6,10 +6,10 @@
 
 pub mod buffer;
 pub mod config;
+pub mod disk;
 pub mod i18n;
 pub mod input;
 pub mod rope;
-pub mod store;
 pub mod term;
 pub mod text;
 pub mod theme;
@@ -158,6 +158,49 @@ mod tests {
         // `claxis_` с пустым именем после — не обращение к крейту.
         assert!(!mentions_a_crate("let x = claxis_ ;"));
         assert!(!mentions_a_crate("claxis_"));
+    }
+
+    #[test]
+    fn only_the_disk_crate_touches_the_disk() {
+        // Запись на диск в проекте одна. Если второй крейт начнёт писать сам,
+        // правило разъедется: у него будут свои пути, своя атомарность и своя
+        // обработка ошибок, а правка одной не дойдёт до другой.
+        let mut offenders = Vec::new();
+        for crate_name in crate_names() {
+            // Сам крейт диска и его тесты — ему положено.
+            if crate_name == "claxis-disk" {
+                continue;
+            }
+            let src = root().join(&crate_name).join("src");
+            for entry in walk(&src) {
+                let text = std::fs::read_to_string(&entry).expect("файл читается");
+                // Всё после `#[cfg(test)]` — тесты, а тестам положено писать
+                // файлы: иначе нечего проверять.
+                let test_start = text
+                    .lines()
+                    .position(|l| l.trim() == "#[cfg(test)]")
+                    .unwrap_or(usize::MAX);
+                for (n, line) in text.lines().enumerate() {
+                    let line = line.trim();
+                    // Комментарий — не запись, а пример в тесте — не запись
+                    // крейта.
+                    if line.starts_with("//") || n >= test_start {
+                        continue;
+                    }
+                    for call in ["fs::write", "fs::remove_file", "fs::rename"] {
+                        if line.contains(call) {
+                            let rel = entry.strip_prefix(root()).unwrap_or(&entry);
+                            offenders.push(format!("{}:{}: {line}", rel.display(), n + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "пишут на диск мимо claxis-disk:\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// Строка кода называет крейт воркспейса.

@@ -2,7 +2,7 @@
 //!
 //! Оба крейта по отдельности ничего не знают друг о друге: `claxis-rope`
 //! отдаёт текст и историю приёмнику и не знает, куда они уйдут,
-//! `claxis-store` умеет только складывать и доставать байты. Соединяются они
+//! `claxis-disk` умеет только складывать и доставать байты. Соединяются они
 //! здесь — это и есть работа маршрутизатора.
 
 use std::cell::RefCell;
@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::api::disk::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::api::rope::defaults::buffer::HISTORY_DEPTH;
 use crate::api::rope::{
     Document as Rope, Error as RopeError, History, MIN_DEPTH, Record as RopeRecord, SnapshotSink,
 };
-use crate::api::store::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::messages::Messages;
 use crate::router::lines::LineMap;
 use crate::router::stats::{self, Stats};
@@ -968,7 +968,7 @@ mod tests {
     #[test]
     fn session_opens_in_standard_cache_path() {
         // Путь по умолчанию — кеш ОС, а не рабочий каталог.
-        let paths = crate::api::store::StorePaths::from_env();
+        let paths = crate::api::disk::StorePaths::from_env();
         let dir = paths.dir.display().to_string();
         assert!(
             dir.ends_with("claxis"),
@@ -1071,12 +1071,12 @@ mod tests {
         // Сессия по умолчанию берёт значения из настроек крейтов, а не из
         // зашитых констант.
         let tmp = Temp::new("defaults");
-        let session = Session::open_at(tmp.dir.clone(), crate::api::store::KEEP).unwrap();
+        let session = Session::open_at(tmp.dir.clone(), crate::api::disk::KEEP).unwrap();
         assert_eq!(
             session.history_depth(),
             crate::api::rope::defaults::buffer::HISTORY_DEPTH.value
         );
-        assert_eq!(session.persist(), crate::api::store::PERSIST);
+        assert_eq!(session.persist(), crate::api::disk::PERSIST);
     }
 
     #[test]

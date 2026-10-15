@@ -28,6 +28,10 @@ pub trait Messages {
     /// при перезапуске.
     fn not_watched(&self, place: &str) -> String;
 
+    /// Наблюдение за файлами сломалось: `{reason}`. Правки перестанут
+    /// применяться сами, но ничто не пропадёт.
+    fn watch_failed(&self, reason: &str) -> String;
+
     /// Сломано столько проблем, что работать не с чем: `{issues}`.
     fn no_usable_config(&self, issues: usize) -> String;
     /// Файл больше, чем помещается в `u32`.
@@ -88,6 +92,13 @@ impl Messages for En {
         )
     }
 
+    fn watch_failed(&self, reason: &str) -> String {
+        substitute(
+            "the file watcher failed: {reason}; config changes will no longer apply by themselves",
+            &[("reason", reason.to_string())],
+        )
+    }
+
     fn no_usable_config(&self, issues: usize) -> String {
         substitute(
             "config has {issues} problems and no saved valid copy to fall back to",
@@ -145,6 +156,10 @@ pub fn samples() -> Vec<(&'static str, String)> {
         (
             "file_too_large",
             m.file_too_large(5_000_000_000, 5.0, u32::MAX as u64, 4.2),
+        ),
+        (
+            "watch_failed",
+            m.watch_failed("the notification queue overflowed"),
         ),
     ]
 }

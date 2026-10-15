@@ -56,10 +56,8 @@ pub fn ensure_files(
     catalog: &claxis_i18n::Catalog,
 ) -> std::result::Result<Generated, Error> {
     let mut result = Generated::default();
-    std::fs::create_dir_all(dir).map_err(|e| Error::Read {
-        path: dir.display().to_string(),
-        reason: e.to_string(),
-    })?;
+    // Каталог создаёт сам крейт диска: путь до файла — часть записи.
+    crate::disk::create_dir(dir)?;
 
     for &file in ConfigFile::ALL {
         let path = dir.join(file.file_name());
@@ -68,10 +66,7 @@ pub fn ensure_files(
             continue;
         }
         let text = render(file, catalog);
-        std::fs::write(&path, text).map_err(|e| Error::Write {
-            path: path.display().to_string(),
-            reason: e.to_string(),
-        })?;
+        crate::disk::write_text(&path, &text)?;
         result.created.push(path);
     }
     Ok(result)
@@ -434,11 +429,11 @@ fn open_for_edit(path: &Path) -> std::result::Result<DocumentMut, Error> {
 
 /// Записать документ обратно, расправив свёрнутые таблицы схемы.
 fn save(path: &Path, doc: &DocumentMut) -> std::result::Result<(), Error> {
+    // Запись на диск — дело крейта диска: он делает её атомарно, через временный
+    // файл с переименованием. Здесь только собрано содержимое.
     let written = expand_schema_tables(&doc.to_string());
-    std::fs::write(path, written).map_err(|e| Error::Write {
-        path: path.display().to_string(),
-        reason: e.to_string(),
-    })
+    crate::disk::write_text(path, &written)?;
+    Ok(())
 }
 
 /// Спуститься по пути секции, создавая недостающие таблицы на ходу.

@@ -8,16 +8,14 @@ version = "0.4.0"
 dependencies = [
  "claxis-buffer",
  "claxis-config",
+ "claxis-disk",
  "claxis-i18n",
  "claxis-input",
  "claxis-rope",
- "claxis-store",
  "claxis-term",
  "claxis-text",
  "claxis-theme",
  "crossterm",
- "notify",
- "rusqlite",
  "toml_edit",
 ]
 
@@ -55,12 +53,20 @@ name = "claxis-config"
 version = "0.2.0"
 dependencies = [
  "claxis-buffer",
+ "claxis-disk",
  "claxis-i18n",
  "claxis-input",
- "claxis-store",
+ "claxis-text",
+ "toml_edit",
+]
+
+[[package]]
+name = "claxis-disk"
+version = "0.1.0"
+dependencies = [
  "claxis-text",
  "notify",
- "toml_edit",
+ "rusqlite",
 ]
 
 [[package]]
@@ -80,14 +86,6 @@ name = "claxis-rope"
 version = "0.2.0"
 dependencies = [
  "claxis-text",
-]
-
-[[package]]
-name = "claxis-store"
-version = "0.2.3"
-dependencies = [
- "claxis-text",
- "rusqlite",
 ]
 
 [[package]]

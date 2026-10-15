@@ -13,14 +13,16 @@ pub mod load;
 pub mod messages;
 pub mod path;
 pub mod schema;
-pub mod watch;
+
+/// Запись, чтение и наблюдение — дело крейта диска. Конфиг собирает содержимое
+/// и решает, что именно записать, а как это ляжет на диск, знает не он.
+use claxis_disk as disk;
 
 pub use error::{Error, Result};
 pub use load::{Issue, Loaded, Problem};
 pub use messages::{En, Messages};
 pub use schema::TableDef;
 pub use schema::{ConfigFile, GENERAL, KEYS, KeyDef, Kind};
-pub use watch::Watch;
 
 use toml_edit::Item;
 

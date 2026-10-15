@@ -1,3 +1,12 @@
+//! Хранилище снапшотов на диске.
+//!
+//! Снапшоты одного файла живут кольцом: хранится ровно `keep` штук, и когда
+//! приходит новый, самый старый вытесняется. Это делается прямо в базе одной
+//! транзакцией, поэтому на диске никогда не бывает больше, чем сказано.
+//!
+//! Несколько процессов могут работать с одной базой одновременно: SQLite
+//! это допускает, и каждый видит чужие записи при следующем чтении.
+
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -332,7 +341,7 @@ mod tests {
 
     impl Temp {
         fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("claxis-store-{name}"));
+            let dir = std::env::temp_dir().join(format!("claxis-disk-store-{name}"));
             let _ = std::fs::remove_dir_all(&dir);
             Self { dir }
         }

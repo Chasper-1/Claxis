@@ -122,5 +122,26 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Ошибка диска приходит сюда своей сутью: путь и причина уже на месте,
+/// переписывать их заново незачем.
+impl From<claxis_disk::Error> for Error {
+    fn from(e: claxis_disk::Error) -> Self {
+        match e {
+            claxis_disk::Error::Write { path, reason } => Error::Write { path, reason },
+            claxis_disk::Error::Read { path, reason } => Error::Read { path, reason },
+            claxis_disk::Error::PrepareDir { path, reason } => Error::Read { path, reason },
+            claxis_disk::Error::Rename { path, reason } => Error::Write { path, reason },
+            claxis_disk::Error::Open { path, reason } => Error::Read { path, reason },
+            // Остальное к конфигу отношения не имеет: приходит только если
+            // ошибка выехала за пределы своего крейта, и тогда она видна как
+            // есть, а не переименованная в чужую.
+            other => Error::Write {
+                path: String::new(),
+                reason: other.text(),
+            },
+        }
+    }
+}
+
 /// Результат операции с конфигом.
 pub type Result<T> = std::result::Result<T, Error>;
