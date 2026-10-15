@@ -11,12 +11,30 @@ use crate::node::{NIL, Node};
 use crate::tree::Tree;
 
 /// Запись правки. Операция несётся самой записью.
+///
+/// Смещения названы тем, чем они являются: `text_offset` — с какого места общего
+/// буфера начинается текст этой записи. Это не текст документа и не позиция в нём.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Record {
-    /// Вставка: куда, сколько и где текст.
-    Insert { anchor: u32, head: u32, text: u32 },
-    /// Удаление: что вырезано и где текст.
-    Delete { anchor: u32, head: u32, text: u32 },
+    /// Вставка: куда, сколько и где в буфере лежит вставленное.
+    Insert {
+        /// Где в документе.
+        anchor: u32,
+        /// Где кончается вставка: это её длина.
+        head: u32,
+        /// С какого места буфера начинается вставленный текст.
+        text_offset: u32,
+    },
+    /// Удаление: что вырезано и где в буфере это лежит.
+    Delete {
+        /// Где начинается вырезанный диапазон.
+        anchor: u32,
+        /// Где кончается вырезанный диапазон.
+        head: u32,
+        /// С какого места буфера начинается вырезанный текст: он вернётся при
+        /// отмене.
+        text_offset: u32,
+    },
     /// Замена диапазона: что вырезано, что вставлено и где оба текста.
     ///
     /// Одна запись, а не две: замена — одно действие пользователя и один
@@ -27,10 +45,11 @@ pub enum Record {
         anchor: u32,
         /// Где кончается заменённый диапазон: это длина вставленного.
         head: u32,
-        /// Где в буфере лежит вставленный текст.
-        text: u32,
-        /// Где в буфере лежит вырезанный текст: он вернётся при отмене.
-        removed: u32,
+        /// С какого места буфера начинается вставленный текст.
+        text_offset: u32,
+        /// С какого места буфера начинается вырезанный текст: он вернётся при
+        /// отмене.
+        removed_offset: u32,
         /// Сколько байт было вырезано.
         removed_len: u32,
     },
@@ -65,11 +84,11 @@ impl Record {
         }
     }
 
-    /// Смещение текста в буфере.
-    pub fn text(&self) -> u32 {
+    /// С какого места буфера начинается текст записи.
+    pub fn text_offset(&self) -> u32 {
         match self {
-            Record::Insert { text, .. } | Record::Delete { text, .. } => *text,
-            Record::Replace { text, .. } => *text,
+            Record::Insert { text_offset, .. } | Record::Delete { text_offset, .. } => *text_offset,
+            Record::Replace { text_offset, .. } => *text_offset,
         }
     }
 
@@ -80,10 +99,10 @@ impl Record {
     pub fn removed(&self) -> Option<(u32, u32)> {
         match self {
             Record::Replace {
-                removed,
+                removed_offset,
                 removed_len,
                 ..
-            } => Some((*removed, *removed_len)),
+            } => Some((*removed_offset, *removed_len)),
             _ => None,
         }
     }
@@ -151,8 +170,8 @@ pub enum Error {
     /// Смещения приходят из блоба, написанного прошлым запуском. Битый блоб —
     /// это ошибка данных, а не повод ронять редактор вместе с текстом.
     HistoryOutOfBounds {
-        /// Откуда кусок.
-        at: u32,
+        /// С какого места буфера просили кусок.
+        offset: u32,
         /// Сколько байт просили.
         len: u32,
     },
@@ -185,8 +204,8 @@ impl Error {
             Error::UnknownHistoryVersion { version } => messages.unknown_history_version(*version),
             Error::TruncatedHistory => messages.truncated_history(),
             Error::UnknownRecordKind { kind } => messages.unknown_record_kind(*kind),
-            Error::HistoryOutOfBounds { at, len } => {
-                messages.history_out_of_bounds(*at, at.saturating_add(*len))
+            Error::HistoryOutOfBounds { offset, len } => {
+                messages.history_out_of_bounds(*offset, offset.saturating_add(*len))
             }
             Error::InvalidRecordRange { anchor, head } => {
                 messages.invalid_record_range(*anchor, *head)
@@ -254,9 +273,9 @@ impl Memory {
 pub trait SnapshotSink: std::fmt::Debug {
     /// Документ снят: сохранить текст и историю.
     ///
-    /// Ошибка не возвращается: потеря кеша не должна стоять пользователю
+    /// Ошибка не возвращается: потеря кеша не должна стоить пользователю
     /// работы.
-    fn accept(&mut self, path: &std::path::Path, text: &[u8], history: &[u8]);
+    fn accept(&mut self, path: &std::path::Path, document: &[u8], history: &[u8]);
 }
 
 /// Приёмник, который ничего не делает.
@@ -269,8 +288,11 @@ impl SnapshotSink for NullSink {
 
 /// Документ: текст, история и снапшоты.
 pub struct Document {
-    /// Весь текст: исходный файл в начале, дальше вставки и вырезанное.
-    text: Vec<u8>,
+    /// Байты под деревом: исходный файл в начале, дальше вставки и вырезанное.
+    ///
+    /// Именно байты, а не текст документа: сам текст собирается обходом дерева,
+    /// и путать эти две вещи нельзя. Публичное имя того же — `buffer`.
+    bytes: Vec<u8>,
     /// Граница исходного файла: вставки идут после неё.
     file_len: u32,
     tree: Tree,
@@ -290,42 +312,42 @@ impl Document {
     /// Без паники и без `Result`: глубина по умолчанию задана самим крейтом и
     /// проверять тут нечего. Провка остаётся у [`Document::with_depth`], где
     /// глубину задаёт пользователь.
-    pub fn new(text: impl AsRef<[u8]>) -> Self {
-        let text = text.as_ref().to_vec();
-        let len = text.len() as u32;
-        Self::assemble(text, len, DEFAULT_DEPTH)
+    pub fn new(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes = bytes.as_ref().to_vec();
+        let len = bytes.len() as u32;
+        Self::assemble(bytes, len, DEFAULT_DEPTH)
     }
 
     /// Документ с заданной глубиной истории.
-    pub fn with_depth(text: impl AsRef<[u8]>, depth: u32) -> Result<Self> {
+    pub fn with_depth(bytes: impl AsRef<[u8]>, depth: u32) -> Result<Self> {
         if depth < MIN_DEPTH {
             return Err(Error::InvalidHistoryDepth { depth });
         }
-        let text = text.as_ref().to_vec();
-        let len = text.len() as u32;
-        Ok(Self::assemble(text, len, depth))
+        let bytes = bytes.as_ref().to_vec();
+        let len = bytes.len() as u32;
+        Ok(Self::assemble(bytes, len, depth))
     }
 
     /// Документ из готового буфера: текст уже состоит из файла и хвоста.
     ///
     /// Основание — первые `file_len` байт, остальное хвост: так записи
     /// получают верные смещения, а документ остаётся ровно файлом.
-    pub fn from_buffer(text: Vec<u8>, file_len: usize) -> Self {
-        let file_len = file_len.min(text.len());
+    pub fn from_buffer(bytes: Vec<u8>, file_len: usize) -> Self {
+        let file_len = file_len.min(bytes.len());
         let file_len = file_len as u32;
-        Self::assemble(text, file_len, DEFAULT_DEPTH)
+        Self::assemble(bytes, file_len, DEFAULT_DEPTH)
     }
 
-    fn assemble(text: Vec<u8>, file_len: u32, depth: u32) -> Self {
+    fn assemble(bytes: Vec<u8>, file_len: u32, depth: u32) -> Self {
         Self {
             tree: Tree::with_leaf(0, file_len),
-            text,
+            bytes,
             file_len,
             versions: vec![Version {
                 record: Record::Delete {
                     anchor: 0,
                     head: 0,
-                    text: 0,
+                    text_offset: 0,
                 },
                 parent: NIL,
                 child: NIL,
@@ -341,12 +363,12 @@ impl Document {
 
     /// Весь текстовый буфер: файл и хвост вставок и вырезанного.
     pub fn buffer(&self) -> &[u8] {
-        &self.text
+        &self.bytes
     }
 
     /// Длина текстового буфера.
     pub fn buffer_len(&self) -> usize {
-        self.text.len()
+        self.bytes.len()
     }
 
     /// Длина текста файла: всё, что стоит до хвоста.
@@ -395,12 +417,12 @@ impl Document {
             return Ok(());
         }
         self.discard_redo();
-        let text = self.append(data);
+        let text_offset = self.append(data);
         let len = data.len() as u32;
         let record = Record::Insert {
             anchor,
             head: anchor + len,
-            text,
+            text_offset,
         };
         self.apply(record);
         Ok(())
@@ -416,11 +438,11 @@ impl Document {
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а
         // второго буфера быть не должно.
         let removed = self.slice(anchor, anchor + len);
-        let text = self.append(&removed);
+        let text_offset = self.append(&removed);
         let record = Record::Delete {
             anchor,
             head: anchor + len,
-            text,
+            text_offset,
         };
         self.apply(record);
         Ok(())
@@ -440,14 +462,14 @@ impl Document {
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а второго
         // буфера быть не должно.
         let removed = self.slice(anchor, anchor + len);
-        let removed_at = self.append(&removed);
-        let text = self.append(data);
+        let removed_offset = self.append(&removed);
+        let text_offset = self.append(data);
 
         let record = Record::Replace {
             anchor,
             head: anchor + data.len() as u32,
-            text,
-            removed: removed_at,
+            text_offset,
+            removed_offset,
             removed_len: len,
         };
         self.apply_replace(record);
@@ -459,9 +481,9 @@ impl Document {
     /// Буфер только растёт и переезжать не любит: запись правки хранит
     /// смещение, и оно обязано пережить всё, что случится с деревом.
     fn append(&mut self, data: &[u8]) -> u32 {
-        let at = self.text.len() as u32;
-        self.text.extend_from_slice(data);
-        at
+        let offset = self.bytes.len() as u32;
+        self.bytes.extend_from_slice(data);
+        offset
     }
 
     /// Отменить одну правку обратной операцией.
@@ -479,16 +501,20 @@ impl Document {
             // Отмена вставки: вырезать вставленное.
             Record::Insert { anchor, head, .. } => self.tree.cut(anchor, head),
             // Отмена удаления: вернуть вырезанное.
-            Record::Delete { anchor, head, text } => {
+            Record::Delete {
+                anchor,
+                head,
+                text_offset,
+            } => {
                 let len = head - anchor;
-                let restored = self.text_at(text, len)?;
-                self.restore_at(anchor, restored);
+                let restored = self.read_buffer(text_offset, len)?;
+                self.restore(anchor, restored);
             }
             // Отмена замены: вырезать вставленное и вернуть вырезанное.
             Record::Replace {
                 anchor,
                 head,
-                removed,
+                removed_offset,
                 removed_len,
                 ..
             } => {
@@ -496,27 +522,27 @@ impl Document {
                 if removed_len == 0 {
                     return Ok(Some(id));
                 }
-                let restored = self.text_at(removed, removed_len)?;
-                self.restore_at(anchor, restored);
+                let restored = self.read_buffer(removed_offset, removed_len)?;
+                self.restore(anchor, restored);
             }
         }
         Ok(Some(id))
     }
 
-    /// Кусок буфера по смещению из записи истории.
+    /// Скопировать кусок буфера, начиная со смещения из записи истории.
     ///
     /// Смещение приходит из блоба, который писал прошлый запуск: доверять ему
     /// нельзя, а паника из-за битой записи уронила бы редактор вместе с
     /// несохранённым текстом. Не попали — ошибка, документ остаётся целым.
-    fn text_at(&self, at: u32, len: u32) -> Result<Vec<u8>> {
-        self.text
-            .get(at as usize..at as usize + len as usize)
+    fn read_buffer(&self, offset: u32, len: u32) -> Result<Vec<u8>> {
+        self.bytes
+            .get(offset as usize..offset as usize + len as usize)
             .map(<[u8]>::to_vec)
-            .ok_or(Error::HistoryOutOfBounds { at, len })
+            .ok_or(Error::HistoryOutOfBounds { offset, len })
     }
 
     /// Положить кусок в хвост буфера и вставить его на место.
-    fn restore_at(&mut self, anchor: u32, restored: Vec<u8>) {
+    fn restore(&mut self, anchor: u32, restored: Vec<u8>) {
         let len = restored.len() as u32;
         let start = self.append(&restored);
         let leaf = self.tree.alloc(Node::leaf(start, len));
@@ -532,21 +558,24 @@ impl Document {
         self.current = child;
         let record = self.versions[child as usize].record;
         match record {
-            Record::Insert { anchor, head, text } => {
-                let len = head - anchor;
-                let leaf = self.tree.alloc(Node::leaf(text, len));
+            Record::Insert {
+                anchor,
+                head,
+                text_offset,
+            } => {
+                let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
                 self.tree.insert_leaf(anchor, leaf);
             }
             Record::Delete { anchor, head, .. } => self.tree.cut(anchor, head),
             Record::Replace {
                 anchor,
                 head,
-                text,
+                text_offset,
                 removed_len,
                 ..
             } => {
                 self.tree.cut(anchor, anchor + removed_len);
-                let leaf = self.tree.alloc(Node::leaf(text, head - anchor));
+                let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
                 self.tree.insert_leaf(anchor, leaf);
             }
         }
@@ -559,21 +588,25 @@ impl Document {
     /// документ собирался бы неверным.
     pub fn apply(&mut self, record: Record) {
         match record {
-            Record::Insert { anchor, head, text } => {
-                let leaf = self.tree.alloc(Node::leaf(text, head - anchor));
+            Record::Insert {
+                anchor,
+                head,
+                text_offset,
+            } => {
+                let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
                 self.tree.insert_leaf(anchor, leaf);
             }
             Record::Delete { anchor, head, .. } => self.tree.cut(anchor, head),
             Record::Replace {
                 anchor,
                 head,
-                text,
+                text_offset,
                 removed_len,
                 ..
             } => {
                 // Вырезание и вставка одним проходом: так дерево перестраивается
                 // один раз, а не два. Разбор истории идёт тем же путём.
-                let leaf = self.tree.alloc(Node::leaf(text, head - anchor));
+                let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
                 self.tree.replace(anchor, removed_len, leaf);
             }
         }
@@ -589,14 +622,14 @@ impl Document {
         let Record::Replace {
             anchor,
             head,
-            text,
+            text_offset,
             removed_len,
             ..
         } = record
         else {
             return;
         };
-        let leaf = self.tree.alloc(Node::leaf(text, head - anchor));
+        let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
         self.tree.replace(anchor, removed_len, leaf);
         self.push(record);
     }
@@ -630,7 +663,7 @@ impl Document {
         let mut cursor = self.versions[self.current as usize].child;
         while cursor != NIL {
             let version = self.versions[cursor as usize];
-            let off = version.record.text();
+            let off = version.record.text_offset();
             tail = Some(tail.map_or(off, |t: u32| t.min(off)));
             self.free.push(cursor);
             cursor = version.child;
@@ -648,8 +681,8 @@ impl Document {
         // лист останется читать обрезанный участок и потеряет байты.
         if tail.is_some() {
             let end = self.live_end() as usize;
-            if end < self.text.len() {
-                self.text.truncate(end);
+            if end < self.bytes.len() {
+                self.bytes.truncate(end);
             }
         }
     }
@@ -669,9 +702,9 @@ impl Document {
                 continue;
             }
             let record = &version.record;
-            end = end.max(record.text() + record.len());
-            if let Some((at, len)) = record.removed() {
-                end = end.max(at + len);
+            end = end.max(record.text_offset() + record.len());
+            if let Some((offset, len)) = record.removed() {
+                end = end.max(offset + len);
             }
         }
         end
@@ -687,7 +720,7 @@ impl Document {
     /// Текст диапазона документа.
     fn slice(&self, start: u32, end: u32) -> Vec<u8> {
         struct Collect<'a> {
-            text: &'a [u8],
+            bytes: &'a [u8],
             out: Vec<u8>,
         }
         impl crate::tree::Sink for Collect<'_> {
@@ -698,17 +731,17 @@ impl Document {
             /// редактор из-за выхода за границу: обрезанный кусок — это
             /// потерянные байты, паника — это упавший редактор.
             fn range(&mut self, start: u32, len: u32) {
-                let from = (start as usize).min(self.text.len());
+                let from = (start as usize).min(self.bytes.len());
                 let to = (start as usize)
                     .saturating_add(len as usize)
-                    .min(self.text.len());
+                    .min(self.bytes.len());
                 if from < to {
-                    self.out.extend_from_slice(&self.text[from..to]);
+                    self.out.extend_from_slice(&self.bytes[from..to]);
                 }
             }
         }
         let mut sink = Collect {
-            text: &self.text,
+            bytes: &self.bytes,
             out: Vec::new(),
         };
         self.tree.read_range_into(start, end, &mut sink);
@@ -730,14 +763,16 @@ impl Document {
         self.slice(start, end)
     }
 
-    /// Текст, который был до правок: исходный файл.
-    pub fn file_text(&self) -> &[u8] {
+    /// Основа документа: текст файла, каким он был до правок.
+    ///
+    /// Не весь документ: правки лежат в хвосте буфера, и собирает их дерево.
+    pub fn base(&self) -> &[u8] {
         // Основа не длиннее буфера: так её и кладут. Но приходят сюда и
         // восстановленные из базы документы, а обрезать кусок безопаснее, чем
         // упасть.
-        self.text
+        self.bytes
             .get(..self.file_len as usize)
-            .unwrap_or(&self.text)
+            .unwrap_or(&self.bytes)
     }
 
     /// Текст, который эта запись вставила.
@@ -749,8 +784,8 @@ impl Document {
         if len == 0 {
             return None;
         }
-        let at = record.text() as usize;
-        self.text.get(at..at + len as usize)
+        let offset = record.text_offset() as usize;
+        self.bytes.get(offset..offset + len as usize)
     }
 
     /// Текст вырезанного куска по записи.
@@ -761,20 +796,21 @@ impl Document {
         // документе: после отмены на прежнем месте может быть совсем другой текст.
         // Смещения берём те же, что и у самой отмены, иначе карта строк и текст
         // разъедутся. У вставки вырезанного нет вовсе.
-        let (at, len) = match record {
+        let (offset, len) = match record {
             Record::Replace {
-                removed,
+                removed_offset,
                 removed_len,
                 ..
-            } => (*removed, *removed_len),
+            } => (*removed_offset, *removed_len),
             // Длина берётся через `abs_diff`: у испорченной записи `head`
             // может оказаться меньше `anchor`, и простое вычитание переполнилось
             // бы. `abs_diff` даёт осмысленную длину, а дальше границу проверит
             // `get`.
-            Record::Delete { text, .. } => (*text, record.len()),
+            Record::Delete { text_offset, .. } => (*text_offset, record.len()),
             Record::Insert { .. } => return None,
         };
-        self.text.get(at as usize..at as usize + len as usize)
+        self.bytes
+            .get(offset as usize..offset as usize + len as usize)
     }
 
     /// Записи активной ветки, от корня к текущей вершине.
@@ -797,24 +833,24 @@ impl Document {
 
     /// Снять снапшот: текст и история уезжают, буфер встаёт на место файла.
     pub fn snapshot(&mut self) {
-        let text = self.read();
+        let document = self.read();
         let history = crate::history::History::capture(self);
-        self.text = text;
-        self.file_len = self.text.len() as u32;
+        self.bytes = document;
+        self.file_len = self.bytes.len() as u32;
         self.tree.collapse_to(0, self.file_len);
         self.free.clear();
         self.versions.truncate(1);
         self.versions[0].record = Record::Delete {
             anchor: 0,
             head: 0,
-            text: 0,
+            text_offset: 0,
         };
         self.versions[0].parent = NIL;
         self.versions[0].child = NIL;
         self.current = 0;
         self.snapshots += 1;
         if let Some(file) = self.file.clone() {
-            self.sink.accept(&file, &self.text, history.as_bytes());
+            self.sink.accept(&file, &self.bytes, history.as_bytes());
         }
     }
 
@@ -833,8 +869,8 @@ impl Document {
             capacity: self.tree.capacity(),
             leaves: self.tree.leaves,
             node_size: Node::size(),
-            text_len: self.text.len(),
-            text_capacity: self.text.capacity(),
+            text_len: self.bytes.len(),
+            text_capacity: self.bytes.capacity(),
             versions: self.history_used() as usize,
             version_size: std::mem::size_of::<Version>(),
         }

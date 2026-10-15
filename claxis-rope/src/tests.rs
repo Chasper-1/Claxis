@@ -540,7 +540,10 @@ fn a_record_pointing_outside_the_buffer_is_refused() {
     bytes[last + 9..last + 13].copy_from_slice(&9_000u32.to_le_bytes());
     assert_eq!(
         crate::history::History::decode(&bytes).unwrap_err(),
-        Error::HistoryOutOfBounds { at: 9_000, len: 1 }
+        Error::HistoryOutOfBounds {
+            offset: 9_000,
+            len: 1
+        }
     );
 }
 

@@ -9,16 +9,31 @@ use std::time::Instant;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// Клавиша нажата.
-    KeyPressed { key: Key, at: Instant },
+    KeyPressed {
+        /// Что нажато.
+        key: Key,
+        /// Когда это случилось.
+        time: Instant,
+    },
     /// Клавиша отпущена.
-    KeyReleased { key: Key, at: Instant },
+    KeyReleased {
+        /// Что отпустили.
+        key: Key,
+        /// Когда это случилось.
+        time: Instant,
+    },
     /// Клавиша удерживается: нажатие было, автоповтор пошёл.
     ///
     /// Отдельное событие, а не ещё одно `KeyPressed`: повтор не начинает
     /// нового нажатия, он продолжает старое. Иначе время удержания
     /// перезаписывалось бы на каждом повторе, а счётчик нажатий считал бы
     /// удержание как десятки нажатий.
-    KeyRepeated { key: Key, at: Instant },
+    KeyRepeated {
+        /// Что удерживается.
+        key: Key,
+        /// Когда пришёл повтор.
+        time: Instant,
+    },
     /// Размер терминала изменился.
     Resized { cols: u16, rows: u16 },
     /// Терминал получил фокус.

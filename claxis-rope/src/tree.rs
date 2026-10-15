@@ -297,18 +297,18 @@ impl Tree {
         }
         let node = self.nodes[idx as usize];
         if node.is_leaf() {
-            let at = node.start();
+            let start_in_buffer = node.start();
             let len = node.leaf_len();
             let head_len = start.saturating_sub(base);
             let tail_at = (end - base).min(len);
             let tail_len = len - tail_at;
             let head = if head_len > 0 {
-                self.alloc(Node::leaf(at, head_len))
+                self.alloc(Node::leaf(start_in_buffer, head_len))
             } else {
                 NIL
             };
             let tail = if tail_len > 0 {
-                self.alloc(Node::leaf(at + tail_at, tail_len))
+                self.alloc(Node::leaf(start_in_buffer + tail_at, tail_len))
             } else {
                 NIL
             };
@@ -396,15 +396,15 @@ impl Tree {
     /// больше; исходный слот уходит в свободные.
     fn halve(&mut self, id: u32, from: u32, to: u32) -> (u32, u32) {
         let node = self.nodes[id as usize];
-        let at = node.start();
+        let start_in_buffer = node.start();
         let len = node.leaf_len();
         let head = if from > 0 {
-            self.alloc(Node::leaf(at, from))
+            self.alloc(Node::leaf(start_in_buffer, from))
         } else {
             NIL
         };
         let tail = if to < len {
-            self.alloc(Node::leaf(at + to, len - to))
+            self.alloc(Node::leaf(start_in_buffer + to, len - to))
         } else {
             NIL
         };

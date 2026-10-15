@@ -13,7 +13,7 @@
 /// Каталог сообщений об ошибках rope.
 ///
 /// Места под значения: `{anchor}`, `{end}`, `{doc_len}`, `{depth}`, `{min}`,
-/// `{version}`, `{kind}`, `{got}`, `{expected}`, `{at}`.
+/// `{version}`, `{kind}`, `{got}`, `{expected}`, `{tail}`.
 pub trait Messages {
     /// Вставка или удаление вышли за границы документа.
     fn out_of_bounds(&self, anchor: u32, end: u32, doc_len: u32) -> String;
@@ -55,8 +55,8 @@ pub trait Messages {
     /// `{got}` — что пришло, `{expected}` — какие имена допустимы.
     fn bad_placeholder(&self, got: &str, expected: &[&str]) -> String;
 
-    /// В переводе `{` без пары `}`. `{at}` — хвост начиная с незакрытой скобки.
-    fn unclosed_brace(&self, at: &str) -> String;
+    /// В переводе `{` без пары `}`. `{tail}` — хвост начиная с незакрытой скобки.
+    fn unclosed_brace(&self, tail: &str) -> String;
 }
 
 /// Ошибка разбора перевода: неизвестное имя или незакрытая скобка.
@@ -75,7 +75,7 @@ pub enum ParseError {
     /// Скобка `{` без пары `}`.
     UnclosedBrace {
         /// Хвост начиная с незакрытой скобки.
-        at: &'static str,
+        tail: &'static str,
     },
 }
 
@@ -84,7 +84,7 @@ impl ParseError {
     pub fn message(&self, messages: &dyn Messages) -> String {
         match self {
             ParseError::UnknownName { got, expected } => messages.bad_placeholder(got, expected),
-            ParseError::UnclosedBrace { at } => messages.unclosed_brace(at),
+            ParseError::UnclosedBrace { tail } => messages.unclosed_brace(tail),
         }
     }
 
@@ -173,8 +173,11 @@ impl Messages for En {
         )
     }
 
-    fn unclosed_brace(&self, at: &str) -> String {
-        substitute("unclosed brace at \"{at}\"", &[("at", at.to_string())])
+    fn unclosed_brace(&self, tail: &str) -> String {
+        substitute(
+            "unclosed brace in \"{tail}\"",
+            &[("tail", tail.to_string())],
+        )
     }
 }
 

@@ -30,12 +30,12 @@ fn convert(raw: CEvent) -> Option<Event> {
             let kind = key.kind;
             let code = convert_key_code(key.code)?;
             let modifiers = convert_modifiers(key.modifiers);
-            let at = Instant::now();
+            let time = Instant::now();
             let key = Key { code, modifiers };
             match kind {
-                KeyEventKind::Press => Some(Event::KeyPressed { key, at }),
-                KeyEventKind::Release => Some(Event::KeyReleased { key, at }),
-                KeyEventKind::Repeat => Some(Event::KeyRepeated { key, at }),
+                KeyEventKind::Press => Some(Event::KeyPressed { key, time }),
+                KeyEventKind::Release => Some(Event::KeyReleased { key, time }),
+                KeyEventKind::Repeat => Some(Event::KeyRepeated { key, time }),
             }
         }
         CEvent::Resize(cols, rows) => Some(Event::Resized { cols, rows }),

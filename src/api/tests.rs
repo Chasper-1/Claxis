@@ -70,10 +70,10 @@ fn nothing_imports_crates_directly() {
 fn mentions_a_crate(line: &str) -> bool {
     let bytes = line.as_bytes();
     let prefix = b"claxis_";
-    bytes.windows(prefix.len()).enumerate().any(|(at, w)| {
+    bytes.windows(prefix.len()).enumerate().any(|(offset, w)| {
         w == prefix
             && bytes
-                .get(at + prefix.len())
+                .get(offset + prefix.len())
                 .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
     })
 }

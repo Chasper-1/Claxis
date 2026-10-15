@@ -43,18 +43,18 @@ impl Cycle {
     /// и сколько времени они заняли. Остальные события пока ничего не меняют.
     pub fn handle(&mut self, event: Event, doc: &mut Document) -> Action {
         match event {
-            Event::KeyPressed { key, at } => {
+            Event::KeyPressed { key, time } => {
                 if key.code == KeyCode::Char('q') && key.modifiers == Modifiers::CTRL {
                     return Action::Quit;
                 }
-                self.pressed.insert(key, at);
+                self.pressed.insert(key, time);
                 doc.note_press();
             }
-            Event::KeyReleased { key, at } => {
+            Event::KeyReleased { key, time } => {
                 // Отпускание без нажатия — потерянное событие: времени у него
                 // нет, и выдумывать ноль секунд вместо неизвестного неправильно.
-                if let Some(since) = self.pressed.remove(&key) {
-                    doc.note_held(at.saturating_duration_since(since));
+                if let Some(pressed) = self.pressed.remove(&key) {
+                    doc.note_held(time.saturating_duration_since(pressed));
                 }
             }
             Event::Resized { .. } | Event::FocusGained | Event::FocusLost => {}

@@ -374,8 +374,8 @@ impl Buffer {
                 } else {
                     &self.original
                 };
-                let at = off as usize;
-                source[at..at + len as usize].to_vec()
+                let start = off as usize;
+                source[start..start + len as usize].to_vec()
             })
             .collect();
         for chunk in chunks {
@@ -456,7 +456,7 @@ impl Buffer {
                 // ссылке: он принадлежит записи удаления, а та лежит в
                 // отброшенной ветке и её текст будет срезан при следующей
                 // правке. Ссылка на срезанное место — это битый документ.
-                let at = self.added.len() as u32;
+                let appended = self.added.len() as u32;
                 let piece: Vec<u8> = self
                     .added
                     .get(text as usize..text as usize + len as usize)
@@ -466,10 +466,10 @@ impl Buffer {
                 // Запоминаем конец фантомного текста: хвост нельзя резать
                 // ниже этой точки, иначе сегмент останется ссылаться на
                 // срезанное место.
-                self.phantom.push(at + len);
+                self.phantom.push(appended + len);
                 // Запись в историю не нужна: эта правка лишь возвращает
                 // документ к состоянию до удаления.
-                self.current.apply_insert(anchor, at, len, u32::MAX)?;
+                self.current.apply_insert(anchor, appended, len, u32::MAX)?;
                 Ok(())
             }
         }

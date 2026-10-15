@@ -429,10 +429,10 @@ fn messages_are_localizable_and_default_to_english() {
                 &[("got", got.to_string()), ("expected", expected.join(", "))],
             )
         }
-        fn unclosed_brace(&self, at: &str) -> String {
+        fn unclosed_brace(&self, tail: &str) -> String {
             substitute(
-                "в переводе не закрыта скобка: {at}",
-                &[("at", at.to_string())],
+                "в переводе не закрыта скобка: {tail}",
+                &[("tail", tail.to_string())],
             )
         }
     }
@@ -522,10 +522,10 @@ fn bad_placeholder_names_what_came_and_what_was_expected() {
                 &[("got", got.to_string()), ("expected", expected.join(", "))],
             )
         }
-        fn unclosed_brace(&self, at: &str) -> String {
+        fn unclosed_brace(&self, tail: &str) -> String {
             substitute(
-                "в переводе не закрыта скобка: {at}",
-                &[("at", at.to_string())],
+                "в переводе не закрыта скобка: {tail}",
+                &[("tail", tail.to_string())],
             )
         }
     }
@@ -554,7 +554,7 @@ fn bad_placeholder_names_what_came_and_what_was_expected() {
     assert!(ru.contains("capacity"), "русский каталог: {ru}");
 
     // Незакрытая скобка: показываем хвост начиная с неё.
-    let unclosed = ParseError::UnclosedBrace { at: "{capacity" };
+    let unclosed = ParseError::UnclosedBrace { tail: "{capacity" };
     assert!(
         unclosed.text().contains("{capacity"),
         "хвост должен быть виден"

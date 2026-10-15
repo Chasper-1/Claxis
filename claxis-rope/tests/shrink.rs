@@ -10,9 +10,9 @@ use claxis_rope::Document;
 /// Правка в эталоне и в документе.
 #[derive(Clone, Debug)]
 enum Op {
-    Insert { at: usize, text: String },
-    Delete { at: usize, len: usize },
-    Replace { at: usize, len: usize },
+    Insert { pos: usize, text: String },
+    Delete { pos: usize, len: usize },
+    Replace { pos: usize, len: usize },
     Undo,
 }
 
@@ -26,50 +26,50 @@ fn run(ops: &[Op]) -> Option<(String, String)> {
     for op in ops {
         match *op {
             Op::Insert {
-                at,
+                pos,
                 text: ref typed,
             } => {
                 // После удаления лишней операции позиции могут выйти за текст.
                 // Такая правка просто не выполняется — с обеих сторон одинаково.
-                if at > text.len() {
+                if pos > text.len() {
                     continue;
                 }
-                doc.insert(at as u32, typed.as_bytes()).unwrap();
-                text.insert_str(at, typed);
-                history.push((1, at, typed.len(), String::new()));
+                doc.insert(pos as u32, typed.as_bytes()).unwrap();
+                text.insert_str(pos, typed);
+                history.push((1, pos, typed.len(), String::new()));
             }
-            Op::Delete { at, len } => {
-                if at + len > text.len() {
+            Op::Delete { pos, len } => {
+                if pos + len > text.len() {
                     continue;
                 }
-                let removed = text[at..at + len].to_string();
-                doc.delete(at as u32, len as u32).unwrap();
-                text.replace_range(at..at + len, "");
-                history.push((0, at, len, removed));
+                let removed = text[pos..pos + len].to_string();
+                doc.delete(pos as u32, len as u32).unwrap();
+                text.replace_range(pos..pos + len, "");
+                history.push((0, pos, len, removed));
             }
-            Op::Replace { at, len } => {
-                if at + len > text.len() {
+            Op::Replace { pos, len } => {
+                if pos + len > text.len() {
                     continue;
                 }
-                let removed = text[at..at + len].to_string();
-                doc.replace(at as u32, len as u32, b"xy\n").unwrap();
-                text.replace_range(at..at + len, "xy\n");
-                history.push((2, at, 3, removed));
+                let removed = text[pos..pos + len].to_string();
+                doc.replace(pos as u32, len as u32, b"xy\n").unwrap();
+                text.replace_range(pos..pos + len, "xy\n");
+                history.push((2, pos, 3, removed));
             }
             Op::Undo => {
-                let Some((kind, at, len, removed)) = history.pop() else {
+                let Some((kind, pos, len, removed)) = history.pop() else {
                     continue;
                 };
                 doc.undo().unwrap().expect("отменять есть что");
                 match kind {
                     // Отмена вставки: убрать вставленное.
-                    1 => text.replace_range(at..at + len, ""),
+                    1 => text.replace_range(pos..pos + len, ""),
                     // Отмена удаления: вернуть вырезанное.
-                    0 => text.insert_str(at, &removed),
+                    0 => text.insert_str(pos, &removed),
                     // Отмена замены: убрать вставленное и вернуть вырезанное.
                     _ => {
-                        text.replace_range(at..at + len, "");
-                        text.insert_str(at, &removed);
+                        text.replace_range(pos..pos + len, "");
+                        text.insert_str(pos, &removed);
                     }
                 }
             }
@@ -108,25 +108,25 @@ fn random_ops(seed: u64, count: usize) -> Vec<Op> {
     for _ in 0..count {
         let op = match rng.below(4) {
             0 if !text.is_empty() => {
-                let at = rng.below(text.len());
-                let len = 1 + rng.below((text.len() - at).min(20));
-                text.replace_range(at..at + len, "");
-                Op::Delete { at, len }
+                let pos = rng.below(text.len());
+                let len = 1 + rng.below((text.len() - pos).min(20));
+                text.replace_range(pos..pos + len, "");
+                Op::Delete { pos, len }
             }
             1 => {
-                let at = rng.below(text.len() + 1);
+                let pos = rng.below(text.len() + 1);
                 let typed = if rng.below(2) == 0 { "\n" } else { "ab" };
-                text.insert_str(at, typed);
+                text.insert_str(pos, typed);
                 Op::Insert {
-                    at,
+                    pos,
                     text: typed.to_string(),
                 }
             }
             2 => {
-                let at = rng.below(text.len() + 1);
-                let len = rng.below((text.len() - at).min(10));
-                text.replace_range(at..at + len, "xy\n");
-                Op::Replace { at, len }
+                let pos = rng.below(text.len() + 1);
+                let len = rng.below((text.len() - pos).min(10));
+                text.replace_range(pos..pos + len, "xy\n");
+                Op::Replace { pos, len }
             }
             _ => Op::Undo,
         };

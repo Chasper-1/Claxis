@@ -95,9 +95,9 @@ pub trait Clock: std::fmt::Debug {
 pub struct FixedClock(pub Duration);
 
 impl FixedClock {
-    /// Часы, стоящие на указанной отметке.
-    pub fn at(at: Duration) -> Self {
-        Self(at)
+    /// Часы, прошедшие указанное время от старта процесса.
+    pub fn after(elapsed: Duration) -> Self {
+        Self(elapsed)
     }
 }
 

@@ -188,8 +188,8 @@ mod tests {
         let map = reference("one\ntwo\nthree\nfour");
         let len = 18u32;
         for line in 0..map.line_count() {
-            let at = map.offset_of_line(line, len);
-            assert_eq!(map.line_of(at), line, "строка {line} не сошлась обратно");
+            let start = map.offset_of_line(line, len);
+            assert_eq!(map.line_of(start), line, "строка {line} не сошлась обратно");
         }
         // За пределами документа — конец, а не паника.
         assert_eq!(map.offset_of_line(99, len), len);
@@ -253,18 +253,18 @@ mod tests {
         for step in 0..300usize {
             match step % 3 {
                 0 => {
-                    let at = text.len() / 2;
-                    map.insert(at as u32, b"\n");
-                    text.insert(at, '\n');
+                    let middle = text.len() / 2;
+                    map.insert(middle as u32, b"\n");
+                    text.insert(middle, '\n');
                 }
                 1 => {
-                    let at = (text.len() / 3).min(text.len().saturating_sub(1));
-                    map.delete(at as u32, at as u32 + 1);
-                    text.remove(at);
+                    let third = (text.len() / 3).min(text.len().saturating_sub(1));
+                    map.delete(third as u32, third as u32 + 1);
+                    text.remove(third);
                 }
                 _ => {
-                    let at = text.len();
-                    map.insert(at as u32, b"line\n");
+                    let end = text.len();
+                    map.insert(end as u32, b"line\n");
                     text.push_str("line\n");
                 }
             }

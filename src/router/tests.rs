@@ -67,7 +67,7 @@ impl Drop for Temp {
 fn type_until_snapshot(session: &Session, file: &std::path::Path, chunk: &str) -> usize {
     let mut doc = session.open_file(file).unwrap();
     // Пока часы стоят, снапшот не снимется ни при какой правке.
-    doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
+    doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
     let mut i = 0usize;
     while doc.buffer().snapshots_taken() == 0 && i < 40 {
         let pos = doc.buffer().len();
@@ -76,7 +76,7 @@ fn type_until_snapshot(session: &Session, file: &std::path::Path, chunk: &str) -
         i += 1;
     }
     // Пять минут прошли — снимок снимает всё, что набрано.
-    doc.set_clock(Box::new(FixedClock::at(Duration::from_secs(600))));
+    doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(600))));
     doc.snapshot_if_due();
     assert_eq!(doc.buffer().snapshots_taken(), 1, "снапшот не сработал");
     i
@@ -167,7 +167,7 @@ fn keep_limit_applies_through_session() {
 
     let mut doc = session.open_file(&file).unwrap();
     // Часы стоят: ни одна из сорока вставок не успевает за интервал.
-    doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
+    doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
     for _ in 0..40 {
         let end = doc.buffer().len();
         doc.insert(end, b"z").unwrap();
@@ -326,7 +326,7 @@ fn persist_false_keeps_snapshots_in_memory_only() {
     let session = tmp.no_persist_session(3, 8);
 
     let mut doc = session.open_file(&file).unwrap();
-    doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
+    doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
     for _ in 0..40 {
         let end = doc.buffer().len();
         doc.insert(end, b"z").unwrap();
@@ -1339,7 +1339,7 @@ fn a_snapshot_is_taken_by_the_clock_and_not_by_the_edit_count() {
 
     // Часы стоят: сколько правок ни сделай, пяти минут не прошло.
     let mut doc = session.open_file(&file).unwrap();
-    doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
+    doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
     for _ in 0..500 {
         let at = doc.buffer().len() - 1;
         doc.insert(at, b"y").unwrap();
@@ -1349,11 +1349,11 @@ fn a_snapshot_is_taken_by_the_clock_and_not_by_the_edit_count() {
     assert_eq!(doc.buffer().snapshots_taken(), 0, "время не шло");
 
     // Часы пошли: пять минут прошло, и первая же проверка снимает снапшот.
-    doc.set_clock(Box::new(FixedClock::at(Duration::from_secs(299))));
+    doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(299))));
     doc.snapshot_if_due();
     assert_eq!(doc.buffer().snapshots_taken(), 0, "до интервала рано");
 
-    doc.set_clock(Box::new(FixedClock::at(Duration::from_secs(300))));
+    doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(300))));
     doc.snapshot_if_due();
     assert_eq!(
         doc.buffer().snapshots_taken(),
@@ -1362,7 +1362,7 @@ fn a_snapshot_is_taken_by_the_clock_and_not_by_the_edit_count() {
     );
 
     // И отсчёт начинается заново: следующий снимок ещё не через пять минут.
-    doc.set_clock(Box::new(FixedClock::at(Duration::from_secs(420))));
+    doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(420))));
     doc.snapshot_if_due();
     assert_eq!(doc.buffer().snapshots_taken(), 1, "отсчёт пошёл заново");
 }
@@ -1757,7 +1757,13 @@ fn the_cycle_counts_presses_and_their_time() {
         modifiers: Modifiers::NONE,
     };
     assert_eq!(
-        cycle.handle(Event::KeyPressed { key: a, at: start }, &mut doc),
+        cycle.handle(
+            Event::KeyPressed {
+                key: a,
+                time: start
+            },
+            &mut doc
+        ),
         Action::Continue
     );
     // Между нажатием и отпусканием прошло время размышления — в сумму оно не
@@ -1766,7 +1772,7 @@ fn the_cycle_counts_presses_and_their_time() {
         cycle.handle(
             Event::KeyReleased {
                 key: a,
-                at: start + Duration::from_millis(30)
+                time: start + Duration::from_millis(30)
             },
             &mut doc
         ),
@@ -1794,7 +1800,7 @@ fn a_release_without_a_press_adds_no_time() {
                 code: KeyCode::Char('z'),
                 modifiers: Modifiers::NONE,
             },
-            at: Instant::now(),
+            time: Instant::now(),
         },
         &mut doc,
     );
@@ -1818,7 +1824,7 @@ fn ctrl_q_leaves_the_editor() {
                     code: KeyCode::Char('q'),
                     modifiers: Modifiers::CTRL,
                 },
-                at: Instant::now(),
+                time: Instant::now(),
             },
             &mut doc
         ),

@@ -28,8 +28,8 @@ pub trait Messages {
     /// `{got}` — что пришло, `{expected}` — какие имена допустимы.
     fn bad_placeholder(&self, got: &str, expected: &[&str]) -> String;
 
-    /// В переводе `{` без пары `}`. `{at}` — хвост начиная с незакрытой скобки.
-    fn unclosed_brace(&self, at: &str) -> String;
+    /// В переводе `{` без пары `}`. `{tail}` — хвост начиная с незакрытой скобки.
+    fn unclosed_brace(&self, tail: &str) -> String;
 }
 
 /// Ошибка разбора перевода: неизвестное имя или незакрытая скобка.
@@ -48,7 +48,7 @@ pub enum ParseError {
     /// Скобка `{` без пары `}`.
     UnclosedBrace {
         /// Хвост начиная с незакрытой скобки.
-        at: &'static str,
+        tail: &'static str,
     },
 }
 
@@ -57,7 +57,7 @@ impl ParseError {
     pub fn message(&self, messages: &dyn Messages) -> String {
         match self {
             ParseError::UnknownName { got, expected } => messages.bad_placeholder(got, expected),
-            ParseError::UnclosedBrace { at } => messages.unclosed_brace(at),
+            ParseError::UnclosedBrace { tail } => messages.unclosed_brace(tail),
         }
     }
 
@@ -121,8 +121,11 @@ impl Messages for En {
         )
     }
 
-    fn unclosed_brace(&self, at: &str) -> String {
-        substitute("unclosed brace at \"{at}\"", &[("at", at.to_string())])
+    fn unclosed_brace(&self, tail: &str) -> String {
+        substitute(
+            "unclosed brace in \"{tail}\"",
+            &[("tail", tail.to_string())],
+        )
     }
 }
 /// Все сообщения крейте с примерами значений.

@@ -83,13 +83,13 @@ impl Watch {
         let mut ready: Vec<PathBuf> = self
             .pending
             .iter()
-            .filter(|(_, at)| now.duration_since(*at) >= SETTLE)
+            .filter(|(_, seen)| now.duration_since(*seen) >= SETTLE)
             .map(|(path, _)| path.clone())
             .collect();
         ready.sort();
         ready.dedup();
         self.pending
-            .retain(|(_, at)| now.duration_since(*at) < SETTLE);
+            .retain(|(_, seen)| now.duration_since(*seen) < SETTLE);
         ready
     }
 

@@ -110,11 +110,11 @@ impl History {
             // Смещения пришли из базы, доверять им нельзя: из-за вывернутого
             // диапазона вычитание переполнилось бы, а кусок за границами
             // буфера уронил бы редактор вместе с несохранённым текстом.
-            let (anchor, head, text) = (read(1), read(5), read(9));
+            let (anchor, head, text_offset) = (read(1), read(5), read(9));
             if head < anchor {
                 return Err(crate::Error::InvalidRecordRange { anchor, head });
             }
-            fits(text, head - anchor, header.buf_len)?;
+            fits(text_offset, head - anchor, header.buf_len)?;
             if kind == REPLACE {
                 fits(read(13), read(17), header.buf_len)?;
             }
@@ -148,7 +148,7 @@ impl History {
             });
             bytes.extend_from_slice(&record.anchor().to_le_bytes());
             bytes.extend_from_slice(&record.head().to_le_bytes());
-            bytes.extend_from_slice(&record.text().to_le_bytes());
+            bytes.extend_from_slice(&record.text_offset().to_le_bytes());
             bytes.extend_from_slice(&removed.to_le_bytes());
             bytes.extend_from_slice(&removed_len.to_le_bytes());
         }
@@ -181,18 +181,18 @@ impl History {
                 INSERT => Record::Insert {
                     anchor: read(1),
                     head: read(5),
-                    text: read(9),
+                    text_offset: read(9),
                 },
                 DELETE => Record::Delete {
                     anchor: read(1),
                     head: read(5),
-                    text: read(9),
+                    text_offset: read(9),
                 },
                 _ => Record::Replace {
                     anchor: read(1),
                     head: read(5),
-                    text: read(9),
-                    removed: read(13),
+                    text_offset: read(9),
+                    removed_offset: read(13),
                     removed_len: read(17),
                 },
             };
@@ -202,11 +202,11 @@ impl History {
         Ok(doc)
     }
 }
-/// Помещается ли кусок `len` байт с позиции `at` в буфер длиной `buf_len`.
-fn fits(at: u32, len: u32, buf_len: usize) -> Result<()> {
-    let end = at as u64 + len as u64;
+/// Помещается ли кусок `len` байт, начиная со смещения `offset`, в буфер `buf_len`.
+fn fits(offset: u32, len: u32, buf_len: usize) -> Result<()> {
+    let end = offset as u64 + len as u64;
     if end > buf_len as u64 {
-        return Err(crate::Error::HistoryOutOfBounds { at, len });
+        return Err(crate::Error::HistoryOutOfBounds { offset, len });
     }
     Ok(())
 }
@@ -227,8 +227,8 @@ struct Header {
 
 impl Header {
     fn parse(b: &[u8]) -> Result<Header> {
-        let u32_at = |at: usize| -> Option<u32> {
-            let c = b.get(at..at + 4)?;
+        let read_u32 = |offset: usize| -> Option<u32> {
+            let c = b.get(offset..offset + 4)?;
             Some(u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         };
         if b.get(..4) != Some(MAGIC.as_slice()) {
@@ -238,16 +238,16 @@ impl Header {
         if version != VERSION {
             return Err(crate::Error::UnknownHistoryVersion { version });
         }
-        let file_len = u32_at(5).ok_or(crate::Error::TruncatedHistory)? as usize;
-        let buf_len = u32_at(9).ok_or(crate::Error::TruncatedHistory)? as usize;
+        let file_len = read_u32(5).ok_or(crate::Error::TruncatedHistory)? as usize;
+        let buf_len = read_u32(9).ok_or(crate::Error::TruncatedHistory)? as usize;
         let buffer_at: usize = 13;
         let records_at = buffer_at
             .checked_add(buf_len)
             .ok_or(crate::Error::TruncatedHistory)?;
-        let count = u32_at(records_at).ok_or(crate::Error::TruncatedHistory)? as usize;
+        let count = read_u32(records_at).ok_or(crate::Error::TruncatedHistory)? as usize;
         let needed = records_at
             .checked_add(4)
-            .and_then(|at| at.checked_add(count.checked_mul(RECORD)?))
+            .and_then(|offset| offset.checked_add(count.checked_mul(RECORD)?))
             .ok_or(crate::Error::TruncatedHistory)?;
         if b.len() < needed {
             return Err(crate::Error::TruncatedHistory);
