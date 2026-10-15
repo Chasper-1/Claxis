@@ -136,6 +136,66 @@ mod tests {
     }
 
     #[test]
+    fn every_binary_message_has_a_sample() {
+        // Каталог строится по примерам. Сообщения, для которого примера нет,
+        // переводчик не увидит никогда — и оно останется английским навсегда.
+        let expected = [
+            "store_failed",
+            "read_file_failed",
+            "buffer_error",
+            "config_dir_failed",
+            "no_home_dir",
+            "no_usable_config",
+            "file_too_large",
+        ];
+        let samples: Vec<&str> = crate::messages::samples()
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        for key in expected {
+            assert!(samples.contains(&key), "нет примера для {key}");
+        }
+
+        let expected = [
+            "terminal_failed",
+            "session_failed",
+            "event_line",
+            "using_last_good",
+            "changed_outside",
+            "unknown_argument",
+            "usage",
+            "opens_editor",
+            "commands_heading",
+            "command_line",
+            "what_messages",
+            "what_help",
+        ];
+        let samples: Vec<&str> = main_messages::samples()
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        for key in expected {
+            assert!(samples.contains(&key), "нет примера для {key}");
+        }
+    }
+
+    #[test]
+    fn every_sample_key_is_unique() {
+        // Повтор ключа в списке переводов означает, что переводчик правит одно и
+        // то же дважды и не понимает, куда.
+        for (name, list) in [
+            ("Claxis", crate::messages::samples()),
+            ("Claxis (main)", main_messages::samples()),
+        ] {
+            let mut seen: Vec<&str> = list.iter().map(|(key, _)| *key).collect();
+            let total = seen.len();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), total, "в {name} повторяются ключи");
+        }
+    }
+
+    #[test]
     fn arguments_are_parsed() {
         assert_eq!(parse(&[]), Command::Run { path: None });
         // Неизвестное слово — это файл, а не ошибка.

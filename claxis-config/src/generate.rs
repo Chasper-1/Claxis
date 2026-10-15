@@ -416,9 +416,9 @@ pub fn write_value(
         table = table
             .get_mut(part)
             .and_then(Item::as_table_mut)
-            .ok_or_else(|| Error::Parse {
+            .ok_or_else(|| Error::NotASection {
                 path: path.display().to_string(),
-                reason: format!("{} is not a section", part),
+                part: part.to_string(),
             })?;
     }
 
@@ -481,9 +481,9 @@ pub fn write_table_value(
         table = table
             .get_mut(part)
             .and_then(Item::as_table_mut)
-            .ok_or_else(|| Error::Parse {
+            .ok_or_else(|| Error::NotASection {
                 path: path.display().to_string(),
-                reason: format!("{part} is not a section"),
+                part: part.to_string(),
             })?;
     }
 
@@ -929,6 +929,27 @@ mod tests {
             "таблица не поехала"
         );
         assert!(folded.contains("после = 1"), "хвост не тронут");
+    }
+
+    #[test]
+    fn a_key_where_a_section_should_be_is_reported() {
+        // Путь к секции занят значением: идти вглубь нельзя, и об этом сказано
+        // внятным видом ошибки, а не готовым текстом внутри `Parse`.
+        let tmp = Temp::new("not-a-section");
+        std::fs::write(tmp.dir().join("config.toml"), "Savescreen = \"строка\"\n").unwrap();
+        let table =
+            crate::schema::find_table(ConfigFile::Global, "Savescreen.Setting.history_usage")
+                .unwrap();
+        let err = write_table_value(tmp.dir(), table, &[("percent", "{percent}")]).unwrap_err();
+        assert!(
+            matches!(err, Error::NotASection { .. }),
+            "получено: {err:?}"
+        );
+        assert!(
+            err.text().contains("Savescreen"),
+            "{text}",
+            text = err.text()
+        );
     }
 
     #[test]

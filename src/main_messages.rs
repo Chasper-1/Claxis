@@ -109,5 +109,8 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ("opens_editor", m.opens_editor()),
         ("commands_heading", m.commands_heading()),
         ("command_line", m.command_line("help", "this help")),
+        ("usage", m.usage("claxis [command] [file]")),
+        ("what_messages", m.what_messages()),
+        ("what_help", m.what_help()),
     ]
 }

@@ -1640,7 +1640,7 @@ fn the_line_map_stays_with_the_document() {
     for _ in 0..600 {
         // Что именно сделали на этом шаге: без этого расхождение бесполезно.
         let done: String;
-        match next(4) {
+        match next(5) {
             0 if !text.is_empty() => {
                 let at = next(text.len());
                 let len = 1 + next((text.len() - at).min(20));
@@ -1652,25 +1652,33 @@ fn the_line_map_stays_with_the_document() {
             }
             1 => {
                 let at = next(text.len() + 1);
-                let piece = if next(2) == 0 { "\n" } else { "ab" };
-                doc.insert(at as u32, piece.as_bytes()).unwrap();
-                text.insert_str(at, piece);
+                let typed = if next(2) == 0 { "\n" } else { "ab" };
+                doc.insert(at as u32, typed.as_bytes()).unwrap();
+                text.insert_str(at, typed);
                 history.push(Op::Insert {
                     at,
-                    len: piece.len(),
+                    len: typed.len(),
                 });
-                done = format!("вставить {piece:?} на {at}");
+                done = format!("вставить {typed:?} на {at}");
             }
             2 => {
                 let at = next(text.len() + 1);
                 let len = next((text.len() - at).min(10));
                 let removed = text[at..at + len].to_string();
-                let piece = "xy\n";
-                doc.replace(at as u32, len as u32, piece.as_bytes())
+                let typed = "xy\n";
+                doc.replace(at as u32, len as u32, typed.as_bytes())
                     .unwrap();
-                text.replace_range(at..at + len, piece);
+                text.replace_range(at..at + len, typed);
                 history.push(Op::Replace { at, removed });
-                done = format!("заменить {at}..{} на {piece:?}", at + len);
+                done = format!("заменить {at}..{} на {typed:?}", at + len);
+            }
+            3 => {
+                // Снапшот текста не меняет, и карта строк после него обязана
+                // остаться в силе. Раньше её пересобирали зря. Зато история
+                // правок обнуляется — как и в эталоне.
+                doc.snapshot();
+                history.clear();
+                done = "снапшот".to_string();
             }
             _ => {
                 let Some(op) = history.pop() else { continue };

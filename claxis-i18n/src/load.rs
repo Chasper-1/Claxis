@@ -56,9 +56,9 @@ fn parse(path: &LangPath, body: &str) -> crate::Result<crate::Catalog> {
     let mut catalog = crate::Catalog::new();
     for (key, item) in doc.as_table().iter() {
         let Some(value) = item.as_str() else {
-            return Err(crate::Error::Parse {
+            return Err(crate::Error::NotAString {
                 path: path.file().display().to_string(),
-                reason: format!("{key}: expected a string"),
+                key: key.to_string(),
             });
         };
         catalog.add(key.to_string(), value.to_string());
@@ -190,9 +190,10 @@ mod tests {
         tmp.write("ru.toml", "\"Open file\" = 42\n");
         let err = load(&tmp.0, "ru").unwrap_err();
         assert!(
-            matches!(err, crate::Error::Parse { .. }),
+            matches!(err, crate::Error::NotAString { .. }),
             "получено: {err:?}"
         );
+        assert!(err.text().contains("Open file"), "в тексте нет ключа");
     }
 
     #[test]
@@ -202,9 +203,10 @@ mod tests {
         tmp.write("ru.toml", "[General]\n\"Open file\" = \"Открыть\"\n");
         let err = load(&tmp.0, "ru").unwrap_err();
         assert!(
-            matches!(err, crate::Error::Parse { .. }),
+            matches!(err, crate::Error::NotAString { .. }),
             "получено: {err:?}"
         );
+        assert!(err.text().contains("General"), "в тексте нет ключа секции");
     }
 
     #[test]

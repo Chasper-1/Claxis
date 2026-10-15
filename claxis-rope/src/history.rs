@@ -96,11 +96,29 @@ impl History {
     /// последней записи, и отвечает заранее: годный блоб или нет.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let header = Header::parse(bytes)?;
-        for kind in bytes[header.records_at..].iter().step_by(RECORD) {
-            let kind = *kind;
+        let mut offset = header.records_at;
+        for _ in 0..header.count {
+            let chunk = bytes
+                .get(offset..offset + RECORD)
+                .ok_or(crate::Error::TruncatedHistory)?;
+            let read =
+                |i: usize| u32::from_le_bytes([chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]]);
+            let kind = chunk[0];
             if kind != INSERT && kind != DELETE && kind != REPLACE {
                 return Err(crate::Error::UnknownRecordKind { kind });
             }
+            // Смещения пришли из базы, доверять им нельзя: из-за вывернутого
+            // диапазона вычитание переполнилось бы, а кусок за границами
+            // буфера уронил бы редактор вместе с несохранённым текстом.
+            let (anchor, head, text) = (read(1), read(5), read(9));
+            if head < anchor {
+                return Err(crate::Error::InvalidRecordRange { anchor, head });
+            }
+            fits(text, head - anchor, header.buf_len)?;
+            if kind == REPLACE {
+                fits(read(13), read(17), header.buf_len)?;
+            }
+            offset += RECORD;
         }
         Ok(Self {
             bytes: bytes.to_vec(),
@@ -143,10 +161,10 @@ impl History {
     /// `text` не нужен — он записан рядом, тем же файлом.
     pub fn restore(&self) -> Result<Document> {
         let header = Header::parse(&self.bytes)?;
-        let b = self.bytes.as_slice();
+        let bytes = self.bytes.as_slice();
         let file_len = header.file_len;
         let buf_len = header.buf_len;
-        let buffer = b
+        let buffer = bytes
             .get(header.buffer_at..header.buffer_at + buf_len)
             .ok_or(crate::Error::TruncatedHistory)?;
         let mut offset = header.records_at;
@@ -154,7 +172,7 @@ impl History {
 
         let mut doc = Document::from_buffer(buffer.to_vec(), file_len);
         for _ in 0..count {
-            let chunk = b
+            let chunk = bytes
                 .get(offset..offset + RECORD)
                 .ok_or(crate::Error::TruncatedHistory)?;
             let read =
@@ -184,6 +202,15 @@ impl History {
         Ok(doc)
     }
 }
+/// Помещается ли кусок `len` байт с позиции `at` в буфер длиной `buf_len`.
+fn fits(at: u32, len: u32, buf_len: usize) -> Result<()> {
+    let end = at as u64 + len as u64;
+    if end > buf_len as u64 {
+        return Err(crate::Error::HistoryOutOfBounds { at, len });
+    }
+    Ok(())
+}
+
 /// Разобранный заголовок: где что лежит.
 struct Header {
     /// Длина текста файла.

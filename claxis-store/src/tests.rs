@@ -30,13 +30,13 @@ impl Drop for Temp {
 }
 
 fn file(name: &str) -> PathBuf {
-    Path::new("/tmp/project").join(name)
+    Path::new("/temp/project").join(name)
 }
 
 #[test]
 fn database_is_created_on_first_open() {
-    let tmp = Temp::new("create");
-    let paths = tmp.paths();
+    let temp = Temp::new("create");
+    let paths = temp.paths();
     assert!(!paths.exists());
     let _ = SnapshotStore::open(&paths, 3).unwrap();
     assert!(paths.exists(), "каталог должен быть создан");
@@ -45,37 +45,37 @@ fn database_is_created_on_first_open() {
 
 #[test]
 fn snapshot_survives_reopen() {
-    let tmp = Temp::new("reopen");
-    let f = file("a.rs");
+    let temp = Temp::new("reopen");
+    let target = file("a.rs");
     {
-        let mut store = tmp.store(3);
-        store.put(&f, "первый".as_bytes(), b"").unwrap();
+        let mut store = temp.store(3);
+        store.put(&target, "первый".as_bytes(), b"").unwrap();
     }
     {
-        let store = tmp.store(3);
-        let snap = store
-            .latest(&f)
+        let store = temp.store(3);
+        let snapshot = store
+            .latest(&target)
             .unwrap()
             .expect("снапшот должен сохраниться");
-        assert_eq!(snap.text, "первый".as_bytes());
+        assert_eq!(snapshot.text, "первый".as_bytes());
     }
 }
 
 #[test]
 fn keep_limits_snapshots_per_file() {
     // Три снапшота на файл: четвёртый вытесняет самый старый.
-    let tmp = Temp::new("ring");
-    let f = file("a.rs");
-    let mut store = tmp.store(3);
+    let temp = Temp::new("ring");
+    let target = file("a.rs");
+    let mut store = temp.store(3);
 
     for i in 0..5 {
         store
-            .put(&f, format!("снапшот {i}").as_bytes(), b"")
+            .put(&target, format!("снапшот {i}").as_bytes(), b"")
             .unwrap();
     }
 
-    assert_eq!(store.count(&f).unwrap(), 3);
-    let list = store.list(&f).unwrap();
+    assert_eq!(store.count(&target).unwrap(), 3);
+    let list = store.list(&target).unwrap();
     let texts: Vec<String> = list
         .iter()
         .map(|s| String::from_utf8_lossy(&s.text).into_owned())
@@ -90,28 +90,32 @@ fn keep_limits_snapshots_per_file() {
 #[test]
 fn zero_keep_saves_nothing_and_destroys_nothing() {
     // Ноль — честный выбор: на диск не пишется ничего, но вызовы не падают.
-    let tmp = Temp::new("keep-zero");
-    let f = file("a.rs");
-    let mut store = tmp.store(0);
+    let temp = Temp::new("keep-zero");
+    let target = file("a.rs");
+    let mut store = temp.store(0);
     for i in 0..5 {
-        store.put(&f, format!("{i}").as_bytes(), b"").unwrap();
+        store.put(&target, format!("{i}").as_bytes(), b"").unwrap();
     }
-    assert_eq!(store.count(&f).unwrap(), 0, "при keep = 0 писать нечего");
-    assert!(store.latest(&f).unwrap().is_none());
+    assert_eq!(
+        store.count(&target).unwrap(),
+        0,
+        "при keep = 0 писать нечего"
+    );
+    assert!(store.latest(&target).unwrap().is_none());
 }
 
 #[test]
 fn keep_is_respected_for_any_value() {
     // Настройка из конфига: хоть один снапшот, хоть десять.
     for keep in [1u8, 2, 7, 10] {
-        let tmp = Temp::new(&format!("keep{keep}"));
-        let f = file("a.rs");
-        let mut store = tmp.store(keep);
+        let temp = Temp::new(&format!("keep{keep}"));
+        let target = file("a.rs");
+        let mut store = temp.store(keep);
         for i in 0..keep + 3 {
-            store.put(&f, format!("{i}").as_bytes(), b"").unwrap();
+            store.put(&target, format!("{i}").as_bytes(), b"").unwrap();
         }
         assert_eq!(
-            store.count(&f).unwrap(),
+            store.count(&target).unwrap(),
             keep as u32,
             "keep={keep} не соблюдён"
         );
@@ -121,10 +125,10 @@ fn keep_is_respected_for_any_value() {
 #[test]
 fn different_files_have_separate_rings() {
     // Кольцо у каждого файла своё: снапшоты других файлов не вытесняются.
-    let tmp = Temp::new("separate");
+    let temp = Temp::new("separate");
     let a = file("a.rs");
     let b = file("b.rs");
-    let mut store = tmp.store(2);
+    let mut store = temp.store(2);
 
     store.put(&a, b"a0", b"").unwrap();
     store.put(&a, b"a1", b"").unwrap();
@@ -140,50 +144,50 @@ fn different_files_have_separate_rings() {
 #[test]
 fn empty_text_is_stored_fine() {
     // Пустой документ — обычный снапшот.
-    let tmp = Temp::new("empty");
-    let f = file("empty.rs");
-    let mut store = tmp.store(3);
-    store.put(&f, b"", b"").unwrap();
-    let snap = store.latest(&f).unwrap().unwrap();
-    assert!(snap.text.is_empty());
+    let temp = Temp::new("empty");
+    let target = file("empty.rs");
+    let mut store = temp.store(3);
+    store.put(&target, b"", b"").unwrap();
+    let snapshot = store.latest(&target).unwrap().unwrap();
+    assert!(snapshot.text.is_empty());
 }
 
 #[test]
 fn large_text_round_trips_unchanged() {
     // Много байт с любыми значениями, включая ноль и не-UTF8.
-    let tmp = Temp::new("large");
-    let f = file("big.rs");
-    let mut store = tmp.store(3);
+    let temp = Temp::new("large");
+    let target = file("big.rs");
+    let mut store = temp.store(3);
     let text: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
-    store.put(&f, &text, b"").unwrap();
-    let snap = store.latest(&f).unwrap().unwrap();
-    assert_eq!(snap.text.len(), text.len(), "длина не совпала");
-    assert_eq!(snap.text, text, "содержимое не совпало");
+    store.put(&target, &text, b"").unwrap();
+    let snapshot = store.latest(&target).unwrap().unwrap();
+    assert_eq!(snapshot.text.len(), text.len(), "длина не совпала");
+    assert_eq!(snapshot.text, text, "содержимое не совпало");
     // Нули в данных тоже должны выжить — это проверка на то, что блоб
     // сохраняется целиком, а не до первого нуля.
     let zeros = (0..500_000u32).filter(|i| i % 251 == 0).count();
-    assert_eq!(snap.text.iter().filter(|&&b| b == 0).count(), zeros);
+    assert_eq!(snapshot.text.iter().filter(|&&b| b == 0).count(), zeros);
 }
 
 #[test]
 fn get_by_seq_and_missing_is_none() {
-    let tmp = Temp::new("byseq");
-    let f = file("a.rs");
-    let mut store = tmp.store(3);
-    store.put(&f, "первый".as_bytes(), b"").unwrap();
-    let seq = store.latest(&f).unwrap().unwrap().seq;
-    let by_seq = store.get(&f, seq).unwrap().expect("снапшот по номеру");
+    let temp = Temp::new("byseq");
+    let target = file("a.rs");
+    let mut store = temp.store(3);
+    store.put(&target, "первый".as_bytes(), b"").unwrap();
+    let seq = store.latest(&target).unwrap().unwrap().seq;
+    let by_seq = store.get(&target, seq).unwrap().expect("снапшот по номеру");
     assert_eq!(by_seq.text, "первый".as_bytes());
-    assert!(store.get(&f, 999_999).unwrap().is_none());
+    assert!(store.get(&target, 999_999).unwrap().is_none());
     assert!(store.latest(&file("нет-такого.rs")).unwrap().is_none());
 }
 
 #[test]
 fn forget_removes_only_that_file() {
-    let tmp = Temp::new("forget");
+    let temp = Temp::new("forget");
     let a = file("a.rs");
     let b = file("b.rs");
-    let mut store = tmp.store(3);
+    let mut store = temp.store(3);
     store.put(&a, b"a", b"").unwrap();
     store.put(&b, b"b", b"").unwrap();
     store.forget(&a).unwrap();
@@ -194,17 +198,21 @@ fn forget_removes_only_that_file() {
 #[test]
 fn reopening_keeps_existing_snapshots() {
     // Второе открытие не стирает то, что записано ранее.
-    let tmp = Temp::new("keep-on-reopen");
-    let f = file("a.rs");
+    let temp = Temp::new("keep-on-reopen");
+    let target = file("a.rs");
     {
-        let mut store = tmp.store(3);
-        store.put(&f, "из первого запуска".as_bytes(), b"").unwrap();
+        let mut store = temp.store(3);
+        store
+            .put(&target, "из первого запуска".as_bytes(), b"")
+            .unwrap();
     }
     {
-        let mut store = tmp.store(3);
-        assert_eq!(store.count(&f).unwrap(), 1);
-        store.put(&f, "из второго запуска".as_bytes(), b"").unwrap();
-        let list = store.list(&f).unwrap();
+        let mut store = temp.store(3);
+        assert_eq!(store.count(&target).unwrap(), 1);
+        store
+            .put(&target, "из второго запуска".as_bytes(), b"")
+            .unwrap();
+        let list = store.list(&target).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].text, "из второго запуска".as_bytes());
         assert_eq!(list[1].text, "из первого запуска".as_bytes());
@@ -215,24 +223,32 @@ fn reopening_keeps_existing_snapshots() {
 fn two_stores_on_one_database() {
     // Два независимых подключения к одной базе работают одновременно —
     // это то, ради чего выбрана sqlite, а не база с эксклюзивным локом.
-    let tmp = Temp::new("two");
-    let f = file("a.rs");
-    let mut first = tmp.store(3);
-    first.put(&f, "первый".as_bytes(), b"").unwrap();
+    let temp = Temp::new("two");
+    let target = file("a.rs");
+    let mut first = temp.store(3);
+    first.put(&target, "первый".as_bytes(), b"").unwrap();
 
-    let mut second = SnapshotStore::open(&tmp.paths(), 3).unwrap();
-    second.put(&f, "второй".as_bytes(), b"").unwrap();
+    let mut second = SnapshotStore::open(&temp.paths(), 3).unwrap();
+    second.put(&target, "второй".as_bytes(), b"").unwrap();
 
-    assert_eq!(first.count(&f).unwrap(), 2, "первый видит запись второго");
-    assert_eq!(second.count(&f).unwrap(), 2, "второй видит запись первого");
+    assert_eq!(
+        first.count(&target).unwrap(),
+        2,
+        "первый видит запись второго"
+    );
+    assert_eq!(
+        second.count(&target).unwrap(),
+        2,
+        "второй видит запись первого"
+    );
 }
 
 #[test]
 fn size_on_disk_is_reported() {
-    let tmp = Temp::new("size");
-    let f = file("a.rs");
-    let mut store = tmp.store(3);
-    store.put(&f, &vec![b'x'; 100_000], b"").unwrap();
+    let temp = Temp::new("size");
+    let target = file("a.rs");
+    let mut store = temp.store(3);
+    store.put(&target, &vec![b'x'; 100_000], b"").unwrap();
     let size = store.size_on_disk().unwrap();
     assert!(size > 0, "размер должен быть известен");
     assert!(store.keep() == 3);
@@ -253,8 +269,8 @@ fn store_paths_from_env_have_claxis_dir() {
 #[test]
 fn last_good_config_round_trip() {
     // Последний корректный конфиг переживает перезапуск редактора.
-    let tmp = Temp::new("last-good");
-    let store = tmp.store(3);
+    let temp = Temp::new("last-good");
+    let store = temp.store(3);
     assert!(store.last_good("config").unwrap().is_none());
 
     let mut store = store;
@@ -269,8 +285,8 @@ fn last_good_config_round_trip() {
 
 #[test]
 fn last_good_config_overwrites_and_forgets() {
-    let tmp = Temp::new("last-good-overwrite");
-    let mut store = tmp.store(3);
+    let temp = Temp::new("last-good-overwrite");
+    let mut store = temp.store(3);
 
     store.save_last_good("config", "old").unwrap();
     store.save_last_good("config", "new").unwrap();
@@ -289,11 +305,11 @@ fn last_good_config_overwrites_and_forgets() {
 #[test]
 fn last_good_survives_reopening() {
     // Перезапуск редактора не должен терять сохранённый конфиг.
-    let tmp = Temp::new("last-good-reopen");
+    let temp = Temp::new("last-good-reopen");
     {
-        let mut store = tmp.store(3);
+        let mut store = temp.store(3);
         store.save_last_good("config", "body").unwrap();
     }
-    let store = tmp.store(3);
+    let store = temp.store(3);
     assert_eq!(store.last_good("config").unwrap().as_deref(), Some("body"));
 }

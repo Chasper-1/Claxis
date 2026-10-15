@@ -40,6 +40,16 @@ pub trait Messages {
     /// `{kind}` — что пришло в байте вида.
     fn unknown_record_kind(&self, kind: u8) -> String;
 
+    /// Запись истории ссылается на кусок буфера, которого нет.
+    ///
+    /// `{from}` и `{to}` — границы куска, которого не оказалось.
+    fn history_out_of_bounds(&self, from: u32, to: u32) -> String;
+
+    /// Запись истории вывернута: начало дальше конца.
+    ///
+    /// `{anchor}` и `{head}` — границы диапазона из записи.
+    fn invalid_record_range(&self, anchor: u32, head: u32) -> String;
+
     /// В переводе встретилось имя, которого нет среди известных.
     ///
     /// `{got}` — что пришло, `{expected}` — какие имена допустимы.
@@ -142,6 +152,20 @@ impl Messages for En {
         )
     }
 
+    fn history_out_of_bounds(&self, from: u32, to: u32) -> String {
+        substitute(
+            "rope history points outside the buffer: {from}..{to}",
+            &[("from", from.to_string()), ("to", to.to_string())],
+        )
+    }
+
+    fn invalid_record_range(&self, anchor: u32, head: u32) -> String {
+        substitute(
+            "rope history record has a backwards range: {anchor}..{head}",
+            &[("anchor", anchor.to_string()), ("head", head.to_string())],
+        )
+    }
+
     fn bad_placeholder(&self, got: &str, expected: &[&str]) -> String {
         substitute(
             "unknown placeholder {{{got}}}: expected one of {expected}",
@@ -168,6 +192,8 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ("unknown_history_version", m.unknown_history_version(7)),
         ("truncated_history", m.truncated_history()),
         ("unknown_record_kind", m.unknown_record_kind(9)),
+        ("history_out_of_bounds", m.history_out_of_bounds(100, 150)),
+        ("invalid_record_range", m.invalid_record_range(90, 10)),
         (
             "bad_placeholder",
             m.bad_placeholder("capasity", &["capacity", "depth"]),

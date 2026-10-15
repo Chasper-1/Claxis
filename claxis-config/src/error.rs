@@ -63,6 +63,16 @@ pub enum Error {
         /// Какой ключ не признан.
         key: String,
     },
+    /// В пути к секции что-то есть, а секцией это не является: `{path}`, `{part}`.
+    ///
+    /// Отдельный вид, а не `Parse` с готовым текстом: сообщение собирает
+    /// каталог, иначе перевести его нечем.
+    NotASection {
+        /// Путь к файлу.
+        path: String,
+        /// Кусок пути, который оказался не таблицей.
+        part: String,
+    },
 }
 
 impl Error {
@@ -77,6 +87,7 @@ impl Error {
             Error::WrongSection { key, want, got } => m.wrong_section(key, want, got),
             Error::NoLastGood => m.no_last_good(),
             Error::UnknownKeyInFile { file, key } => m.unknown_key_in_file(file, key),
+            Error::NotASection { path, part } => m.not_a_section(path, part),
         }
     }
 

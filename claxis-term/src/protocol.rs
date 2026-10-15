@@ -78,10 +78,10 @@ fn query() -> Option<u16> {
 
 /// Разобрать ответ `CSI ? flags ; mode u`.
 fn parse_response(buf: &[u8]) -> Option<u16> {
-    let s = std::str::from_utf8(buf).ok()?;
+    let answer = std::str::from_utf8(buf).ok()?;
     // Ищем ESC [ ? ... u
-    let start = s.find("\x1b[?")?;
-    let rest = &s[start + 3..];
+    let start = answer.find("\x1b[?")?;
+    let rest = &answer[start + 3..];
     let end = rest.find('u')?;
     let body = &rest[..end];
     // body = "flags ; mode"

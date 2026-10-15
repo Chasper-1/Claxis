@@ -7,8 +7,8 @@ use crate::node::{FREE, Leaf, NIL, Node};
 
 /// Приёмник куска текста при обходе.
 pub trait Sink {
-    /// Текст диапазона.
-    fn piece(&mut self, start: u32, len: u32);
+    /// Диапазон буфера: откуда и сколько.
+    fn range(&mut self, start: u32, len: u32);
 }
 
 /// Пул узлов: выделяется сразу и больше не растёт.
@@ -488,7 +488,7 @@ impl Tree {
         }
         let node = self.nodes[idx as usize];
         if node.is_leaf() {
-            sink.piece(node.start(), node.leaf_len());
+            sink.range(node.start(), node.leaf_len());
         } else {
             self.walk(node.left(), sink);
             self.walk(node.right(), sink);
@@ -516,7 +516,7 @@ impl Tree {
             let from = start.saturating_sub(base);
             let to = (end - base).min(node.leaf_len());
             if from < to {
-                sink.piece(node.start() + from, to - from);
+                sink.range(node.start() + from, to - from);
             }
             return;
         }

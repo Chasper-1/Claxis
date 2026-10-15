@@ -10,7 +10,7 @@ use claxis_rope::Document;
 /// Правка в эталоне и в документе.
 #[derive(Clone, Debug)]
 enum Op {
-    Insert { at: usize, piece: String },
+    Insert { at: usize, text: String },
     Delete { at: usize, len: usize },
     Replace { at: usize, len: usize },
     Undo,
@@ -25,15 +25,18 @@ fn run(ops: &[Op]) -> Option<(String, String)> {
 
     for op in ops {
         match *op {
-            Op::Insert { at, ref piece } => {
+            Op::Insert {
+                at,
+                text: ref typed,
+            } => {
                 // После удаления лишней операции позиции могут выйти за текст.
                 // Такая правка просто не выполняется — с обеих сторон одинаково.
                 if at > text.len() {
                     continue;
                 }
-                doc.insert(at as u32, piece.as_bytes()).unwrap();
-                text.insert_str(at, piece);
-                history.push((1, at, piece.len(), String::new()));
+                doc.insert(at as u32, typed.as_bytes()).unwrap();
+                text.insert_str(at, typed);
+                history.push((1, at, typed.len(), String::new()));
             }
             Op::Delete { at, len } => {
                 if at + len > text.len() {
@@ -112,11 +115,11 @@ fn random_ops(seed: u64, count: usize) -> Vec<Op> {
             }
             1 => {
                 let at = rng.below(text.len() + 1);
-                let piece = if rng.below(2) == 0 { "\n" } else { "ab" };
-                text.insert_str(at, piece);
+                let typed = if rng.below(2) == 0 { "\n" } else { "ab" };
+                text.insert_str(at, typed);
                 Op::Insert {
                     at,
-                    piece: piece.to_string(),
+                    text: typed.to_string(),
                 }
             }
             2 => {

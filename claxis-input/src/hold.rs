@@ -30,6 +30,11 @@ impl HoldKey {
     pub fn window_ms(&self) -> u128 {
         self.window.as_millis()
     }
+
+    /// Окно в миллисекундах целым числом: сравнения с вводом без дробей.
+    pub fn window_millis(&self) -> u64 {
+        self.window.as_millis() as u64
+    }
 }
 
 /// Настройки удержания: окно для каждой клавиши.
@@ -126,7 +131,7 @@ pub fn resolve(hold: &Hold, key: &str, held_ms: u64) -> Resolved {
     match hold.window(key) {
         None => Resolved::Tapped,
         Some(window) => {
-            if held_ms < window_ms(window) {
+            if held_ms < window_millis(window) {
                 Resolved::Tapped
             } else {
                 Resolved::Held
@@ -136,7 +141,7 @@ pub fn resolve(hold: &Hold, key: &str, held_ms: u64) -> Resolved {
 }
 
 /// Окно в целых миллисекундах.
-fn window_ms(window: Duration) -> u64 {
+fn window_millis(window: Duration) -> u64 {
     window.as_millis() as u64
 }
 
@@ -144,66 +149,66 @@ fn window_ms(window: Duration) -> u64 {
 mod tests {
     use super::*;
 
-    fn hold() -> Hold {
+    fn two_keys() -> Hold {
         Hold::from_pairs([("alt", 200), ("ctrl", 200)])
     }
 
     #[test]
     fn defaults_have_two_keys_of_200() {
-        let h = Hold::defaults();
-        assert_eq!(h.len(), 2, "по умолчанию две клавиши");
-        assert_eq!(h.window("alt"), Some(Duration::from_millis(200)));
-        assert_eq!(h.window("ctrl"), Some(Duration::from_millis(200)));
+        let hold = Hold::defaults();
+        assert_eq!(hold.len(), 2, "по умолчанию две клавиши");
+        assert_eq!(hold.window("alt"), Some(Duration::from_millis(200)));
+        assert_eq!(hold.window("ctrl"), Some(Duration::from_millis(200)));
     }
 
     #[test]
     fn quick_release_is_a_tap() {
         // Нажали и отпустили быстро — обычное действие.
-        assert_eq!(resolve(&hold(), "alt", 0), Resolved::Tapped);
-        assert_eq!(resolve(&hold(), "alt", 100), Resolved::Tapped);
-        assert_eq!(resolve(&hold(), "alt", 199), Resolved::Tapped);
+        assert_eq!(resolve(&two_keys(), "alt", 0), Resolved::Tapped);
+        assert_eq!(resolve(&two_keys(), "alt", 100), Resolved::Tapped);
+        assert_eq!(resolve(&two_keys(), "alt", 199), Resolved::Tapped);
     }
 
     #[test]
     fn slow_release_is_a_hold() {
         // Окно истекло, палец не отпустил — удержание.
-        assert_eq!(resolve(&hold(), "alt", 200), Resolved::Held);
-        assert_eq!(resolve(&hold(), "alt", 5000), Resolved::Held);
+        assert_eq!(resolve(&two_keys(), "alt", 200), Resolved::Held);
+        assert_eq!(resolve(&two_keys(), "alt", 5000), Resolved::Held);
     }
 
     #[test]
     fn each_key_has_its_own_window() {
-        let mut h = hold();
-        h.set("space", Duration::from_millis(50));
+        let mut hold = two_keys();
+        hold.set("space", Duration::from_millis(50));
         // Быстрые клавиши удержанием не считаются.
-        assert_eq!(resolve(&h, "space", 60), Resolved::Held);
+        assert_eq!(resolve(&hold, "space", 60), Resolved::Held);
         // Долгие по-прежнему ждут своё окно.
-        assert_eq!(resolve(&h, "alt", 60), Resolved::Tapped);
+        assert_eq!(resolve(&hold, "alt", 60), Resolved::Tapped);
     }
 
     #[test]
     fn plain_key_is_always_a_tap() {
         // У клавиши без окна второго значения нет: она не может удерживаться.
         // Иначе каждый символ ждал бы окончания окна.
-        assert_eq!(resolve(&hold(), "a", 10_000), Resolved::Tapped);
-        assert!(!hold().holds("a"));
+        assert_eq!(resolve(&two_keys(), "a", 10_000), Resolved::Tapped);
+        assert!(!two_keys().holds("a"));
     }
 
     #[test]
     fn keys_can_be_added_without_limit() {
-        let mut h = hold();
-        h.set("space", Duration::from_millis(120));
-        h.set("tab", Duration::from_millis(300));
-        assert_eq!(h.len(), 4);
-        assert_eq!(h.window("tab"), Some(Duration::from_millis(300)));
+        let mut hold = two_keys();
+        hold.set("space", Duration::from_millis(120));
+        hold.set("tab", Duration::from_millis(300));
+        assert_eq!(hold.len(), 4);
+        assert_eq!(hold.window("tab"), Some(Duration::from_millis(300)));
     }
 
     #[test]
     fn empty_hold_makes_everything_a_tap() {
         // Пока удержание не настроено, редактор работает как обычный.
-        let h = Hold::new();
-        assert!(h.is_empty());
-        assert_eq!(resolve(&h, "alt", 9999), Resolved::Tapped);
+        let hold = Hold::new();
+        assert!(hold.is_empty());
+        assert_eq!(resolve(&hold, "alt", 9999), Resolved::Tapped);
     }
 
     #[test]

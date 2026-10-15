@@ -26,6 +26,8 @@ pub enum StartError {
         /// Почему недоступен.
         reason: String,
     },
+    /// Домашнего каталога нет: конфиг положить некуда.
+    NoHomeDir,
     /// Конфиг сломан настолько, что продолжать не с чем.
     ///
     /// Так бывает, только если сломаны все файлы разом и запасной не
@@ -42,6 +44,7 @@ impl StartError {
         match self {
             StartError::Session(e) => e.message(m),
             StartError::ConfigDir { path, reason } => m.config_dir_failed(path, reason),
+            StartError::NoHomeDir => m.no_home_dir(),
             StartError::NoUsableConfig { issues } => m.no_usable_config(*issues),
         }
     }
@@ -117,10 +120,7 @@ impl Reloaded {
 impl Editor {
     /// Открыть редактор с конфигом пользователя и хранилищем в кеше.
     pub fn open() -> Result<Self, StartError> {
-        let dir = crate::api::config::path::user_dir().ok_or_else(|| StartError::ConfigDir {
-            path: "?".to_string(),
-            reason: "cannot find the home directory".to_string(),
-        })?;
+        let dir = crate::api::config::path::user_dir().ok_or(StartError::NoHomeDir)?;
         let store_dir = crate::api::store::StorePaths::from_env().dir;
         Self::open_in(&dir, &store_dir)
     }

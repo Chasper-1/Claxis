@@ -17,6 +17,10 @@ pub trait Messages {
     fn write_failed(&self, path: &str, reason: &str) -> String;
     /// Файл разобран неправильно.
     fn parse_failed(&self, path: &str, reason: &str) -> String;
+    /// В пути к секции что-то есть, а секцией это не является.
+    ///
+    /// `{path}` — файл, `{part}` — кусок пути, который оказался не таблицей.
+    fn not_a_section(&self, path: &str, part: &str) -> String;
     /// Ключа нет в схеме.
     fn unknown_key(&self, key: &str) -> String;
     /// Значение не того типа.
@@ -85,6 +89,13 @@ impl Messages for En {
 
     fn unknown_key(&self, key: &str) -> String {
         substitute("unknown key: {key}", &[("key", key.to_string())])
+    }
+
+    fn not_a_section(&self, path: &str, part: &str) -> String {
+        substitute(
+            "cannot use config {path}: {part} is not a section",
+            &[("path", path.to_string()), ("part", part.to_string())],
+        )
     }
 
     fn bad_value(&self, key: &str, got: &str, expected: &str) -> String {
@@ -197,6 +208,20 @@ pub fn samples() -> Vec<(&'static str, String)> {
         (
             "unknown_key_in_file",
             m.unknown_key_in_file("files.toml", "General.history_depth"),
+        ),
+        // Сводная строка проблемы: переводчик видит, как выглядит всё вместе.
+        (
+            "issue",
+            m.issue(&crate::load::Issue {
+                file: "files.toml",
+                line: 12,
+                key: "General.history_dept".to_string(),
+                problem: crate::load::Problem::UnknownKey,
+            }),
+        ),
+        (
+            "not_a_section",
+            m.not_a_section("edit.toml", "General.history_depth"),
         ),
     ]
 }

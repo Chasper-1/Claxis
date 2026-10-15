@@ -16,6 +16,8 @@ pub trait Messages {
     fn buffer_error(&self, error: &crate::api::rope::Error) -> String;
     /// Каталог конфига недоступен: `{path}`, `{reason}`.
     fn config_dir_failed(&self, path: &str, reason: &str) -> String;
+    /// Домашнего каталога нет: конфиг положить некуда.
+    fn no_home_dir(&self) -> String;
     /// Сломано столько проблем, что работать не с чем: `{issues}`.
     fn no_usable_config(&self, issues: usize) -> String;
     /// Файл больше, чем помещается в `u32`.
@@ -56,6 +58,10 @@ impl Messages for En {
             "cannot use config directory {path}: {reason}",
             &[("path", path.to_string()), ("reason", reason.to_string())],
         )
+    }
+
+    fn no_home_dir(&self) -> String {
+        "cannot find the home directory, so there is nowhere to keep the config".to_string()
     }
 
     fn no_usable_config(&self, issues: usize) -> String {
@@ -102,6 +108,7 @@ pub fn samples() -> Vec<(&'static str, String)> {
             "config_dir_failed",
             m.config_dir_failed("/home/user/.config/claxis", "no access"),
         ),
+        ("no_home_dir", m.no_home_dir()),
         ("no_usable_config", m.no_usable_config(2)),
         (
             "file_too_large",

@@ -254,15 +254,15 @@ fn against_a_reference_string_with_undo_redo_mix() {
                 cursor = history.len();
             } else if roll < 7 {
                 let pos = rng.below(text.len() + 1);
-                let piece: String = (0..rng.below(30) + 1)
+                let typed: String = (0..rng.below(30) + 1)
                     .map(|_| (b'a' + rng.below(26) as u8) as char)
                     .collect();
-                doc.insert(pos as u32, piece.as_bytes()).unwrap();
-                text.insert_str(pos, &piece);
+                doc.insert(pos as u32, typed.as_bytes()).unwrap();
+                text.insert_str(pos, &typed);
                 history.truncate(cursor);
                 history.push(Op::Insert {
                     pos,
-                    text: piece.into_bytes(),
+                    text: typed.into_bytes(),
                 });
                 cursor = history.len();
             } else if roll < 9 {
@@ -271,17 +271,17 @@ fn against_a_reference_string_with_undo_redo_mix() {
                 let pos = rng.below(text.len() + 1);
                 let len = rng.below((text.len() - pos).min(40));
                 let removed = text.as_bytes()[pos..pos + len].to_vec();
-                let piece: String = (0..rng.below(20) + 1)
+                let typed: String = (0..rng.below(20) + 1)
                     .map(|_| (b'a' + rng.below(26) as u8) as char)
                     .collect();
-                doc.replace(pos as u32, len as u32, piece.as_bytes())
+                doc.replace(pos as u32, len as u32, typed.as_bytes())
                     .unwrap();
-                text.replace_range(pos..pos + len, &piece);
+                text.replace_range(pos..pos + len, &typed);
                 history.truncate(cursor);
                 history.push(Op::Replace {
                     pos,
                     removed,
-                    text: piece.into_bytes(),
+                    text: typed.into_bytes(),
                 });
                 cursor = history.len();
             } else if roll == 9 && cursor > 0 {
@@ -513,6 +513,55 @@ fn an_unknown_record_kind_is_refused() {
 }
 
 #[test]
+fn a_record_with_a_backwards_range_is_refused() {
+    // Из-за `head - anchor` переполнилось бы вычитание, а это паника.
+    let mut doc = d("abc");
+    doc.insert(3, b"XY").unwrap();
+    let mut bytes = crate::history::History::capture(&doc).as_bytes().to_vec();
+    let last = bytes.len() - crate::history::RECORD_SIZE;
+    // anchor и head стоят подряд, начиная с первого поля записи.
+    bytes[last + 1..last + 5].copy_from_slice(&9u32.to_le_bytes());
+    bytes[last + 5..last + 9].copy_from_slice(&2u32.to_le_bytes());
+    assert_eq!(
+        crate::history::History::decode(&bytes).unwrap_err(),
+        Error::InvalidRecordRange { anchor: 9, head: 2 }
+    );
+}
+
+#[test]
+fn a_record_pointing_outside_the_buffer_is_refused() {
+    // Куски за границами буфера не существует. Раньше отмена удаления резала
+    // буфер по такому смещению и роняла редактор вместе с текстом.
+    let mut doc = d("abc");
+    doc.insert(3, b"XY").unwrap();
+    doc.delete(0, 1).unwrap();
+    let mut bytes = crate::history::History::capture(&doc).as_bytes().to_vec();
+    let last = bytes.len() - crate::history::RECORD_SIZE;
+    bytes[last + 9..last + 13].copy_from_slice(&9_000u32.to_le_bytes());
+    assert_eq!(
+        crate::history::History::decode(&bytes).unwrap_err(),
+        Error::HistoryOutOfBounds { at: 9_000, len: 1 }
+    );
+}
+
+#[test]
+fn a_captured_history_survives_a_round_trip() {
+    // Обратная сторона проверок: хорошая история разбирается и восстанавливается.
+    let mut doc = d("abc");
+    doc.insert(3, b"XY").unwrap();
+    doc.replace(0, 2, b"Z").unwrap();
+    doc.delete(1, 1).unwrap();
+    let history = crate::history::History::capture(&doc);
+    let mut restored = crate::history::History::decode(history.as_bytes())
+        .unwrap()
+        .restore()
+        .unwrap();
+    assert_eq!(restored.read(), doc.read());
+    restored.undo().unwrap().expect("отменять есть что");
+    assert_eq!(restored.read(), b"ZcXY");
+}
+
+#[test]
 fn errors_speak_through_the_catalog() {
     // Ошибка не несёт готовой строки: текст собирает каталог, иначе её нельзя
     // будет перевести.
@@ -597,7 +646,7 @@ fn deleting_the_whole_document_is_the_same_as_a_new_one() {
 }
 
 #[test]
-fn a_big_piece_is_inserted_in_one_move() {
+fn a_big_text_is_inserted_in_one_move() {
     // Кусок больше одного листа: вставка идёт одним куском, а читаться и
     // вырезаться он должен так же, как много мелких.
     let chunk: Vec<u8> = (0..50_000u32).map(|i| b'a' + (i % 26) as u8).collect();
@@ -791,11 +840,11 @@ fn the_replace_survives_a_random_mix_with_undo() {
             }
             1 => {
                 let at = rng.below(text.len() + 1);
-                let piece = if rng.below(2) == 0 { "\n" } else { "ab" };
-                doc.insert(at as u32, piece.as_bytes()).unwrap();
-                text.insert_str(at, piece);
-                history.push((1, at, piece.len(), String::new()));
-                log.push(format!("insert {at} {piece:?}"));
+                let typed = if rng.below(2) == 0 { "\n" } else { "ab" };
+                doc.insert(at as u32, typed.as_bytes()).unwrap();
+                text.insert_str(at, typed);
+                history.push((1, at, typed.len(), String::new()));
+                log.push(format!("insert {at} {typed:?}"));
             }
             2 => {
                 let at = rng.below(text.len() + 1);

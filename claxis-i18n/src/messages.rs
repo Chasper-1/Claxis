@@ -20,6 +20,8 @@ pub trait Messages {
     fn incomplete(&self, lang: &str, count: usize, total: usize) -> String;
     /// Ключ повторяется дважды.
     fn duplicate_key(&self, lang: &str, key: &str) -> String;
+    /// Значение перевода оказалось не строкой: `{path}`, `{key}`.
+    fn not_a_string(&self, path: &str, key: &str) -> String;
 }
 
 /// Английские сообщения — язык по умолчанию.
@@ -62,6 +64,13 @@ impl Messages for En {
             &[("lang", lang.to_string()), ("key", key.to_string())],
         )
     }
+
+    fn not_a_string(&self, path: &str, key: &str) -> String {
+        substitute(
+            "translation {path}: value of {key} is not a string",
+            &[("path", path.to_string()), ("key", key.to_string())],
+        )
+    }
 }
 /// Все сообщения крейте с примерами значений.
 pub fn samples() -> Vec<(&'static str, String)> {
@@ -81,5 +90,9 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ),
         ("incomplete", m.incomplete("ru", 12, 340)),
         ("duplicate_key", m.duplicate_key("ru", "Open file")),
+        (
+            "not_a_string",
+            m.not_a_string("/home/u/.config/claxis/lang/ru.toml", "Open file"),
+        ),
     ]
 }

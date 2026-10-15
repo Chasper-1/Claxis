@@ -146,6 +146,25 @@ pub enum Error {
         /// Что пришло в байте вида.
         kind: u8,
     },
+    /// Запись истории ссылается на кусок буфера, которого нет.
+    ///
+    /// Смещения приходят из блоба, написанного прошлым запуском. Битый блоб —
+    /// это ошибка данных, а не повод ронять редактор вместе с текстом.
+    HistoryOutOfBounds {
+        /// Откуда кусок.
+        at: u32,
+        /// Сколько байт просили.
+        len: u32,
+    },
+    /// Запись истории противоречива: диапазон вывернут наоборот.
+    ///
+    /// Всё то же самое, что битый блоб из базы: данные не наши или испорчены.
+    InvalidRecordRange {
+        /// Откуда диапазон.
+        anchor: u32,
+        /// Куда диапазон.
+        head: u32,
+    },
 }
 
 impl Error {
@@ -166,6 +185,12 @@ impl Error {
             Error::UnknownHistoryVersion { version } => messages.unknown_history_version(*version),
             Error::TruncatedHistory => messages.truncated_history(),
             Error::UnknownRecordKind { kind } => messages.unknown_record_kind(*kind),
+            Error::HistoryOutOfBounds { at, len } => {
+                messages.history_out_of_bounds(*at, at.saturating_add(*len))
+            }
+            Error::InvalidRecordRange { anchor, head } => {
+                messages.invalid_record_range(*anchor, *head)
+            }
         }
     }
 
@@ -392,8 +417,8 @@ impl Document {
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а
         // второго буфера быть не должно.
         let start = self.text.len() as u32;
-        let piece = self.slice(anchor, anchor + len);
-        self.text.extend_from_slice(&piece);
+        let removed = self.slice(anchor, anchor + len);
+        self.text.extend_from_slice(&removed);
         let record = Record::Delete {
             anchor,
             head: anchor + len,
@@ -454,11 +479,8 @@ impl Document {
             // Отмена удаления: вернуть вырезанное.
             Record::Delete { anchor, head, text } => {
                 let len = head - anchor;
-                let start = self.text.len() as u32;
-                let piece = self.text[text as usize..text as usize + len as usize].to_vec();
-                self.text.extend_from_slice(&piece);
-                let leaf = self.tree.alloc(Node::leaf(start, len));
-                self.tree.insert_leaf(anchor, leaf);
+                let restored = self.text_at(text, len)?;
+                self.restore_at(anchor, restored);
             }
             // Отмена замены: вырезать вставленное и вернуть вырезанное.
             Record::Replace {
@@ -472,15 +494,32 @@ impl Document {
                 if removed_len == 0 {
                     return Ok(Some(id));
                 }
-                let start = self.text.len() as u32;
-                let piece =
-                    self.text[removed as usize..removed as usize + removed_len as usize].to_vec();
-                self.text.extend_from_slice(&piece);
-                let leaf = self.tree.alloc(Node::leaf(start, removed_len));
-                self.tree.insert_leaf(anchor, leaf);
+                let restored = self.text_at(removed, removed_len)?;
+                self.restore_at(anchor, restored);
             }
         }
         Ok(Some(id))
+    }
+
+    /// Кусок буфера по смещению из записи истории.
+    ///
+    /// Смещение приходит из блоба, который писал прошлый запуск: доверять ему
+    /// нельзя, а паника из-за битой записи уронила бы редактор вместе с
+    /// несохранённым текстом. Не попали — ошибка, документ остаётся целым.
+    fn text_at(&self, at: u32, len: u32) -> Result<Vec<u8>> {
+        self.text
+            .get(at as usize..at as usize + len as usize)
+            .map(<[u8]>::to_vec)
+            .ok_or(Error::HistoryOutOfBounds { at, len })
+    }
+
+    /// Положить кусок в хвост буфера и вставить его на место.
+    fn restore_at(&mut self, anchor: u32, restored: Vec<u8>) {
+        let len = restored.len() as u32;
+        let start = self.text.len() as u32;
+        self.text.extend_from_slice(&restored);
+        let leaf = self.tree.alloc(Node::leaf(start, len));
+        self.tree.insert_leaf(anchor, leaf);
     }
 
     /// Повторить отменённую правку.
@@ -636,13 +675,13 @@ impl Document {
             /// на сто строчек ниже. Читать с проверкой дешевле, чем чинить
             /// редактор из-за выхода за границу: обрезанный кусок — это
             /// потерянные байты, паника — это упавший редактор.
-            fn piece(&mut self, start: u32, len: u32) {
-                let s = (start as usize).min(self.text.len());
-                let e = (start as usize)
+            fn range(&mut self, start: u32, len: u32) {
+                let from = (start as usize).min(self.text.len());
+                let to = (start as usize)
                     .saturating_add(len as usize)
                     .min(self.text.len());
-                if s < e {
-                    self.out.extend_from_slice(&self.text[s..e]);
+                if from < to {
+                    self.out.extend_from_slice(&self.text[from..to]);
                 }
             }
         }
@@ -671,7 +710,12 @@ impl Document {
 
     /// Текст, который был до правок: исходный файл.
     pub fn file_text(&self) -> &[u8] {
-        &self.text[..self.file_len as usize]
+        // Основа не длиннее буфера: так её и кладут. Но приходят сюда и
+        // восстановленные из базы документы, а обрезать кусок безопаснее, чем
+        // упасть.
+        self.text
+            .get(..self.file_len as usize)
+            .unwrap_or(&self.text)
     }
 
     /// Текст, который эта запись вставила.
@@ -701,7 +745,11 @@ impl Document {
                 removed_len,
                 ..
             } => (*removed, *removed_len),
-            Record::Delete { head, text, .. } => (*text, *head - record.anchor()),
+            // Длина берётся через `abs_diff`: у испорченной записи `head`
+            // может оказаться меньше `anchor`, и простое вычитание переполнилось
+            // бы. `abs_diff` даёт осмысленную длину, а дальше границу проверит
+            // `get`.
+            Record::Delete { text, .. } => (*text, record.len()),
             Record::Insert { .. } => return None,
         };
         self.text.get(at as usize..at as usize + len as usize)

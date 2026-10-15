@@ -287,4 +287,50 @@ mod tests {
             "конец последней — конец документа"
         );
     }
+
+    #[test]
+    fn a_document_without_a_trailing_break_still_has_a_last_line() {
+        // Файл, который заканчивается не переводом строки, — самая частая
+        // форма файла. Карта должна считать последнюю строку, а не терять её.
+        let map = reference("one\ntwo");
+        assert_eq!(map.breaks(), [3]);
+        assert_eq!(map.line_count(), 2);
+        assert_eq!(map.offset_of_line(1, 7), 4);
+        assert_eq!(map.end_of_line(1, 7), 7);
+    }
+
+    #[test]
+    fn deleting_to_the_end_removes_the_tail_breaks() {
+        let mut map = reference("a\nb\nc\n");
+        // Диапазон, а не длина: с 2-го байта до конца документа.
+        map.delete(2, 6);
+        assert_eq!(map.breaks(), [1], "остался только первый перевод");
+        assert_eq!(map.line_count(), 2);
+    }
+
+    #[test]
+    fn inserting_past_the_end_lands_beyond_every_break() {
+        // Позиция за пределами текста — это конец документа, а не поломка.
+        let mut map = reference("a\nb");
+        map.insert(99, b"\n");
+        assert_eq!(map.breaks(), [1, 99]);
+    }
+
+    #[test]
+    fn a_line_number_past_the_document_is_the_end() {
+        let map = reference("one\ntwo");
+        assert_eq!(map.offset_of_line(99, 7), 7, "выше конца не прыгаем");
+        assert_eq!(map.end_of_line(99, 7), 7);
+        assert_eq!(map.line_of(99), 1, "позиция за текстом — последняя строка");
+    }
+
+    #[test]
+    fn an_empty_document_has_no_breaks_at_all() {
+        let map = reference("");
+        assert!(map.breaks().is_empty());
+        assert_eq!(map.line_count(), 1);
+        assert_eq!(map.line_of(0), 0);
+        assert_eq!(map.offset_of_line(0, 0), 0);
+        assert_eq!(map.end_of_line(0, 0), 0);
+    }
 }

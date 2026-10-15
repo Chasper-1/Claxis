@@ -42,6 +42,16 @@ pub enum Error {
         /// Какой ключ повторился.
         key: String,
     },
+    /// Значение перевода не строка: `{path}`, `{key}`.
+    ///
+    /// Отдельный вид, а не `Parse` с готовым текстом: переводчик должен
+    /// видеть, что именно не так, и на своём языке.
+    NotAString {
+        /// Путь к файлу.
+        path: String,
+        /// Какой ключ оказался не строкой.
+        key: String,
+    },
 }
 
 impl Error {
@@ -53,6 +63,7 @@ impl Error {
             Error::Parse { path, reason } => messages.parse_failed(path, reason),
             Error::Incomplete { lang, count, total } => messages.incomplete(lang, *count, *total),
             Error::DuplicateKey { lang, key } => messages.duplicate_key(lang, key),
+            Error::NotAString { path, key } => messages.not_a_string(path, key),
         }
     }
 
