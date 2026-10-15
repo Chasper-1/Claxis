@@ -22,6 +22,8 @@ pub use schema::TableDef;
 pub use schema::{ConfigFile, GENERAL, KEYS, KeyDef, Kind};
 pub use watch::Watch;
 
+use toml_edit::Item;
+
 /// Конфиг целиком: по файлу на состояние.
 ///
 /// Каждое состояние открыто отдельно: так комментарии и порядок ключей внутри
@@ -78,11 +80,61 @@ impl Config {
     }
 
     /// Значение от 0 до 65535 из конфига, иначе значение по умолчанию.
-    pub fn u16_or_default(&self, def: &'static KeyDef) -> u16 {
-        self.get(def)
-            .and_then(|i| i.as_integer())
-            .and_then(|n| u16::try_from(n).ok())
-            .unwrap_or_else(|| def.default.parse().unwrap_or(0))
+    ///
+    /// Значение по умолчанию берётся из схемы и обязано быть числом: если оно
+    /// не такое, это огрех схемы, и о нём сообщается, а не подставляется
+    /// тихий ноль.
+    pub fn u16_or_default(&self, def: &'static KeyDef) -> crate::Result<u16> {
+        match self.get(def).and_then(Item::as_integer) {
+            Some(n) => u16::try_from(n).map_err(|_| crate::Error::BadValue {
+                key: def.path.to_string(),
+                got: n.to_string(),
+                expected: "0..65535",
+            }),
+            None => def
+                .default
+                .parse()
+                .map_err(|_| crate::Error::BadSchemaDefault {
+                    key: def.path,
+                    value: def.default,
+                    expected: "a number",
+                }),
+        }
+    }
+
+    /// Значение от 0 до 255 из конфига, иначе значение по умолчанию.
+    pub fn u8_or_default(&self, def: &'static KeyDef) -> crate::Result<u8> {
+        match self.get(def).and_then(Item::as_integer) {
+            Some(n) => u8::try_from(n).map_err(|_| crate::Error::BadValue {
+                key: def.path.to_string(),
+                got: n.to_string(),
+                expected: "0..255",
+            }),
+            None => def
+                .default
+                .parse()
+                .map_err(|_| crate::Error::BadSchemaDefault {
+                    key: def.path,
+                    value: def.default,
+                    expected: "a number",
+                }),
+        }
+    }
+
+    /// Логическое значение ключа из конфига, иначе значение по умолчанию.
+    pub fn bool_or_default(&self, def: &'static KeyDef) -> crate::Result<bool> {
+        match self.get(def).and_then(Item::as_bool) {
+            Some(v) => Ok(v),
+            None => match def.default {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                other => Err(crate::Error::BadSchemaDefault {
+                    key: def.path,
+                    value: other,
+                    expected: "true or false",
+                }),
+            },
+        }
     }
 
     /// Значение табличной настройки: пары «ключ, значение» как они записаны.
@@ -115,21 +167,6 @@ impl Config {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string().trim().to_string()))
             .collect()
-    }
-
-    /// Значение от 0 до 255 из конфига, иначе значение по умолчанию.
-    pub fn u8_or_default(&self, def: &'static KeyDef) -> u8 {
-        self.get(def)
-            .and_then(|i| i.as_integer())
-            .and_then(|n| u8::try_from(n).ok())
-            .unwrap_or_else(|| def.default.parse().unwrap_or(0))
-    }
-
-    /// Логическое значение ключа из конфига, иначе значение по умолчанию.
-    pub fn bool_or_default(&self, def: &'static KeyDef) -> bool {
-        self.get(def)
-            .and_then(|i| i.as_bool())
-            .unwrap_or(def.default == "true")
     }
 
     /// Ключ есть в файле и не отключён плохой секцией.
@@ -183,7 +220,7 @@ mod tests {
     fn reads_a_value_from_the_right_file() {
         let config = edit_config("[General]\nhistory_depth = 64\n");
         let def = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
-        assert_eq!(config.u16_or_default(def), 64);
+        assert_eq!(config.u16_or_default(def).unwrap(), 64);
     }
 
     #[test]
@@ -191,7 +228,10 @@ mod tests {
         // Не задано — работает то, что в схеме.
         let config = edit_config("[General]\n");
         let def = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
-        assert_eq!(config.u16_or_default(def), def.default.parse().unwrap());
+        assert_eq!(
+            config.u16_or_default(def).unwrap(),
+            def.default.parse().unwrap()
+        );
     }
 
     #[test]
@@ -202,7 +242,7 @@ mod tests {
             "[General]\nhistory_depth = 64\n".parse().unwrap(),
         )]);
         let def = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
-        assert_eq!(config.u16_or_default(def), 8192);
+        assert_eq!(config.u16_or_default(def).unwrap(), 8192);
     }
 
     #[test]

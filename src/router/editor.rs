@@ -81,6 +81,11 @@ pub struct Editor {
     /// не отключает секцию конфига. Интерфейс остаётся английским, а правка
     /// видна сразу.
     pub language_error: Option<crate::api::i18n::Error>,
+    /// В схеме конфига значение по умолчанию не того вида, чем объявлен ключ.
+    ///
+    /// Огрех схемы, а не конфига: пользователь ничего не писал. Сообщаем и
+    /// работаем на значениях по умолчанию, чтобы редактор открылся.
+    pub schema_error: Option<crate::api::config::Error>,
     /// Файлы, которых не было и которые созданы при первом запуске.
     pub created: Vec<PathBuf>,
     /// Редактор пошёл на последнем корректном конфиге.
@@ -92,6 +97,11 @@ pub struct Editor {
     /// `None`, если система не смогла подписаться: конфиг перестанет
     /// применяться сам, и об этом честно скажем, а не промолчим.
     pub watch: Option<crate::api::config::Watch>,
+    /// Папки, за которыми следить не вышло, с причинами.
+    ///
+    /// Правки внутри них не применятся сами: только перезапуск. Пользователю
+    /// об этом сказано, иначе он ищет ошибку там, где её нет.
+    pub blind_spots: Vec<String>,
 }
 
 /// Что вышло из перечитывания конфига.
@@ -171,8 +181,29 @@ impl Editor {
             // изменением, а то первый же запуск сочтётся правкой конфига.
             w.mark_current(config_dir);
         }
+        // Папки, за которыми следить не вышло: смена темы или языка в них не
+        // применится сама. Пользователь должен знать про это, иначе он будет
+        // искать ошибку в конфиге, которого никто не прочитал.
+        // Папка без причины выглядит как «что-то сломалось в системе», а с причиной
+        // человек сразу видит, куда смотреть.
+        let blind_spots: Vec<String> = watch
+            .as_ref()
+            .map(|w| {
+                w.blind_spots()
+                    .iter()
+                    .zip(w.blind_reasons())
+                    .map(|(p, reason)| format!("{}: {reason}", p.display()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        let mut settings = Settings::from_config(&config);
+        // Ошибка схемы — не пользовательская: это огрех наших же значений по
+        // умолчанию. Сообщаем и работаем на значениях по умолчанию, чтобы
+        // редактор открылся: чинить схему должен тот, кто её писал.
+        let (mut settings, schema_error) = match Settings::from_config(&config) {
+            Ok(settings) => (settings, None),
+            Err(e) => (Settings::defaults(), Some(e)),
+        };
         // Перевод не входит в конфиг, но отсутствие файла — это ровно та же
         // поломка: пользователь попросил язык, которого нет. Сообщаем, но не
         // отказываем запускаться: редактор с английским лучше, чем ошибка
@@ -194,10 +225,12 @@ impl Editor {
             issues,
             theme_error,
             language_error,
+            schema_error,
             created: generated.created,
             used_last_good,
             config_dir: config_dir.to_path_buf(),
             watch,
+            blind_spots,
         })
     }
 
@@ -216,10 +249,12 @@ impl Editor {
             issues: Vec::new(),
             theme_error: None,
             language_error: None,
+            schema_error: None,
             created: Vec::new(),
             used_last_good: false,
             config_dir: dir.as_ref().to_path_buf(),
             watch: None,
+            blind_spots: Vec::new(),
         })
     }
 
@@ -269,7 +304,12 @@ impl Editor {
             };
         }
 
-        let mut settings = Settings::from_config(&loaded.config);
+        // Как и при старте: огрех схемы не должен ронять редактор, но и молчать о
+        // нём нельзя.
+        let (mut settings, schema_error) = match Settings::from_config(&loaded.config) {
+            Ok(settings) => (settings, None),
+            Err(e) => (Settings::defaults(), Some(e)),
+        };
         // Перевод грузится здесь же: язык меняется в конфиге, и ждать
         // перезапуска для смены языка незачем.
         //
@@ -285,6 +325,7 @@ impl Editor {
         self.issues = Vec::new();
         self.language_error = language_error;
         self.theme_error = theme_error;
+        self.schema_error = schema_error;
 
         Reloaded {
             applied,

@@ -69,6 +69,9 @@ fn query() -> Option<u16> {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            // Любая другая ошибка чтения означает одно: ответа не будет.
+            // Ждать дальше бессмысленно, а пользователь увидит
+            // `NoKittyProtocol` с внятным объяснением — молчания тут нет.
             Err(_) => break,
         }
     }

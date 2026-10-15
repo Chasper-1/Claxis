@@ -406,7 +406,7 @@ pub fn write_value(
     // Комментарий стоит на строке с ключом, а вставка значения его стирает.
     // Забираем суффикс до вставки и возвращаем после: меняется только число.
     let suffix = take_suffix(table, key.key());
-    table.insert_formatted(&entry, parse_value(key, value));
+    table.insert_formatted(&entry, parse_value(key, value)?);
     if let Some(suffix) = suffix
         && let Some(v) = table.get_mut(key.key()).and_then(Item::as_value_mut)
     {
@@ -472,12 +472,23 @@ fn keep_formatting(table: &Table, name: &str) -> toml_edit::Key {
 }
 
 /// Комментарий на строке ключа: без него правка стёрла бы пояснение.
+///
+/// `as_str` вернул бы `None` на комментарии с нестандартными переводами
+/// строки, и пояснение потерялось бы молча. Такие комментарии пропускаем с
+/// предупреждением: значение всё равно запишется, но человек узнает, что
+/// пояснение ушло.
 fn take_suffix(table: &Table, name: &str) -> Option<String> {
-    table
+    let raw = table
         .get(name)
         .and_then(Item::as_value)
-        .and_then(|v| v.decor().suffix())
-        .map(|s| s.as_str().unwrap_or_default().to_string())
+        .and_then(|v| v.decor().suffix())?;
+    match raw.as_str() {
+        Some(text) => Some(text.to_string()),
+        None => {
+            eprintln!("comment after {name} has unusual escapes and was left as is: {raw:?}");
+            None
+        }
+    }
 }
 
 /// Записать пары табличной настройки, не трогая остальной файл.
@@ -544,18 +555,29 @@ fn value_for_table(def: &schema::TableDef, value: &str) -> toml_edit::Value {
 ///
 /// Открыто наружу: тем же правилом проверяется тип при разборе, иначе ключ
 /// можно было бы записать не так, как потом разберётся.
-pub fn parse_value(key: &KeyDef, value: &str) -> Item {
+///
+/// Значение, которое не соответствует своему виду, — ошибка. Записать его
+/// строкой значило бы тихо поменять настройку на строку и получить ошибку
+/// в другом месте, уже без указания, кто её придумал.
+pub fn parse_value(key: &KeyDef, value: &str) -> Result<Item, Error> {
     use toml_edit::Value;
+    fn wrong(key: &KeyDef, value: &str, expected: &'static str) -> Error {
+        Error::BadValue {
+            key: key.path.to_string(),
+            got: value.to_string(),
+            expected,
+        }
+    }
     match key.kind {
-        schema::Kind::U16 | schema::Kind::U8 => match value.parse::<i64>() {
-            Ok(n) => Item::Value(Value::from(n)),
-            Err(_) => Item::Value(Value::from(value)),
-        },
-        schema::Kind::Bool => match value.parse::<bool>() {
-            Ok(b) => Item::Value(Value::from(b)),
-            Err(_) => Item::Value(Value::from(value)),
-        },
-        schema::Kind::Str | schema::Kind::Path => Item::Value(Value::from(value)),
+        schema::Kind::U16 | schema::Kind::U8 => value
+            .parse::<i64>()
+            .map(|n| Item::Value(Value::from(n)))
+            .map_err(|_| wrong(key, value, "a whole number")),
+        schema::Kind::Bool => value
+            .parse::<bool>()
+            .map(|b| Item::Value(Value::from(b)))
+            .map_err(|_| wrong(key, value, "true or false")),
+        schema::Kind::Str | schema::Kind::Path => Ok(Item::Value(Value::from(value))),
         // Список приходит текстом через запятую и собирается в массив: так
         // его можно и показать в конфиге, и положить обратно без потерь.
         schema::Kind::Array => {
@@ -565,18 +587,18 @@ pub fn parse_value(key: &KeyDef, value: &str) -> Item {
             for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
                 array.push(part.trim_matches('"'));
             }
-            Item::Value(Value::Array(array))
+            Ok(Item::Value(Value::Array(array)))
         }
-        schema::Kind::Int => match value.parse::<i64>() {
-            Ok(n) => Item::Value(Value::from(n)),
-            Err(_) => Item::Value(Value::from(value)),
-        },
+        schema::Kind::Int => value
+            .parse::<i64>()
+            .map(|n| Item::Value(Value::from(n)))
+            .map_err(|_| wrong(key, value, "a whole number")),
         schema::Kind::Float => match value.parse::<f64>() {
-            Ok(f) => Item::Value(Value::from(f)),
-            Err(_) => match value.parse::<i64>() {
-                Ok(n) => Item::Value(Value::from(n)),
-                Err(_) => Item::Value(Value::from(value)),
-            },
+            Ok(f) => Ok(Item::Value(Value::from(f))),
+            Err(_) => value
+                .parse::<i64>()
+                .map(|n| Item::Value(Value::from(n)))
+                .map_err(|_| wrong(key, value, "a number")),
         },
     }
 }
@@ -589,6 +611,56 @@ pub fn required_dirs(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_value_of_the_wrong_kind_is_refused() {
+        // Число туда, где ждётся логика, — это ошибка вызывающего. Записать
+        // его строкой значило бы тихо поменять настройку и свалить ошибку
+        // позже, уже без указания, кто её придумал.
+        let key = crate::schema::find(crate::schema::ConfigFile::Files, "General.snapshots_keep")
+            .expect("ключ есть в схеме");
+        match parse_value(key, "много") {
+            Err(Error::BadValue { key, got, expected }) => {
+                assert_eq!(key, "General.snapshots_keep");
+                assert_eq!(got, "много");
+                assert!(!expected.is_empty(), "ожидаемый вид не назван");
+            }
+            other => panic!("ожидалась ошибка значения, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_value_of_the_right_kind_is_written_as_its_kind() {
+        let key = crate::schema::find(crate::schema::ConfigFile::Files, "General.snapshots_keep")
+            .expect("ключ есть в схеме");
+        let item = parse_value(key, "5").expect("число записывается числом");
+        assert_eq!(item.as_integer(), Some(5));
+    }
+
+    #[test]
+    fn every_schema_default_matches_its_kind() {
+        // Тихий ноль из неразбираемого значения по умолчанию означал бы, что
+        // редактор работает с настройкой, которой никто не писал.
+        for def in crate::schema::KEYS {
+            let ok = match def.kind {
+                crate::schema::Kind::U8 | crate::schema::Kind::U16 => {
+                    def.default.parse::<i64>().is_ok()
+                }
+                crate::schema::Kind::Bool => matches!(def.default, "true" | "false"),
+                crate::schema::Kind::Int => def.default.parse::<i64>().is_ok(),
+                crate::schema::Kind::Float => def.default.parse::<f64>().is_ok(),
+                // Строка, путь и список принимают любой текст.
+                crate::schema::Kind::Str
+                | crate::schema::Kind::Path
+                | crate::schema::Kind::Array => true,
+            };
+            assert!(
+                ok,
+                "{}: значение по умолчанию {:?} не его вида",
+                def.path, def.default
+            );
+        }
+    }
 
     /// Пустой каталог: без перевода тексты остаются английскими.
     fn plain() -> claxis_i18n::Catalog {
@@ -690,7 +762,7 @@ mod tests {
         let loaded = crate::load::parse(ConfigFile::Edit, &text);
         let key = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
         assert_eq!(
-            loaded.config.u16_or_default(key),
+            loaded.config.u16_or_default(key).unwrap(),
             key.default.parse::<u16>().unwrap()
         );
     }
@@ -827,7 +899,7 @@ mod tests {
             // И обратно: значение должно записаться в файл и разобраться.
             let line = format!("probe = {}", value_text(&key));
             let mut doc = toml_edit::DocumentMut::new();
-            doc["General"]["probe"] = parse_value(&key, value);
+            doc["General"]["probe"] = parse_value(&key, value).unwrap();
             let written = doc.to_string();
             assert!(
                 written.contains(line.trim_end()),
@@ -1119,7 +1191,7 @@ mod tests {
         let loaded = read_all(tmp.dir());
         assert!(loaded.is_ok(), "пустой каталог не должен давать ошибок");
         let key = schema::find(ConfigFile::Edit, "General.history_depth").unwrap();
-        assert_eq!(loaded.config.u16_or_default(key), 8192);
+        assert_eq!(loaded.config.u16_or_default(key).unwrap(), 8192);
     }
 
     #[test]
@@ -1167,7 +1239,7 @@ mod tests {
         let loaded = read_all(tmp.dir());
         assert!(loaded.is_ok(), "проблемы: {:?}", loaded.issues);
         let keep = schema::find(ConfigFile::Files, "General.snapshots_persist").unwrap();
-        assert!(!loaded.config.bool_or_default(keep));
+        assert!(!loaded.config.bool_or_default(keep).unwrap());
     }
 }
 

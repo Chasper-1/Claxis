@@ -34,7 +34,17 @@ pub struct Watch {
     pending: Vec<(PathBuf, Instant)>,
     /// Что было в каталоге на момент подписки: без этого первое же событие
     /// пришло бы просто от того, что мы сами что-то открыли.
+    ///
+    /// Список пополняется на ходу: тему или перевод человек может положить
+    /// в папку уже во время работы редактора, и такой файл обязан быть виден
+    /// так же, как лежавшие при старте.
     watched: Vec<PathBuf>,
+    /// Папки, за которыми следить не вышло.
+    blind_spots: Vec<PathBuf>,
+    /// Почему не вышло подписаться на папку из `blind_spots`.
+    blind_reasons: Vec<String>,
+    /// Корень конфига: по нему узнаём, что файл всё-таки наш.
+    root: PathBuf,
 }
 
 impl Watch {
@@ -44,15 +54,41 @@ impl Watch {
     /// перестанет применяться сам, и об этом честно скажем.
     pub fn new(dir: &Path) -> notify::Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-            if let Ok(event) = res {
-                let _ = tx.send(event);
-            }
-        })?;
+        // Канал закрыт только вместе с наблюдателем, но если это случилось —
+        // значит система событий больше не работает, и об этом надо сказать, а
+        // не складывать ошибки в тишину.
+        let sender_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&sender_gone);
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<Event>| match res {
+                Ok(event) => {
+                    if tx.send(event).is_err() {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("watching the config directory failed: {e}");
+                }
+            })?;
         watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        let mut blind_spots: Vec<PathBuf> = Vec::new();
+        // Причины тех же мест: папка без причины выглядит как «что-то сломалось
+        // в системе», а с причиной человек сразу видит, куда смотреть.
+        let mut blind_reasons: Vec<String> = Vec::new();
         for sub in [super::path::theme_dir(dir), super::path::lang_dir(dir)] {
-            // Папок может не быть: редактор их создаст при первом запуске.
-            let _ = watcher.watch(&sub, RecursiveMode::NonRecursive);
+            // Папок может не быть: редактор их создаст при первом запуске. А
+            // вот если папка есть, а подписаться не вышло — это поломка, и о
+            // ней нужно сказать, иначе смена темы или языка не применится и
+            // человек не поймёт почему.
+            if sub.exists()
+                && let Err(e) = watcher.watch(&sub, RecursiveMode::NonRecursive)
+            {
+                blind_spots.push(sub.clone());
+                // Причина уходит в то же сообщение о слепой зоне: какая именно
+                // подписка не вышла, пользователю знать полезно.
+                blind_reasons.push(e.to_string());
+            }
         }
 
         Ok(Self {
@@ -60,7 +96,23 @@ impl Watch {
             events: rx,
             pending: Vec::new(),
             watched: Vec::new(),
+            root: dir.to_path_buf(),
+            blind_spots,
+            blind_reasons,
         })
+    }
+
+    /// Папки, за которыми следить не вышло.
+    ///
+    /// Пустой список — значит следим за всем. Непустой: правки внутри этих
+    /// папок применятся только при перезапуске, и об этом сказано пользователю.
+    pub fn blind_spots(&self) -> &[PathBuf] {
+        &self.blind_spots
+    }
+
+    /// Почему следить не вышло: строки по одной на папку из `blind_spots`.
+    pub fn blind_reasons(&self) -> &[String] {
+        &self.blind_reasons
     }
 
     /// Запомнить, что сейчас в каталоге.
@@ -68,7 +120,27 @@ impl Watch {
     /// Вызывается один раз после подписки: события, пришедшие между подпиской
     /// и этой отметкой, не считаются изменением.
     pub fn mark_current(&mut self, dir: &Path) {
+        self.root = dir.to_path_buf();
         self.watched = config_files(dir);
+    }
+
+    /// Наш ли файл и видел ли мы его раньше.
+    ///
+    /// Наши — файлы конфига и всё, что лежит в папках тем и переводов: там
+    /// каждая новая тема или новый язык появляются сами собой, и ждать
+    /// перезапуска ради них незачем. Остальное в каталоге конфига к делу не
+    /// относится и правки редактора не вызывает.
+    fn accept(&mut self, path: &Path) -> bool {
+        if self.watched.contains(&path.to_path_buf()) {
+            return true;
+        }
+        let own_folder = path.starts_with(crate::path::theme_dir(&self.root))
+            || path.starts_with(crate::path::lang_dir(&self.root));
+        if !own_folder {
+            return false;
+        }
+        self.watched.push(path.to_path_buf());
+        true
     }
 
     /// Пути конфига, изменившиеся с прошлой проверки и уже устоявшиеся.
@@ -99,13 +171,11 @@ impl Watch {
     /// система шлёт и создание, и удаление, и переименование, а реагировать
     /// надо только на наши файлы.
     fn drain(&mut self) {
-        let watch = self.watched.clone();
         loop {
             match self.events.try_recv() {
                 Ok(event) => {
                     for path in event.paths {
-                        let ours = watch.is_empty() || watch.contains(&path);
-                        if ours {
+                        if self.accept(&path) {
                             touch(&mut self.pending, path);
                         }
                     }
@@ -192,6 +262,45 @@ mod tests {
             changed.contains(&file),
             "изменение config-файла не замечено, пришло: {changed:?}"
         );
+    }
+
+    #[test]
+    fn a_theme_added_while_running_is_noticed() {
+        // Тему кладут в папку уже во время работы редактора. Список за которым
+        // мы следим снимается один раз, и раньше такой файл уходил в сторону:
+        // событие было, а реагировать на него было не на что.
+        //
+        // Проверяем папку, а не сам файл: система по-разному присылает изменение
+        // — то файлом, то папкой, в которой файл появился. Редактору достаточно
+        // самого факта, что в папке тем что-то изменилось.
+        let tmp = Temp::new("theme-added");
+        let themes = crate::path::theme_dir(tmp.dir());
+        std::fs::create_dir_all(&themes).unwrap();
+        let mut watch = Watch::new(tmp.dir()).unwrap();
+        watch.mark_current(tmp.dir());
+
+        std::fs::write(themes.join("everforest.toml"), "").unwrap();
+
+        let changed = wait_for(&mut watch, Duration::from_secs(5));
+        assert!(
+            changed.iter().any(|p| p.starts_with(&themes)),
+            "новая тема не замечена, пришло: {changed:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_outside_the_config_is_ignored() {
+        // Рядом валяется чужая папка: её правки конфигом не являются.
+        let tmp = Temp::new("outside");
+        let outside = tmp.0.join("снаружи");
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut watch = Watch::new(tmp.dir()).unwrap();
+        watch.mark_current(tmp.dir());
+
+        std::fs::write(outside.join("edit.toml"), "[General]\n").unwrap();
+        std::thread::sleep(SETTLE * 3);
+        watch.changed();
+        assert!(watch.changed().is_empty(), "чужой файл принят за наш");
     }
 
     #[test]

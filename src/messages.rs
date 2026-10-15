@@ -18,6 +18,16 @@ pub trait Messages {
     fn config_dir_failed(&self, path: &str, reason: &str) -> String;
     /// Домашнего каталога нет: конфиг положить некуда.
     fn no_home_dir(&self) -> String;
+    /// Снапшот не записался: `{path}` — какой файл, `{reason}` — почему.
+    ///
+    /// Отдельно и громко: без этого сообщения человек закрывает редактор и
+    /// теряет работу, думая, что она сохранена.
+    fn snapshot_failed(&self, path: &str, reason: &str) -> String;
+
+    /// За папкой следить не вышло: `{where}` — где и почему. Правки применятся
+    /// при перезапуске.
+    fn not_watched(&self, place: &str) -> String;
+
     /// Сломано столько проблем, что работать не с чем: `{issues}`.
     fn no_usable_config(&self, issues: usize) -> String;
     /// Файл больше, чем помещается в `u32`.
@@ -62,6 +72,20 @@ impl Messages for En {
 
     fn no_home_dir(&self) -> String {
         "cannot find the home directory, so there is nowhere to keep the config".to_string()
+    }
+
+    fn snapshot_failed(&self, path: &str, reason: &str) -> String {
+        substitute(
+            "cannot save a snapshot of {path}: {reason}; your work will not survive a restart",
+            &[("path", path.to_string()), ("reason", reason.to_string())],
+        )
+    }
+
+    fn not_watched(&self, place: &str) -> String {
+        substitute(
+            "cannot watch {place}; changes there will apply on restart",
+            &[("place", place.to_string())],
+        )
     }
 
     fn no_usable_config(&self, issues: usize) -> String {
@@ -109,7 +133,15 @@ pub fn samples() -> Vec<(&'static str, String)> {
             m.config_dir_failed("/home/user/.config/claxis", "no access"),
         ),
         ("no_home_dir", m.no_home_dir()),
+        (
+            "snapshot_failed",
+            m.snapshot_failed("/home/user/notes.txt", "disk is full"),
+        ),
         ("no_usable_config", m.no_usable_config(2)),
+        (
+            "not_watched",
+            m.not_watched("/home/user/.config/claxis/theme: too many open files"),
+        ),
         (
             "file_too_large",
             m.file_too_large(5_000_000_000, 5.0, u32::MAX as u64, 4.2),

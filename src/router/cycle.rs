@@ -82,6 +82,7 @@ impl Cycle {
         term: &mut Terminal,
         editor: &mut crate::router::Editor,
         doc: &mut Document,
+        messages: &dyn crate::messages::Messages,
         mut report: impl FnMut(&str),
     ) -> io::Result<()> {
         loop {
@@ -93,6 +94,12 @@ impl Cycle {
                 }
             }
             doc.snapshot_if_due();
+            // Снапшот мог не записаться: об этом человек обязан знать, иначе
+            // он спокойно закроет редактор и потеряет работу.
+            if let Some(reason) = doc.snapshot_error() {
+                let path = doc.path().display().to_string();
+                report(&messages.snapshot_failed(&path, &reason));
+            }
 
             let event = term.next_event()?;
             if self.handle(event, doc) == Action::Quit {

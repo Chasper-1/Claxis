@@ -566,7 +566,7 @@ mod tests {
             .iter()
             .find(|k| k.path == "General.snapshots_keep")
             .unwrap();
-        assert_eq!(loaded.config.u8_or_default(keep), 7);
+        assert_eq!(loaded.config.u8_or_default(keep).unwrap(), 7);
     }
 
     #[test]

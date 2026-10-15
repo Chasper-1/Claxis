@@ -59,13 +59,35 @@ impl Terminal {
     pub fn size(&self) -> io::Result<Size> {
         size::current()
     }
+
+    /// Закрыть терминал и сказать, если что-то осталось невыключенным.
+    ///
+    /// Обычный выход идёт через [`Terminal::close`]: редактор узнаёт, если
+    /// терминал остался в raw mode или протокол не отключился, и скажет об
+    /// этом пользователю. Из [`Drop`] ошибку вернуть некуда.
+    pub fn close(mut self) -> io::Result<()> {
+        // Порядок важен: сначала снять raw mode, потом выключить протокол.
+        // Иначе последовательности протокола попадут в канал как обычный текст.
+        let raw = self.raw.take();
+        if let Some(raw) = raw {
+            raw.leave()?;
+        }
+        protocol::disable()
+    }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        // Порядок важен: сначала снять raw mode, потом выключить протокол.
-        // Иначе последовательности протокола попадут в канал как обычный текст.
-        drop(self.raw.take());
-        let _ = protocol::disable();
+        // Сюда попадаем при панике или аварийном выходе: вернуть ошибку некуда,
+        // но молчать нельзя — человек будет искать причину сломанного терминала
+        // уже без редактора на экране.
+        if let Some(raw) = self.raw.take()
+            && let Err(e) = raw.leave()
+        {
+            eprintln!("cannot leave raw mode: {e}");
+        }
+        if let Err(e) = protocol::disable() {
+            eprintln!("cannot disable the keyboard protocol: {e}");
+        }
     }
 }

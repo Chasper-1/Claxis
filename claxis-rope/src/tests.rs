@@ -356,6 +356,73 @@ enum Op {
 }
 
 #[test]
+fn the_tree_stays_balanced_under_replaces_and_undos() {
+    // Тот же баланс, но под заменами и отменами: это самый дорогой путь
+    // дерева, и рассинхрон высот там виден не сразу, а потом всплывает
+    // медленным спуском по документу.
+    // Текст латиницей: позиции в эталоне байтовые, и резать строку посреди
+    // многобайтового символа нельзя — тест проверяет дерево, а не UTF-8.
+    let mut doc = Document::new("start\n".as_bytes());
+    let mut rng = Rng(0x5DEECE66D);
+    let mut reference = String::from("start\n");
+    // Последняя правка была заменой: что вставили и что там было.
+    // Отменять умеем только её, поэтому и отменяем только её.
+    let mut last_replace: Option<(usize, usize, String)> = None;
+    const INSERTED: &str = "replaced\n";
+
+    for _ in 0..1500 {
+        match rng.below(5) {
+            0 if last_replace.is_some() => {
+                let (pos, _len, before) = last_replace.take().expect("замена была");
+                let after_redo = reference.clone();
+                doc.undo().unwrap().expect("отменять есть что");
+                // Отмена замены: убрать вставленное и вернуть вырезанное.
+                reference.replace_range(pos..pos + INSERTED.len(), &before);
+                assert_eq!(
+                    doc.read(),
+                    reference.as_bytes(),
+                    "отмена замены на {pos} вернула не то: было {:?}, стало {:?}",
+                    after_redo,
+                    before
+                );
+                doc.redo().unwrap().expect("повторять есть что");
+                // Повтор вернул документ к тому, что было: эталон тоже.
+                reference = after_redo;
+                assert_eq!(doc.read(), reference.as_bytes());
+            }
+            1 => {
+                let pos = rng.below(reference.len() + 1);
+                let len = rng.below((reference.len() - pos).min(20));
+                let before = reference[pos..pos + len].to_string();
+                doc.replace(pos as u32, len as u32, INSERTED.as_bytes())
+                    .unwrap();
+                reference.replace_range(pos..pos + len, INSERTED);
+                last_replace = Some((pos, len, before));
+            }
+            2 if !reference.is_empty() => {
+                let pos = rng.below(reference.len());
+                let len = 1 + rng.below((reference.len() - pos).min(10));
+                last_replace = None;
+                doc.delete(pos as u32, len as u32).unwrap();
+                reference.replace_range(pos..pos + len, "");
+            }
+            _ => {
+                let pos = rng.below(reference.len() + 1);
+                last_replace = None;
+                doc.insert(pos as u32, "inserted\n".as_bytes()).unwrap();
+                reference.insert_str(pos, "inserted\n");
+            }
+        }
+        assert_eq!(doc.read(), reference.as_bytes());
+    }
+
+    let (_, height, skew, mismatch) = doc.tree_debug_stats();
+    assert_eq!(mismatch, 0, "высота в узле разошлась с настоящей");
+    assert!(skew <= 1, "перекос {skew} после замен и отмен");
+    assert_eq!(height, doc.height(), "высота в корне не совпадает");
+}
+
+#[test]
 fn tree_stays_balanced_under_churn() {
     // Баланс держится при любом порядке правок: иначе спуск перестаёт быть
     // логарифмическим.

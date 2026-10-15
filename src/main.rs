@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use claxis::api::term::Terminal;
 use claxis::cli::{self, Command};
 use claxis::main_messages::{En, Messages};
+use claxis::messages::Messages as SessionMessages;
 use claxis::router::{Cycle, Editor, SessionError};
 
 fn main() {
@@ -65,6 +66,20 @@ fn run(path: Option<PathBuf>) {
     for issue in editor.issues.clone() {
         eprintln!("{}", messages.event_line(&issue.text()));
     }
+    // Папки, за которыми следить не вышло: без этого человек ждёт, что смена
+    // темы применится сама, и не понимает, почему не применилась.
+    for folder in &editor.blind_spots {
+        eprintln!(
+            "{}",
+            messages.event_line(&claxis::messages::En.not_watched(folder))
+        );
+    }
+    // Огрех схемы: значение по умолчанию не того вида. Работаем на дефолтах,
+    // но сказать надо — иначе настройка «сама не применяется» останется
+    // загадкой.
+    if let Some(e) = &editor.schema_error {
+        eprintln!("{}", messages.event_line(&e.text()));
+    }
 
     // Файла может не быть: редактор с этим умеет, и пустой документ —
     // такой же документ, как остальные.
@@ -96,9 +111,20 @@ fn run(path: Option<PathBuf>) {
     };
 
     let mut cycle = Cycle::new();
-    if let Err(e) = cycle.run(&mut term, &mut editor, &mut doc, |line| {
-        eprintln!("{}", messages.event_line(line));
-    }) {
+    let result = cycle.run(
+        &mut term,
+        &mut editor,
+        &mut doc,
+        &claxis::messages::En,
+        |line| eprintln!("{}", messages.event_line(line)),
+    );
+    if let Err(e) = result {
+        eprintln!("{}", messages.terminal_failed(&e.to_string()));
+    }
+    // Терминал закрываем сами, а не по `Drop`: если он остался в raw mode или
+    // протокол не отключился, человек должен об этом узнать сейчас, а не
+    // разгадывать потом, почему после редактора всё сломалось.
+    if let Err(e) = term.close() {
         eprintln!("{}", messages.terminal_failed(&e.to_string()));
         std::process::exit(1);
     }

@@ -5,8 +5,10 @@
 //! `claxis-store` умеет только складывать и доставать байты. Соединяются они
 //! здесь — это и есть работа маршрутизатора.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use crate::api::rope::defaults::buffer::HISTORY_DEPTH;
@@ -68,16 +70,22 @@ impl std::error::Error for SessionError {}
 #[derive(Debug)]
 struct StoreSink {
     store: SnapshotStore,
+    /// Последняя ошибка записи: снапшот не лёг, и об этом должен узнать человек.
+    ///
+    /// Ошибку нельзя вернуть из `accept`: у приёмника нет вызывающего, а
+    /// разорвать из-за неё правку нельзя — текст уже изменён. Поэтому ошибка
+    /// кладётся в общую ячейку, документ забирает её после снятия снапшота и
+    /// говорит о ней пользователю. Молчаливая потеря работы хуже всего.
+    failed: Rc<RefCell<Option<String>>>,
 }
 
 impl SnapshotSink for StoreSink {
     fn accept(&mut self, file: &Path, text: &[u8], history: &[u8]) {
-        // Ошибка сохранения снапшота не ломает правку: потеря кеша не должна
-        // стоить пользователю работы.
-        //
         // История идёт вместе с текстом: без неё после перезапуска отменять
         // было бы нечего, то есть снапшот сохранил бы половину работы.
-        let _ = self.store.put(file, text, history);
+        if let Err(e) = self.store.put(file, text, history) {
+            *self.failed.borrow_mut() = Some(e.text());
+        }
     }
 }
 
@@ -148,6 +156,13 @@ pub struct Document {
     /// не видна и уехала бы под следующим сохранением. Пользователю об этом
     /// говорит вызывающий.
     changed_outside: bool,
+    /// Ячейка, куда приёмник кладёт ошибку записи снапшота.
+    ///
+    /// Приёмник живёт внутри rope и обратного хода не имеет: ошибку забирает
+    /// документ при следующем снятии снапшота и показывает пользователю.
+    sink_failed: Rc<RefCell<Option<String>>>,
+    /// Ошибка записи снапшота, ждущая показа.
+    snapshot_failed: Option<String>,
 }
 
 impl Document {
@@ -360,7 +375,21 @@ impl Document {
     pub fn snapshot(&mut self) {
         // Текст от этого не меняется, поэтому карта строк остаётся в силе.
         self.buffer.snapshot();
+        // Приёмник отдал текст и историю и ошибться мог там, где у него нет
+        // вызывающего. Ошибку забираем здесь: она про работу пользователя, а не
+        // про кеш, и молчать о ней нельзя.
+        if let Some(reason) = self.sink_failed.borrow_mut().take() {
+            self.snapshot_failed = Some(reason);
+        }
         self.last_snapshot = self.clock.elapsed();
+    }
+
+    /// Снапшот не лёг на диск. Текст с причиной, уже переведённый.
+    ///
+    /// Пока ошибка не забрана вызывающим, она здесь: следующий вызов вернёт её
+    /// и очистит, чтобы одно и то же не сообщать дважды.
+    pub fn snapshot_error(&mut self) -> Option<String> {
+        self.snapshot_failed.take()
     }
 }
 
@@ -606,14 +635,27 @@ impl Session {
         // это «только память»: приёмника не будет вовсе, иначе он писал бы
         // в базу строку, которую кольцо тут же удаляет, а пользователь с
         // `persist = true` думал бы, что работа переживает перезапуск.
-        if self.persist && self.store.keep() > 0 {
+        let sink_failed = if self.persist && self.store.keep() > 0 {
             // Своё подключение к той же базе: буфер живёт дольше сессии.
             let store = self.store.reopen().map_err(|e| SessionError::Store {
                 path: self.paths.database().display().to_string(),
                 reason: e.to_string(),
             })?;
-            buffer.set_sink(path.clone(), Box::new(StoreSink { store }));
-        }
+            let failed: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+            buffer.set_sink(
+                path.clone(),
+                Box::new(StoreSink {
+                    store,
+                    failed: Rc::clone(&failed),
+                }),
+            );
+            Some(failed)
+        } else {
+            None
+        };
+        // Без приёмника ошибки писать некуда: ячейка всё равно нужна, чтобы
+        // документ ждал одинаково в обоих случаях.
+        let sink_failed = sink_failed.unwrap_or_default();
         Ok(Document {
             path,
             // Карта строится по тексту, а не едет дельтами: документ только что
@@ -621,10 +663,81 @@ impl Session {
             lines: LineMap::build(&buffer.read()),
             buffer,
             changed_outside,
+            sink_failed,
+            snapshot_failed: None,
             interval: self.interval,
             last_snapshot: Duration::ZERO,
             clock: Box::new(SystemClock),
             stats: Stats::default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Документ с настоящей сессией и настоящим приёмником.
+    fn doc_in(dir: &Path) -> Document {
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "abc\n").unwrap();
+        Session::open_at_with(dir, 3, true, 64)
+            .unwrap()
+            .open_file(&file)
+            .unwrap()
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("claxis-session-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_snapshot_that_failed_to_write_is_reported() {
+        // Приёмник снапшотов не может вернуть ошибку: у него нет вызывающего.
+        // Молчать об этом нельзя — человек закрыл бы редактор, решив, что работа
+        // сохранена, и потерял бы её.
+        let dir = temp_dir("snapshot-failed");
+        let mut doc = doc_in(&dir);
+
+        // Ошибка приходит от приёмника в общую ячейку — так же, как при
+        // настоящей поломке диска.
+        *doc.sink_failed.borrow_mut() = Some("диск кончился".to_string());
+
+        doc.snapshot();
+        let reason = doc
+            .snapshot_error()
+            .expect("ошибка записи снапшота обязана дойти до документа");
+        assert_eq!(reason, "диск кончился");
+        // Второй раз то же не повторяется: показали один раз и хватит.
+        assert!(
+            doc.snapshot_error().is_none(),
+            "одна ошибка — одно сообщение"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_written_without_trouble_says_nothing() {
+        let dir = temp_dir("snapshot-ok");
+        let mut doc = doc_in(&dir);
+        doc.snapshot();
+        assert!(
+            doc.snapshot_error().is_none(),
+            "снапшот лёг, жаловаться не на что"
+        );
+    }
+
+    #[test]
+    fn a_document_without_a_sink_has_nothing_to_report() {
+        // Хранилище выключено: писать некуда и жаловаться не на что.
+        let dir = temp_dir("no-sink");
+        let file = dir.join("b.rs");
+        std::fs::write(&file, "abc\n").unwrap();
+        let session = Session::open_at_with(&dir, 3, false, 64).unwrap();
+        let mut doc = session.open_file(&file).unwrap();
+        doc.snapshot();
+        assert!(doc.snapshot_error().is_none());
     }
 }

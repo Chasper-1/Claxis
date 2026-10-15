@@ -63,6 +63,18 @@ pub enum Error {
         /// Какой ключ не признан.
         key: String,
     },
+    /// Значение по умолчанию в самой схеме не такое, каким объявлен ключ.
+    ///
+    /// Это не ошибка пользователя, а огрех схемы: молчаливый ноль здесь означал
+    /// бы, что редактор работает с настройкой, которой никто не писал.
+    BadSchemaDefault {
+        /// Ключ, у которого значение по умолчанию неразбираемо.
+        key: &'static str,
+        /// Что в схеме написано.
+        value: &'static str,
+        /// Какого вида значение ожидалось.
+        expected: &'static str,
+    },
     /// В пути к секции что-то есть, а секцией это не является: `{path}`, `{part}`.
     ///
     /// Отдельный вид, а не `Parse` с готовым текстом: сообщение собирает
@@ -88,6 +100,11 @@ impl Error {
             Error::NoLastGood => m.no_last_good(),
             Error::UnknownKeyInFile { file, key } => m.unknown_key_in_file(file, key),
             Error::NotASection { path, part } => m.not_a_section(path, part),
+            Error::BadSchemaDefault {
+                key,
+                value,
+                expected,
+            } => m.bad_schema_default(key, value, expected),
         }
     }
 

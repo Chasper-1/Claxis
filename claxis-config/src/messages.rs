@@ -21,6 +21,10 @@ pub trait Messages {
     ///
     /// `{path}` — файл, `{part}` — кусок пути, который оказался не таблицей.
     fn not_a_section(&self, path: &str, part: &str) -> String;
+
+    /// Значение по умолчанию в схеме неразбираемо: `{key}`, `{value}`,
+    /// `{expected}`.
+    fn bad_schema_default(&self, key: &str, value: &str, expected: &str) -> String;
     /// Ключа нет в схеме.
     fn unknown_key(&self, key: &str) -> String;
     /// Значение не того типа.
@@ -95,6 +99,17 @@ impl Messages for En {
         substitute(
             "cannot use config {path}: {part} is not a section",
             &[("path", path.to_string()), ("part", part.to_string())],
+        )
+    }
+
+    fn bad_schema_default(&self, key: &str, value: &str, expected: &str) -> String {
+        substitute(
+            "default value of {key} is {value}, but {expected} was expected",
+            &[
+                ("key", key.to_string()),
+                ("value", value.to_string()),
+                ("expected", expected.to_string()),
+            ],
         )
     }
 
@@ -222,6 +237,10 @@ pub fn samples() -> Vec<(&'static str, String)> {
         (
             "not_a_section",
             m.not_a_section("edit.toml", "General.history_depth"),
+        ),
+        (
+            "bad_schema_default",
+            m.bad_schema_default("General.history_depth", "many", "a number"),
         ),
     ]
 }

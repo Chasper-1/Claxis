@@ -145,6 +145,8 @@ mod tests {
             "buffer_error",
             "config_dir_failed",
             "no_home_dir",
+            "snapshot_failed",
+            "not_watched",
             "no_usable_config",
             "file_too_large",
         ];

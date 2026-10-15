@@ -102,10 +102,14 @@ impl Settings {
     /// истории из `edit.toml`, снапшоты из `files.toml`. Файлы не видят
     /// друг друга.
     ///
+    /// Ошибка приходит от схемы, а не от пользователя: значение по умолчанию
+    /// в схеме обязано соответствовать своему виду. Молчаливый ноль означал бы,
+    /// что редактор работает с настройкой, которой никто не писал.
+    ///
     /// Каталог перевода здесь **не** читается: для этого нужен путь, а путь
     /// знает только редактор. Язык запоминается, файл грузится отдельно —
     /// [`Settings::load_language`].
-    pub fn from_config(config: &Config) -> Self {
+    pub fn from_config(config: &Config) -> Result<Self, crate::api::config::Error> {
         let mut settings = Self::defaults();
 
         if let Some(def) = schema::find(ConfigFile::Global, "General.language") {
@@ -117,37 +121,37 @@ impl Settings {
         if let Some(def) = schema::find(ConfigFile::Edit, "General.history_depth") {
             // Конфиг ограничивает число 65535, буферу нужен u32: привести
             // шире, чем есть, ничего не теряется.
-            settings.history_depth = config.u16_or_default(def) as u32;
+            settings.history_depth = config.u16_or_default(def)? as u32;
         }
         if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_keep") {
-            settings.snapshots_keep = config.u8_or_default(def);
+            settings.snapshots_keep = config.u8_or_default(def)?;
         }
         if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_persist") {
-            settings.snapshots_persist = config.bool_or_default(def);
+            settings.snapshots_persist = config.bool_or_default(def)?;
         }
         if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_interval") {
-            settings.snapshots_interval = config.u16_or_default(def);
+            settings.snapshots_interval = config.u16_or_default(def)?;
         }
         if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.mode") {
             settings.savescreen_mode = config.string_or_default(def);
         }
         if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.include") {
-            settings.savescreen_include = config.bool_or_default(def);
+            settings.savescreen_include = config.bool_or_default(def)?;
         }
         if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.input_char") {
-            settings.savescreen_input_char = config.bool_or_default(def);
+            settings.savescreen_input_char = config.bool_or_default(def)?;
         }
         if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.delete_char") {
-            settings.savescreen_delete_char = config.bool_or_default(def);
+            settings.savescreen_delete_char = config.bool_or_default(def)?;
         }
         if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.history_usage") {
-            settings.savescreen_history_usage = config.bool_or_default(def);
+            settings.savescreen_history_usage = config.bool_or_default(def)?;
         }
         settings.savescreen_history_usage_percent =
             table_string(config, "percent", HISTORY_USAGE_TABLE);
         settings.savescreen_history_usage_number =
             table_string(config, "number", HISTORY_USAGE_TABLE);
-        settings
+        Ok(settings)
     }
 
     /// Загрузить файл перевода активного языка.

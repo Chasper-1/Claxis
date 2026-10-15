@@ -394,7 +394,7 @@ fn each_file_owns_its_keys() {
         ),
     ]);
 
-    let settings = crate::router::Settings::from_config(&config);
+    let settings = crate::router::Settings::from_config(&config).unwrap();
     assert_eq!(settings.history_depth, 64);
     assert_eq!(settings.snapshots_keep, 7);
     assert!(!settings.snapshots_persist);
@@ -407,7 +407,7 @@ fn a_file_does_not_affect_another() {
         crate::api::config::ConfigFile::Files,
         "[General]\nhistory_depth = 64\n".parse().unwrap(),
     )]);
-    let settings = crate::router::Settings::from_config(&config);
+    let settings = crate::router::Settings::from_config(&config).unwrap();
     assert_eq!(settings.history_depth, 8192);
 }
 
@@ -1249,6 +1249,23 @@ fn keep_zero_means_memory_only_and_writes_nothing() {
     assert!(
         store.latest(&file).unwrap().is_none(),
         "в базу не должно уйти ничего"
+    );
+}
+
+#[test]
+fn a_snapshot_written_without_trouble_says_nothing() {
+    // Здоровое состояние не должно пугать сообщениями.
+    let tmp = Temp::new("snapshot-ok");
+    let file = tmp.file("a.rs");
+    std::fs::write(&file, "abc\n").unwrap();
+
+    let session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    let mut doc = session.open_file(&file).unwrap();
+    doc.insert(3, b"XY").unwrap();
+    doc.snapshot();
+    assert!(
+        doc.snapshot_error().is_none(),
+        "снапшот лёг, жаловаться не на что"
     );
 }
 
