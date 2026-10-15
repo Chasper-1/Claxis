@@ -3,7 +3,7 @@ members = ["claxis-text", "claxis-buffer", "claxis-disk", "claxis-input", "claxi
 
 [package]
 name = "Claxis"
-version = "0.4.0"
+version = "0.4.2"
 edition = "2024"
 
 # Бинарная цель остаётся `Claxis`, библиотечная — `claxis`: слой API и
