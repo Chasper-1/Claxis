@@ -40,7 +40,7 @@ pub struct Node {
     a: u32,
     /// Ветка: индекс правого ребёнка. Лист: длина диапазона.
     b: u32,
-    /// Ветка: длина поддерева. Лист: не используется.
+    /// Ветка: длина поддерева. Лист: старший бит смещения в буфере.
     c: u32,
 }
 
@@ -71,10 +71,13 @@ impl Node {
 
     /// Лист: диапазон буфера.
     pub const fn leaf(start: u32, len: u32) -> Self {
-        Self {
-            a: LEAF | start,
+        Node {
+            // Старший бит смещения не влезает в `a` — там метка листа. Он
+            // лежит в `c`: у листа это поле свободно, а документ честно держит
+            // все четыре гигабайта, а не два.
+            a: LEAF | (start & !LEAF),
             b: len,
-            c: 0,
+            c: start >> 31,
         }
     }
 
@@ -104,7 +107,7 @@ impl Node {
     /// Откуда начинается текст листа.
     #[inline]
     pub const fn start(&self) -> u32 {
-        self.a & !LEAF
+        (self.c << 31) | (self.a & !LEAF)
     }
 
     /// Сколько байт в листе.
@@ -167,6 +170,18 @@ pub struct Leaf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leaf_keeps_the_offset_above_two_gigabytes() {
+        // Старший бит смещения лежит в свободном поле листа. Если он потеряется,
+        // документ больше двух гигабайт прочитает чужой кусок — молча.
+        for start in [0, 1, u32::MAX / 2, i32::MAX as u32 + 1, u32::MAX] {
+            let leaf = Node::leaf(start, 7);
+            assert!(leaf.is_leaf());
+            assert_eq!(leaf.start(), start, "смещение {start} не уцелело");
+            assert_eq!(leaf.leaf_len(), 7);
+        }
+    }
 
     #[test]
     fn a_node_is_twelve_bytes() {

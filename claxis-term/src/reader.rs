@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crossterm::event::{Event as CEvent, KeyCode as CKeyCode, KeyEventKind, KeyModifiers};
 
-use crate::event::{Event, Key, KeyCode, Modifiers};
+use crate::event::{Event, Key, KeyCode, Modifiers, MouseButton};
 
 /// Следующее событие от терминала.
 pub fn next() -> io::Result<Event> {
@@ -33,16 +33,45 @@ fn convert(cevent: CEvent) -> Option<Event> {
             let at = Instant::now();
             let key = Key { code, modifiers };
             match kind {
-                KeyEventKind::Press | KeyEventKind::Repeat => Some(Event::KeyPressed { key, at }),
+                KeyEventKind::Press => Some(Event::KeyPressed { key, at }),
                 KeyEventKind::Release => Some(Event::KeyReleased { key, at }),
+                KeyEventKind::Repeat => Some(Event::KeyRepeated { key, at }),
             }
         }
         CEvent::Resize(cols, rows) => Some(Event::Resized { cols, rows }),
         CEvent::FocusGained => Some(Event::FocusGained),
         CEvent::FocusLost => Some(Event::FocusLost),
-        // Мышь и вставка из буфера пока не разобраны.
-        CEvent::Mouse(_) | CEvent::Paste(_) => Some(Event::Unknown),
+        // Вставка и мышь терять нельзя: молча пропавший текст хуже отшибка.
+        CEvent::Paste(text) => Some(Event::Paste { text }),
+        CEvent::Mouse(m) => convert_mouse(m),
     }
+}
+
+/// Конвертировать мышь. Движения без нажатия пока не нужны редактору: курсор
+/// двигают клавиши, а выделение мышью появится вместе с режимом выделения.
+fn convert_mouse(m: crossterm::event::MouseEvent) -> Option<Event> {
+    let button = match m.kind {
+        crossterm::event::MouseEventKind::Down(b) => convert_button(b),
+        crossterm::event::MouseEventKind::Up(b) => convert_button(b),
+        _ => return None,
+    }?;
+    Some(Event::Mouse {
+        button,
+        col: m.column,
+        row: m.row,
+    })
+}
+
+/// Конвертировать кнопку мыши.
+///
+/// Кнопок у мыши больше трёх, но редактору нужны эти: остальные в сюда не
+/// попадают, потому что `crossterm` их не различает.
+fn convert_button(b: crossterm::event::MouseButton) -> Option<MouseButton> {
+    Some(match b {
+        crossterm::event::MouseButton::Left => MouseButton::Left,
+        crossterm::event::MouseButton::Right => MouseButton::Right,
+        crossterm::event::MouseButton::Middle => MouseButton::Middle,
+    })
 }
 
 /// Конвертировать код клавиши.
@@ -114,6 +143,18 @@ mod tests {
     }
 
     #[test]
+    fn repeat_is_not_a_new_press() {
+        // Автоповтор продолжает нажатие, а не начинает новое: иначе время
+        // удержания перезаписывалось бы на каждом повторе.
+        let cevent = CEvent::Key(crossterm::event::KeyEvent::new_with_kind(
+            CKeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert!(matches!(convert(cevent), Some(Event::KeyRepeated { .. })));
+    }
+
+    #[test]
     fn modifiers_are_converted() {
         let cevent = CEvent::Key(crossterm::event::KeyEvent::new(
             CKeyCode::Char('a'),
@@ -151,14 +192,43 @@ mod tests {
     }
 
     #[test]
-    fn mouse_is_unknown() {
+    fn a_mouse_press_keeps_its_button_and_place() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let cevent = CEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 7,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        match convert(cevent) {
+            Some(Event::Mouse { button, col, row }) => {
+                assert_eq!(button, MouseButton::Left);
+                assert_eq!(col, 7);
+                assert_eq!(row, 3);
+            }
+            other => panic!("ожидалось Mouse, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mouse_move_without_a_button_is_skipped() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let cevent = CEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
             column: 0,
             row: 0,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(convert(cevent), Some(Event::Unknown));
+        assert_eq!(convert(cevent), None);
+    }
+
+    #[test]
+    fn a_paste_keeps_its_text() {
+        // Вставка теряться не может: молча пропавший текст хуже отшибка.
+        let cevent = CEvent::Paste("вставленное".to_string());
+        match convert(cevent) {
+            Some(Event::Paste { text }) => assert_eq!(text, "вставленное"),
+            other => panic!("ожидалось Paste, получено {other:?}"),
+        }
     }
 }

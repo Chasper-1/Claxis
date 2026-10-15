@@ -1123,7 +1123,7 @@ fn translations_in_the_folder_do_not_apply_themselves() {
 fn only_the_config_crate_knows_where_the_folders_are() {
     // Крейты получают готовый путь и ничего не знают о раскладке на диске.
     // Если тема или перевод снова начнут собирать путь сами, знание о папках
-    // размажется по двум местам, и правка одной распа��ется на другую.
+    // размажется по двум местам, и правка одной распадётся на другую.
     //
     // Проверяем по коду: ни в `claxis-theme`, ни в `claxis-i18n` не должно быть
     // имён папок. Имена папок — дело одного крейта.
@@ -1198,6 +1198,78 @@ fn history_survives_reopening_the_document() {
         .unwrap()
         .expect("отмена доступна после перезапуска");
     assert_eq!(doc.text(), b"abcXY\n");
+}
+
+#[test]
+fn a_file_changed_outside_is_not_overwritten_by_the_snapshot() {
+    // Файл правили не из редактора. Снапшот построен на прежней версии, и
+    // применять его нельзя: правка извне стала бы невидимой и уехала бы под
+    // следующим сохранением.
+    let tmp = Temp::new("changed-outside");
+    let file = tmp.dir().join("doc.txt");
+    std::fs::write(&file, "abc\n").unwrap();
+
+    let session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    {
+        let mut doc = session.open_file(&file).unwrap();
+        doc.insert(3, b"XY").unwrap();
+        doc.snapshot();
+    }
+
+    // Правка снаружи: и содержимое, и длина.
+    std::fs::write(&file, "чужая правка\n").unwrap();
+
+    let session2 = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    let doc = session2.open_file(&file).unwrap();
+    assert_eq!(
+        doc.text(),
+        "чужая правка\n".as_bytes(),
+        "открыт файл как есть"
+    );
+    assert!(doc.changed_outside(), "об изменении сообщаем");
+}
+
+#[test]
+fn keep_zero_means_memory_only_and_writes_nothing() {
+    // Ноль в кольце — это «только память». Приёмника быть не должно: иначе он
+    // писал бы в базу строку, которую кольцо тут же удаляет, а пользователь с
+    // `persist = true` думал бы, что работа переживает перезапуск.
+    let tmp = Temp::new("keep-zero");
+    let file = tmp.dir().join("doc.txt");
+    std::fs::write(&file, "abc\n").unwrap();
+
+    let session = crate::router::Session::open_at_with(tmp.dir(), 0, true, 64).unwrap();
+    {
+        let mut doc = session.open_file(&file).unwrap();
+        doc.insert(3, b"XY").unwrap();
+        doc.snapshot();
+    }
+
+    let store = session.store().reopen().unwrap();
+    assert!(
+        store.latest(&file).unwrap().is_none(),
+        "в базу не должно уйти ничего"
+    );
+}
+
+#[test]
+fn an_untouched_file_still_gets_its_snapshot() {
+    // Обратная сторона проверки: файл не трогали, снапшот применяется.
+    let tmp = Temp::new("untouched");
+    let file = tmp.dir().join("doc.txt");
+    std::fs::write(&file, "abc\n").unwrap();
+
+    let session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    {
+        let mut doc = session.open_file(&file).unwrap();
+        doc.insert(3, b"XY").unwrap();
+        doc.snapshot();
+    }
+
+    let session2 = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
+    let doc = session2.open_file(&file).unwrap();
+    assert_eq!(doc.text(), b"abcXY\n", "текст из снапшота");
+    assert!(!doc.changed_outside(), "файл не меняли, ложной тревоги нет");
 }
 
 #[test]

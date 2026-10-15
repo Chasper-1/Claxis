@@ -57,7 +57,16 @@ impl Cycle {
                     doc.note_held(at.saturating_duration_since(since));
                 }
             }
-            Event::Resized { .. } | Event::FocusGained | Event::FocusLost | Event::Unknown => {}
+            Event::Resized { .. } | Event::FocusGained | Event::FocusLost => {}
+            // Автоповтор не трогает ни времени, ни счётчика: он продолжает
+            // нажатие, а не начинает новое. Иначе зажатая клавиша считалась бы
+            // десятками нажатий, а удержание — считалось бы от каждого
+            // повтора заново.
+            Event::KeyRepeated { .. } => {}
+            // Вставка и мышь пока некуда деть: вставлять текст некуда без
+            // каретки, выделять нечем. Событие названо явно, чтобы оно не
+            // потерялось молча в общем «остальное».
+            Event::Paste { .. } | Event::Mouse { .. } => {}
         }
         Action::Continue
     }

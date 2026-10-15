@@ -26,17 +26,25 @@ pub enum Command {
     Messages,
     /// Показать справку.
     Help,
+    /// Такого аргумента нет: имя аргумента.
+    Unknown {
+        /// Что пришло в командной строке.
+        arg: String,
+    },
 }
 
 /// Разобрать аргументы командной строки.
 ///
-/// Аргумент, которого мы не знаем, — не ошибка: это путь к файлу. Команды
-/// узнаются по первому слову, всё, что не команда, считается файлом.
+/// Аргумент, который не команда и не файл, — это ошибка: молча открывать
+/// файл с именем `--что-то` хуже, чем сказать, что такого имени нет.
 pub fn parse(args: &[String]) -> Command {
     match args.first().map(String::as_str) {
         Some("messages") => Command::Messages,
         Some("help") | Some("--help") | Some("-h") => Command::Help,
         None => Command::Run { path: None },
+        Some(path) if path.starts_with('-') => Command::Unknown {
+            arg: path.to_string(),
+        },
         Some(path) => Command::Run {
             path: Some(std::path::PathBuf::from(path)),
         },
@@ -49,14 +57,15 @@ pub fn parse(args: &[String]) -> Command {
 /// Каждое сообщение выводится с настоящими значениями вместо имён в
 /// фигурных скобках, иначе переводчик не поймёт, что подставляется.
 pub fn print_messages(out: &mut impl Write) -> std::io::Result<()> {
-    let crates: [(&str, Vec<(&str, String)>); 7] = [
+    let crates: [(&str, Vec<(&str, String)>); 8] = [
         ("claxis-rope", rope::messages::samples()),
         ("claxis-buffer", buffer::messages::samples()),
         ("claxis-store", store::messages::samples()),
         ("claxis-term", term::messages::samples()),
         ("claxis-i18n", i18n::messages::samples()),
         ("claxis-config", config::messages::samples()),
-        ("Claxis", main_messages::samples()),
+        ("Claxis", crate::messages::samples()),
+        ("Claxis (main)", main_messages::samples()),
     ];
 
     for (name, messages) in crates {
@@ -79,17 +88,36 @@ pub fn print_help(out: &mut impl Write, m: &dyn main_messages::Messages) -> std:
     writeln!(out, "{}", m.opens_editor())?;
     writeln!(out)?;
     writeln!(out, "{}", m.commands_heading())?;
-    for (name, what) in COMMANDS {
-        writeln!(out, "{}", m.command_line(name, what))?;
+    // Описания команд — из каталога: пользователю с переводом английский текст
+    // в справке читаться не должен.
+    for (name, key) in COMMANDS {
+        writeln!(out, "{}", m.command_line(name, &what(m, key)))?;
     }
     Ok(())
 }
 
-/// Команды и что они делают. Значения переводятся каталогом.
-const COMMANDS: [(&str, &str); 2] = [
-    ("messages", "show every message of every crate"),
-    ("help", "this help"),
-];
+/// Команды редактора: имя и ключ каталога с описанием.
+///
+/// Имя — код, описание — перевод. Само описание в коде не держится: ключ
+/// достаётся у каталога, а английский вариант лежит там же.
+pub const COMMANDS: [(&str, What); 2] = [("messages", What::Messages), ("help", What::Help)];
+
+/// Описание команды: какое слово из каталога подставить.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum What {
+    /// Описание команды `messages`.
+    Messages,
+    /// Описание команды `help`.
+    Help,
+}
+
+/// Текст описания команды на языке каталога.
+pub fn what(m: &dyn main_messages::Messages, what: What) -> String {
+    match what {
+        What::Messages => m.what_messages(),
+        What::Help => m.what_help(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -102,7 +130,7 @@ mod tests {
         match command {
             Command::Messages => print_messages(&mut buf).unwrap(),
             Command::Help => print_help(&mut buf, &En).unwrap(),
-            Command::Run { .. } => {}
+            Command::Run { .. } | Command::Unknown { .. } => {}
         }
         String::from_utf8(buf).unwrap()
     }
@@ -119,6 +147,20 @@ mod tests {
         );
         assert_eq!(parse(&["messages".to_string()]), Command::Messages);
         assert_eq!(parse(&["--help".to_string()]), Command::Help);
+        // Неизвестный ключ — не имя файла: иначе редактор молча откроет файл,
+        // которого никто не просил.
+        assert_eq!(
+            parse(&["--что-то".to_string()]),
+            Command::Unknown {
+                arg: "--что-то".to_string()
+            }
+        );
+        assert_eq!(
+            parse(&["-x".to_string()]),
+            Command::Unknown {
+                arg: "-x".to_string()
+            }
+        );
     }
 
     #[test]
@@ -197,6 +239,18 @@ mod tests {
             }
             fn command_line(&self, n: &str, w: &str) -> String {
                 format!("  {n} — {w}")
+            }
+            fn changed_outside(&self, p: &str) -> String {
+                format!("файл {p} меняли снаружи")
+            }
+            fn unknown_argument(&self, a: &str) -> String {
+                format!("неизвестный аргумент: {a}")
+            }
+            fn what_messages(&self) -> String {
+                "показать все сообщения".to_string()
+            }
+            fn what_help(&self) -> String {
+                "эта справка".to_string()
             }
         }
         let _ = En;

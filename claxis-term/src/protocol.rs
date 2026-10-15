@@ -11,6 +11,13 @@ use std::io::{self, Read, Write};
 /// альтернативные клавиши и отчёт обо всех клавишах как escape-коды.
 const FLAGS: u16 = 0b11111;
 
+/// Бит «различать нажатие и отпускание».
+///
+/// Без него протокола для редактора нет: терминал будет слать только нажатия,
+/// и модель ввода, ради которой протокол и включается, работать не сможет.
+/// Поддержка протокола проверяется именно этим битом, а не любым ответом.
+const REPORTS_EVENT_TYPES: u16 = 0b10;
+
 /// Включить протокол: `CSI = flags ; mode > u`.
 pub fn enable() -> io::Result<()> {
     let mut out = io::stdout();
@@ -25,12 +32,12 @@ pub fn disable() -> io::Result<()> {
     out.flush()
 }
 
-/// Поддерживает ли терминал протокол.
+/// Поддерживает ли терминал нужную часть протокола.
 ///
-/// Запрос `CSI ? u`, ответ `CSI ? flags ; mode u`. Если ответа нет или флагов
-/// нет — протокол не поддерживается.
+/// Запрос `CSI ? u`, ответ `CSI ? flags ; mode u`. Ответа нет, в ответе нет
+/// бита отчёта о типах событий — протокола для редактора нет.
 pub fn supports() -> bool {
-    query().is_some()
+    matches!(query(), Some(flags) if flags & REPORTS_EVENT_TYPES != 0)
 }
 
 /// Запросить поддержку у терминала.
@@ -90,6 +97,15 @@ mod tests {
     fn enable_sequence_is_correct() {
         // CSI = 1 ; 1 > u — включить с полными флагами.
         assert_eq!(FLAGS, 0b11111);
+    }
+
+    #[test]
+    fn a_terminal_without_event_types_is_not_supported() {
+        // Ответ с другими флагами — это не kitty keyboard protocol для
+        // редактора: отпусканий в нём не будет, а модель ввода без них не
+        // работает. Поддержкой считается только нужный бит.
+        assert_eq!(0b11111 & REPORTS_EVENT_TYPES, REPORTS_EVENT_TYPES);
+        assert_eq!(0b01000 & REPORTS_EVENT_TYPES, 0);
     }
 
     #[test]

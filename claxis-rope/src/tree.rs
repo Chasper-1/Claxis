@@ -96,7 +96,7 @@ impl Tree {
         self.nodes.capacity()
     }
 
-    /// Выс��а дерева — для проверки баланса.
+    /// Высота дерева — для проверки баланса.
     pub fn height(&self) -> u32 {
         if self.root == NIL {
             0

@@ -12,6 +12,10 @@ pub trait Messages {
     fn event_line(&self, event: &str) -> String;
     /// Конфиг сломан, редактор пошёл на запасной.
     fn using_last_good(&self) -> String;
+    /// Файл меняли снаружи, пока редактор был закрыт: `{path}`.
+    fn changed_outside(&self, path: &str) -> String;
+    /// Нет такого аргумента: `{arg}`.
+    fn unknown_argument(&self, arg: &str) -> String;
     /// Строка usage: `{usage}` — как вызывается.
     fn usage(&self, usage: &str) -> String;
     /// Без команды открывается редактор.
@@ -20,6 +24,10 @@ pub trait Messages {
     fn commands_heading(&self) -> String;
     /// Строка списка команд: `{name}` и `{what}`.
     fn command_line(&self, name: &str, what: &str) -> String;
+    /// Описание команды `messages`.
+    fn what_messages(&self) -> String;
+    /// Описание команды `help`.
+    fn what_help(&self) -> String;
 }
 
 /// Английские сообщения — язык по умолчанию.
@@ -49,6 +57,17 @@ impl Messages for En {
         "config is broken, using the last saved good copy".to_string()
     }
 
+    fn changed_outside(&self, path: &str) -> String {
+        crate::api::text::substitute(
+            "file {path} was changed outside; its snapshot is not applied",
+            &[("path", path.to_string())],
+        )
+    }
+
+    fn unknown_argument(&self, arg: &str) -> String {
+        crate::api::text::substitute("unknown argument: {arg}", &[("arg", arg.to_string())])
+    }
+
     fn usage(&self, usage: &str) -> String {
         crate::api::text::substitute(usage, &[("usage", usage.to_string())])
     }
@@ -67,6 +86,14 @@ impl Messages for En {
             &[("name", name.to_string()), ("what", what.to_string())],
         )
     }
+
+    fn what_messages(&self) -> String {
+        "show every message of every crate".to_string()
+    }
+
+    fn what_help(&self) -> String {
+        "this help".to_string()
+    }
 }
 
 /// Все сообщения бинарника с примерами значений.
@@ -76,5 +103,11 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ("terminal_failed", m.terminal_failed("terminal closed")),
         ("session_failed", m.session_failed("cannot open store")),
         ("event_line", m.event_line("KeyPressed { key: Char('a') }")),
+        ("using_last_good", m.using_last_good()),
+        ("changed_outside", m.changed_outside("/home/user/notes.txt")),
+        ("unknown_argument", m.unknown_argument("-x")),
+        ("opens_editor", m.opens_editor()),
+        ("commands_heading", m.commands_heading()),
+        ("command_line", m.command_line("help", "this help")),
     ]
 }

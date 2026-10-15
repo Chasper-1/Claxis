@@ -73,6 +73,22 @@ impl History {
         self.bytes.is_empty()
     }
 
+    /// Файл таков, каким был, когда бралась история.
+    ///
+    /// Это первые `file_len` байт буфера: основа документа, от которой
+    /// считались все правки. Сверяется с файлом на диске — иначе правка,
+    /// сделанная снаружи, молча уедет под следующей записью.
+    pub fn base(&self) -> Result<&[u8]> {
+        let header = Header::parse(&self.bytes)?;
+        let end = header
+            .buffer_at
+            .checked_add(header.file_len)
+            .ok_or(crate::Error::TruncatedHistory)?;
+        self.bytes
+            .get(header.buffer_at..end)
+            .ok_or(crate::Error::TruncatedHistory)
+    }
+
     /// Принять байты из хранилища и проверить, что блоб наш и целый.
     ///
     /// В базе лежит то, что положил прошлый запуск: прежний буфер писал

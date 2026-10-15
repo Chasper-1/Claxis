@@ -26,6 +26,12 @@ fn main() {
             let _ = cli::print_help(&mut out, &messages).and_then(|()| out.flush());
             return;
         }
+        // Такого аргумента нет: молча открывать файл с именем `--что-то` хуже, чем
+        // сказать, что такого имени нет.
+        Command::Unknown { arg } => {
+            eprintln!("{}", messages.unknown_argument(&arg));
+            std::process::exit(2);
+        }
         // Редактор открывается с терминалом, дальше идёт обычный цикл.
         Command::Run { path } => path,
     };
@@ -35,18 +41,18 @@ fn main() {
 
 fn run(path: Option<PathBuf>) {
     let messages = En;
-    let mut term = match Terminal::new() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{}", messages.terminal_failed(&e.to_string()));
-            std::process::exit(1);
-        }
-    };
-
+    // Редактор и документ собираются до терминала. Предупреждения о конфиге
+    // и о чужой правке печатаются здесь же: в raw mode вывод летит мимо
+    // позиционирования и остаётся в экране навсегда.
     let mut editor = match Editor::open() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("{}", messages.session_failed(&e.to_string()));
+            // Текст ошибки собирает каталог, а не `Display`: у ошибок есть
+            // структура, и текст для неё живёт в каталоге.
+            eprintln!(
+                "{}",
+                messages.session_failed(&e.message(&claxis::messages::En))
+            );
             std::process::exit(1);
         }
     };
@@ -54,10 +60,7 @@ fn run(path: Option<PathBuf>) {
     // О сломанном конфиге говорим сразу: молчать нельзя, иначе пользователь
     // не увидит, что его правка не сработала.
     if editor.used_last_good {
-        eprintln!(
-            "{}",
-            messages.event_line("config is broken, using the last saved good copy")
-        );
+        eprintln!("{}", messages.event_line(&messages.using_last_good()));
     }
     for issue in editor.issues.clone() {
         eprintln!("{}", messages.event_line(&issue.text()));
@@ -68,7 +71,26 @@ fn run(path: Option<PathBuf>) {
     let mut doc = match open_document(&editor, path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("{}", messages.session_failed(&e.to_string()));
+            eprintln!(
+                "{}",
+                messages.session_failed(&e.message(&claxis::messages::En))
+            );
+            std::process::exit(1);
+        }
+    };
+    // Файл могли поменять снаружи, пока редактор был закрыт. Снапшот тогда не
+    // применён, и об этом честно сказано: молча пропавший текст хуже отшибка.
+    if doc.changed_outside() {
+        eprintln!(
+            "{}",
+            messages.event_line(&messages.changed_outside(&doc.path().display().to_string()))
+        );
+    }
+
+    let mut term = match Terminal::new() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", messages.terminal_failed(&e.to_string()));
             std::process::exit(1);
         }
     };

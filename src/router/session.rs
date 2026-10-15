@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::api::rope::defaults::buffer::HISTORY_DEPTH;
 use crate::api::rope::{
-    Document as Rope, Error as RopeError, History, Record as RopeRecord, SnapshotSink,
+    Document as Rope, Error as RopeError, History, MIN_DEPTH, Record as RopeRecord, SnapshotSink,
 };
 use crate::api::store::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::messages::Messages;
@@ -142,6 +142,12 @@ pub struct Document {
     /// Карта живёт здесь, а не в буфере: документ знает про байты и ничего не
     /// знает про строки. Сюда приходят только дельты правок.
     lines: LineMap,
+    /// Файл на диске разошёлся с тем, на котором строился снапшот.
+    ///
+    /// Снапшот тогда не применяется: иначе правка, сделанная снаружи, была бы
+    /// не видна и уехала бы под следующим сохранением. Пользователю об этом
+    /// говорит вызывающий.
+    changed_outside: bool,
 }
 
 impl Document {
@@ -166,6 +172,15 @@ impl Document {
     /// Карта строк документа.
     pub fn lines(&self) -> &LineMap {
         &self.lines
+    }
+
+    /// Файл меняли снаружи, пока редактор был закрыт.
+    ///
+    /// Снапшот тогда не применялся: иначе правка извне была бы не видна и
+    /// уехала бы под следующим сохранением. Документ открыт как есть, и об
+    /// этом честно сказано.
+    pub fn changed_outside(&self) -> bool {
+        self.changed_outside
     }
 
     /// Номер строки для позиции, начиная с нуля.
@@ -464,6 +479,20 @@ impl Session {
         self.opened_depth
     }
 
+    /// Глубина для новых документов.
+    ///
+    /// Конфиг может назвать ноль, а буфер с таким значением не создаётся:
+    /// редактор обязан сказать об этом ошибкой, а не приводить значение
+    /// молча — человек у себя в конфиге такого не писал.
+    fn history_depth_for_new_documents(&self) -> Result<u32, SessionError> {
+        if self.history_depth < MIN_DEPTH {
+            return Err(SessionError::Buffer(RopeError::InvalidHistoryDepth {
+                depth: self.history_depth,
+            }));
+        }
+        Ok(self.history_depth)
+    }
+
     /// Где лежит хранилище.
     pub fn paths(&self) -> &StorePaths {
         &self.paths
@@ -529,8 +558,9 @@ impl Session {
                 });
             }
         };
-        let mut buffer =
-            Rope::with_depth(text, self.history_depth).map_err(SessionError::Buffer)?;
+        let mut buffer = Rope::with_depth(text.clone(), self.history_depth_for_new_documents()?)
+            .map_err(SessionError::Buffer)?;
+        let mut changed_outside = false;
         // Снапшот под документом копит не только текст, но и историю правок.
         // Восстанавливаем её: после перезапуска отменять должно быть можно,
         // иначе половина работы пользователя просто исчезает.
@@ -541,13 +571,27 @@ impl Session {
             // Чужой или битый блоб историю не восстановит — и не должен:
             // текст-то из базы верный, терять его из-за испорченного хвоста
             // незачем.
-            if let Ok(restored) = History::decode(&snapshot.history).and_then(|h| h.restore()) {
-                buffer = restored;
+            if let Ok(history) = History::decode(&snapshot.history) {
+                match history.base() {
+                    // Файл тот же, на котором снят снапшот: применяем.
+                    Ok(base) if base == text.as_slice() => {
+                        if let Ok(restored) = history.restore() {
+                            buffer = restored;
+                        }
+                    }
+                    // Файл могли поменять снаружи. Применять снапшот нельзя:
+                    // правка извне станет невидимой и уедет под следующим
+                    // сохранением. Открываем файл как есть и говорим об этом.
+                    Ok(_) => changed_outside = true,
+                    Err(_) => {}
+                }
             }
         }
-        // Приёмник вешается только если снапшоты положено хранить. Иначе
-        // буфер работает без диска и настройка `persist` что-то значит.
-        if self.persist {
+        // Приёмник вешается только если снапшоты положено хранить. Ноль в кольце —
+        // это «только память»: приёмника не будет вовсе, иначе он писал бы
+        // в базу строку, которую кольцо тут же удаляет, а пользователь с
+        // `persist = true` думал бы, что работа переживает перезапуск.
+        if self.persist && self.store.keep() > 0 {
             // Своё подключение к той же базе: буфер живёт дольше сессии.
             let store = self.store.reopen().map_err(|e| SessionError::Store {
                 path: self.paths.database().display().to_string(),
@@ -561,6 +605,7 @@ impl Session {
             // открыт, истории правок ещё не было.
             lines: LineMap::build(&buffer.read()),
             buffer,
+            changed_outside,
             interval: self.interval,
             last_snapshot: Duration::ZERO,
             clock: Box::new(SystemClock),

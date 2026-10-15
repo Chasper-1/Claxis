@@ -341,7 +341,12 @@ fn load_last_good(store_dir: &Path) -> Option<crate::api::config::Config> {
             .ok()?;
     let mut docs = Vec::new();
     for &file in ConfigFile::ALL {
-        let body = store.last_good(file.file_name()).ok()??;
+        // Файла в кеше может не быть: он добавился позже, или кеш чистили.
+        // Отсутствие одного файла не повод отказывать целиком — редактор с
+        // частью настроек лучше, чем редактор, который не запустился.
+        let Ok(Some(body)) = store.last_good(file.file_name()) else {
+            continue;
+        };
         // Разбор идёт по тем же правилам: запасной тоже может быть старым.
         if let Ok(doc) = body.parse::<toml_edit::DocumentMut>() {
             docs.push((file, doc));

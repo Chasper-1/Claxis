@@ -20,7 +20,11 @@ use crate::api::theme::DEFAULT_THEME;
 /// Путь настройки, значение которой — встроенная таблица подписей истории.
 const HISTORY_USAGE_TABLE: &str = "Savescreen.Setting.history_usage";
 
-/// Значение ключа из встроенной таблицы, иначе значение по умолчанию.
+/// Значение ключа из встроенной таблицы подписей истории.
+///
+/// Таблица приходит в конфиг тем же путём, что и обычный ключ. Если её нет в
+/// конфиге, работает `apply_defaults_table`, который берёт то же значение из
+/// схемы: два места читают одну таблицу, и двойной поиск здесь не нужен.
 fn table_string(config: &Config, key: &str, path: &str) -> String {
     let Some(def) = schema::find_table(ConfigFile::Global, path) else {
         return String::new();
@@ -32,12 +36,6 @@ fn table_string(config: &Config, key: &str, path: &str) -> String {
         // Таблица отдаёт значение как оно в TOML, вместе с кавычками: подпись
         // нужна сама по себе, без них.
         .map(|(_, v)| v.trim_matches('"').to_string())
-        .or_else(|| {
-            def.default
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| v.to_string())
-        })
         .unwrap_or_default()
 }
 

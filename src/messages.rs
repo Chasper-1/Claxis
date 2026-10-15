@@ -78,3 +78,34 @@ impl Messages for En {
         )
     }
 }
+
+/// Все сообщения сессии с примерами значений.
+///
+/// Без этого переводчик не видит, что вообще бывает: каталог строится по
+/// примеру, а ключ, которого в примере нет, никогда не переведётся.
+pub fn samples() -> Vec<(&'static str, String)> {
+    let m = En;
+    vec![
+        (
+            "store_failed",
+            m.store_failed("/home/user/.cache/claxis", "no access"),
+        ),
+        (
+            "read_file_failed",
+            m.read_file_failed("/home/user/notes.txt", "no such file"),
+        ),
+        (
+            "buffer_error",
+            m.buffer_error(&crate::api::rope::Error::TruncatedHistory),
+        ),
+        (
+            "config_dir_failed",
+            m.config_dir_failed("/home/user/.config/claxis", "no access"),
+        ),
+        ("no_usable_config", m.no_usable_config(2)),
+        (
+            "file_too_large",
+            m.file_too_large(5_000_000_000, 5.0, u32::MAX as u64, 4.2),
+        ),
+    ]
+}

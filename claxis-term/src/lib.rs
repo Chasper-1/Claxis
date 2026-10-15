@@ -33,15 +33,20 @@ pub struct Terminal {
 impl Terminal {
     /// Открыть терминал: проверить протокол, включить его, войти в raw mode.
     ///
-    /// Если терминал не поддерживает kitty keyboard protocol — ошибка
-    /// `TermError::NoKittyProtocol`. Деградации нет: без протокола редактор
-    /// работать не может.
+    /// Если терминал не поддерживает kitty keyboard protocol с отчётом о типах
+    /// событий — ошибка `TermError::NoKittyProtocol`. Деградации нет: без
+    /// отпусканий редактор работать не может.
+    ///
+    /// Порядок обязателен: сначала raw mode, потом проверка протокола. В
+    /// обычном режиме ввод построчно буферизован, ответ терминала без перевода
+    /// строки не прочитался бы до конца ожидания — и поддержка протокола
+    /// выглядела бы отсутствующей там, где она есть.
     pub fn new() -> io::Result<Self> {
+        let raw = raw::RawMode::enter()?;
         if !protocol::supports() {
             return Err(io::Error::other(TermError::NoKittyProtocol));
         }
         protocol::enable()?;
-        let raw = raw::RawMode::enter()?;
         Ok(Self { raw: Some(raw) })
     }
 
