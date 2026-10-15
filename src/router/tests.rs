@@ -4,8 +4,10 @@
 //! снапшотов на диске и переживают перезапуск редактора.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::api::term::{Event, Key, KeyCode, Modifiers};
+use crate::router::cycle::{Action, Cycle};
 use crate::router::session::{FixedClock, Session, SessionError};
 
 /// Отдельный каталог под каждый тест: базы не делятся.
@@ -1331,10 +1333,13 @@ fn the_statistics_count_only_the_time_a_key_was_held() {
     let session = tmp.session(3);
     let mut doc = session.open_file(&file).unwrap();
 
-    doc.note_press(Duration::from_millis(70));
+    doc.note_press();
     // Между нажатиями прошло двадцать секунд: они сюда не попадают.
-    doc.note_press(Duration::from_millis(130));
-    doc.note_press(Duration::ZERO);
+    doc.note_press();
+    doc.note_held(Duration::from_millis(70));
+    doc.note_held(Duration::from_millis(130));
+    // Третье нажатие так и не отпустили: время оно не добавит.
+    doc.note_press();
 
     assert_eq!(doc.stats().presses, 3, "нажатий три");
     assert_eq!(
@@ -1472,7 +1477,8 @@ fn statistics_survive_a_snapshot() {
     let mut doc = session.open_file(&file).unwrap();
 
     doc.insert(0, "до".as_bytes()).unwrap();
-    doc.note_press(Duration::from_millis(50));
+    doc.note_press();
+    doc.note_held(Duration::from_millis(50));
     doc.snapshot();
     assert_eq!(doc.stats().input_chars, 2, "счётчик не сбросился");
     assert_eq!(doc.stats().presses, 1);
@@ -1653,4 +1659,91 @@ fn a_line_map_survives_undo_and_replace() {
     assert_eq!(doc.lines().breaks(), [1]);
     doc.undo().unwrap();
     assert_eq!(doc.lines().breaks(), []);
+}
+
+#[test]
+fn the_cycle_counts_presses_and_their_time() {
+    // Нажатие и отпускание приходят разными событиями: циклу нужно помнить,
+    // что было нажато, иначе время нажатия посчитать нечем.
+    let tmp = Temp::new("cycle");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+    let mut cycle = Cycle::new();
+
+    let start = Instant::now();
+    let a = Key {
+        code: KeyCode::Char('a'),
+        modifiers: Modifiers::NONE,
+    };
+    assert_eq!(
+        cycle.handle(Event::KeyPressed { key: a, at: start }, &mut doc),
+        Action::Continue
+    );
+    // Между нажатием и отпусканием прошло время размышления — в сумму оно не
+    // попадает, попадает только отрезок от нажатия до отпускания.
+    assert_eq!(
+        cycle.handle(
+            Event::KeyReleased {
+                key: a,
+                at: start + Duration::from_millis(30)
+            },
+            &mut doc
+        ),
+        Action::Continue
+    );
+
+    assert_eq!(doc.stats().presses, 1, "нажатие одно");
+    assert!(doc.stats().pressed >= Duration::from_millis(30));
+    assert!(doc.stats().pressed < Duration::from_millis(500));
+}
+
+#[test]
+fn a_release_without_a_press_adds_no_time() {
+    // Потерянное событие: отпускание без нажатия. Время неизвестно, и
+    // выдумывать ноль секунд вместо неизвестного неправильно.
+    let tmp = Temp::new("cycle-lost");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+    let mut cycle = Cycle::new();
+
+    cycle.handle(
+        Event::KeyReleased {
+            key: Key {
+                code: KeyCode::Char('z'),
+                modifiers: Modifiers::NONE,
+            },
+            at: Instant::now(),
+        },
+        &mut doc,
+    );
+
+    assert_eq!(doc.stats().presses, 0);
+    assert_eq!(doc.stats().pressed, Duration::ZERO);
+}
+
+#[test]
+fn ctrl_q_leaves_the_editor() {
+    let tmp = Temp::new("cycle-quit");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+    let mut cycle = Cycle::new();
+
+    assert_eq!(
+        cycle.handle(
+            Event::KeyPressed {
+                key: Key {
+                    code: KeyCode::Char('q'),
+                    modifiers: Modifiers::CTRL,
+                },
+                at: Instant::now(),
+            },
+            &mut doc
+        ),
+        Action::Quit
+    );
+    // Выход не должен попасть в статистику как нажатие.
+    assert_eq!(doc.stats().presses, 0);
 }

@@ -87,12 +87,17 @@ pub fn note_replace(stats: &mut Stats, data: &[u8], removed: u32) {
     stats.edits += 1;
 }
 
-/// Записать одно нажатие вместе со временем, которое оно заняло.
+/// Записать одно нажатие.
 ///
-/// Нажатие без отпускания — обычное дело: палец на клавише или потерянное
-/// событие. Такое нажатие засчитывается, но времени не добавляет.
-pub fn note_press(stats: &mut Stats, held: Duration) {
+/// Время в счётчик не идёт: нажатие учлось, а сколько оно длилось — известно
+/// только в момент отпускания. Нажатие без отпускания (палец на клавише или
+/// потерянное событие) остаётся учтённым и без времени.
+pub fn note_press(stats: &mut Stats) {
     stats.presses += 1;
+}
+
+/// Дописать время, которое нажатие пролежало.
+pub fn note_held(stats: &mut Stats, held: Duration) {
     stats.pressed += held;
 }
 
@@ -116,9 +121,11 @@ mod tests {
     fn only_the_held_time_counts_not_the_gap() {
         // Пауза между нажатиями — это размышление, а не печать.
         let mut s = Stats::default();
-        note_press(&mut s, Duration::from_millis(80));
+        note_press(&mut s);
+        note_held(&mut s, Duration::from_millis(80));
         // Между нажатиями прошло двадцать секунд: они сюда не попадают.
-        note_press(&mut s, Duration::from_millis(120));
+        note_press(&mut s);
+        note_held(&mut s, Duration::from_millis(120));
         assert_eq!(s.presses, 2);
         assert_eq!(s.pressed, Duration::from_millis(200));
     }
@@ -126,7 +133,7 @@ mod tests {
     #[test]
     fn a_press_that_never_released_adds_no_time() {
         let mut s = Stats::default();
-        note_press(&mut s, Duration::ZERO);
+        note_press(&mut s);
         assert_eq!(s.presses, 1, "нажатие засчитано");
         assert_eq!(s.pressed, Duration::ZERO, "времени не добавило");
     }

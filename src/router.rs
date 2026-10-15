@@ -32,15 +32,18 @@
 //! | [`session`] | буфер и хранилище: открыть документ, снять снапшот на диск |
 //! | [`lines`] | карта строк: номер строки для позиции и обратно |
 //! | [`stats`] | что человек делал: символы, нажатия, занятая история |
+//! | [`cycle`] | цикл: события терминала идут в документ |
 //! | [`settings`] | конфиг и перевод: язык, значения настроек, комментарии |
 //! | [`editor`] | всё вместе: то, с чего начинается запуск |
 
+mod cycle;
 mod editor;
 mod lines;
 pub mod session;
 mod settings;
 pub mod stats;
 
+pub use cycle::{Action, Cycle};
 pub use editor::{Editor, Reloaded, StartError};
 pub use lines::LineMap;
 pub use session::{Applied, Document, Session, SessionError};

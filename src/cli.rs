@@ -15,10 +15,13 @@ use crate::api::term;
 use crate::main_messages;
 
 /// Что просил пользователь в командной строке.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Запустить редактор.
-    Run,
+    /// Запустить редактор, открыв файл, если он указан.
+    Run {
+        /// Путь к файлу: `None` — редактор без файла.
+        path: Option<std::path::PathBuf>,
+    },
     /// Показать все сообщения всех крейтов.
     Messages,
     /// Показать справку.
@@ -27,13 +30,16 @@ pub enum Command {
 
 /// Разобрать аргументы командной строки.
 ///
-/// Аргументы, которых мы не знаем, — не ошибка: они могут принадлежать
-/// редактору, путь к файлу выглядит как аргумент.
+/// Аргумент, которого мы не знаем, — не ошибка: это путь к файлу. Команды
+/// узнаются по первому слову, всё, что не команда, считается файлом.
 pub fn parse(args: &[String]) -> Command {
     match args.first().map(String::as_str) {
         Some("messages") => Command::Messages,
         Some("help") | Some("--help") | Some("-h") => Command::Help,
-        _ => Command::Run,
+        None => Command::Run { path: None },
+        Some(path) => Command::Run {
+            path: Some(std::path::PathBuf::from(path)),
+        },
     }
 }
 
@@ -96,15 +102,21 @@ mod tests {
         match command {
             Command::Messages => print_messages(&mut buf).unwrap(),
             Command::Help => print_help(&mut buf, &En).unwrap(),
-            Command::Run => {}
+            Command::Run { .. } => {}
         }
         String::from_utf8(buf).unwrap()
     }
 
     #[test]
     fn arguments_are_parsed() {
-        assert_eq!(parse(&[]), Command::Run);
-        assert_eq!(parse(&["file.rs".to_string()]), Command::Run);
+        assert_eq!(parse(&[]), Command::Run { path: None });
+        // Неизвестное слово — это файл, а не ошибка.
+        assert_eq!(
+            parse(&["file.rs".to_string()]),
+            Command::Run {
+                path: Some(std::path::PathBuf::from("file.rs"))
+            }
+        );
         assert_eq!(parse(&["messages".to_string()]), Command::Messages);
         assert_eq!(parse(&["--help".to_string()]), Command::Help);
     }
