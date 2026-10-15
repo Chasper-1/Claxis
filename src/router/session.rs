@@ -10,9 +10,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::api::rope::defaults::buffer::HISTORY_DEPTH;
-use crate::api::rope::{Document as Rope, Error as RopeError, History, SnapshotSink};
+use crate::api::rope::{
+    Document as Rope, Error as RopeError, History, Record as RopeRecord, SnapshotSink,
+};
 use crate::api::store::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::messages::Messages;
+use crate::router::lines::LineMap;
 use crate::router::stats::{self, Stats};
 
 /// Что пошло не так в сессии.
@@ -134,6 +137,11 @@ pub struct Document {
     clock: Box<dyn Clock>,
     /// Что набрано за сеанс работы над этим документом.
     stats: Stats,
+    /// Где в документе переводы строк.
+    ///
+    /// Карта живёт здесь, а не в буфере: документ знает про байты и ничего не
+    /// знает про строки. Сюда приходят только дельты правок.
+    lines: LineMap,
 }
 
 impl Document {
@@ -142,14 +150,42 @@ impl Document {
         &self.path
     }
 
-    /// Документ: правки, чтение и история.
-    pub fn buffer(&mut self) -> &mut Rope {
-        &mut self.buffer
+    /// Документ для чтения: текст, история, длина.
+    ///
+    /// Правок тут нет намеренно: иначе можно изменить документ мимо карты
+    /// строк и статистики, и они тихо разъедутся.
+    pub fn buffer(&self) -> &Rope {
+        &self.buffer
     }
 
     /// Текст документа.
     pub fn text(&self) -> Vec<u8> {
         self.buffer.read()
+    }
+
+    /// Карта строк документа.
+    pub fn lines(&self) -> &LineMap {
+        &self.lines
+    }
+
+    /// Номер строки для позиции, начиная с нуля.
+    pub fn line_of(&self, pos: u32) -> u32 {
+        self.lines.line_of(pos)
+    }
+
+    /// Сколько строк в документе.
+    pub fn line_count(&self) -> u32 {
+        self.lines.line_count()
+    }
+
+    /// Позиция, с которой начинается строка.
+    pub fn offset_of_line(&self, line: u32) -> u32 {
+        self.lines.offset_of_line(line, self.buffer.len())
+    }
+
+    /// Позиция конца строки: сам перевод строки.
+    pub fn end_of_line(&self, line: u32) -> u32 {
+        self.lines.end_of_line(line, self.buffer.len())
     }
 
     /// Что собрано за сеанс: символы, нажатия, правки.
@@ -160,6 +196,7 @@ impl Document {
     /// Вставить текст и посчитать введённые символы.
     pub fn insert(&mut self, anchor: u32, data: &[u8]) -> Result<(), RopeError> {
         self.buffer.insert(anchor, data)?;
+        self.lines.insert(anchor, data);
         stats::note_input(&mut self.stats, data);
         Ok(())
     }
@@ -167,6 +204,7 @@ impl Document {
     /// Вырезать диапазон и посчитать удалённые символы.
     pub fn delete(&mut self, anchor: u32, len: u32) -> Result<(), RopeError> {
         self.buffer.delete(anchor, len)?;
+        self.lines.delete(anchor, anchor + len);
         stats::note_deleted(&mut self.stats, len);
         Ok(())
     }
@@ -174,8 +212,81 @@ impl Document {
     /// Заменить диапазон: вставка и удаление одной операцией.
     pub fn replace(&mut self, anchor: u32, len: u32, data: &[u8]) -> Result<(), RopeError> {
         self.buffer.replace(anchor, len, data)?;
+        // Вырезанное ушло из карты, вставленное пришло.
+        self.lines.delete(anchor, anchor + len);
+        self.lines.insert(anchor, data);
         stats::note_replace(&mut self.stats, data, len);
         Ok(())
+    }
+
+    /// Отменить правку. Карта строк едет вместе с текстом.
+    pub fn undo(&mut self) -> Result<Option<u32>, RopeError> {
+        let path = self.buffer.path();
+        let Some(id) = self.buffer.undo()? else {
+            return Ok(None);
+        };
+        // Запись узнаём по её месту в ветке: отмена убрала последнюю.
+        if let Some(record) = path.get(path.len().wrapping_sub(1)) {
+            self.undo_line(record);
+        }
+        Ok(Some(id))
+    }
+
+    /// Откатить карту строк под обратную операцию.
+    fn undo_line(&mut self, record: &RopeRecord) {
+        match record {
+            // Отмена вставки: вырезать вставленное.
+            RopeRecord::Insert { anchor, head, .. } => self.lines.delete(*anchor, *head),
+            // Отмена удаления: вернуть вырезанное.
+            RopeRecord::Delete { anchor, .. } => self.restore_lines(*anchor, record),
+            // Отмена замены: вырезать вставленное и вернуть вырезанное.
+            RopeRecord::Replace { anchor, head, .. } => {
+                self.lines.delete(*anchor, *head);
+                self.restore_lines(*anchor, record);
+            }
+        }
+    }
+
+    /// Вернуть в карту кусок, который лежит в буфере документа.
+    fn restore_lines(&mut self, anchor: u32, record: &RopeRecord) {
+        let Some(piece) = self.buffer.removed_text(record) else {
+            return;
+        };
+        let piece = piece.to_vec();
+        self.lines.insert(anchor, &piece);
+    }
+
+    /// Повторить отменённую правку. Карта строк едет вместе с текстом.
+    pub fn redo(&mut self) -> Result<Option<u32>, RopeError> {
+        let before = self.buffer.path().len();
+        let Some(id) = self.buffer.redo()? else {
+            return Ok(None);
+        };
+        // Повтор добавил одну запись в конец ветки.
+        if let Some(record) = self.buffer.path().get(before) {
+            self.redo_line(record);
+        }
+        Ok(Some(id))
+    }
+
+    /// Провести карту строк по прямой правке.
+    fn redo_line(&mut self, record: &RopeRecord) {
+        match record {
+            RopeRecord::Insert { anchor, .. } => {
+                if let Some(piece) = self.buffer.inserted_text(record) {
+                    let piece = piece.to_vec();
+                    self.lines.insert(*anchor, &piece);
+                }
+            }
+            RopeRecord::Delete { anchor, head, .. } => self.lines.delete(*anchor, *head),
+            RopeRecord::Replace { anchor, head, .. } => {
+                self.lines.delete(*anchor, *head);
+                if let Some(piece) = self.buffer.inserted_text(record) {
+                    let piece = piece.to_vec();
+                    self.lines.insert(*anchor, &piece);
+                }
+            }
+        }
     }
 
     /// Записать одно нажатие вместе со временем, которое оно заняло.
@@ -212,6 +323,7 @@ impl Document {
 
     /// Снять снапшот и отсчитать время заново.
     pub fn snapshot(&mut self) {
+        // Текст от этого не меняется, поэтому карта строк остаётся в силе.
         self.buffer.snapshot();
         self.last_snapshot = self.clock.elapsed();
     }
@@ -440,6 +552,9 @@ impl Session {
         }
         Ok(Document {
             path,
+            // Карта строится по тексту, а не едет дельтами: документ только что
+            // открыт, истории правок ещё не было.
+            lines: LineMap::build(&buffer.read()),
             buffer,
             interval: self.interval,
             last_snapshot: Duration::ZERO,

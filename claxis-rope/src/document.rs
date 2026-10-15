@@ -254,12 +254,6 @@ pub struct Document {
     current: u32,
     /// Глубина истории.
     depth: u32,
-    /// Смещения текста, вставленного отменой удаления.
-    ///
-    /// Такой текст не принадлежит ни одной записи: запись удаления лежит в
-    /// отброшенной ветке, и её обрезка унесла бы текст, на который уже
-    /// ссылается живой лист. Хвост буфера не режется ниже этих точек.
-    kept: Vec<u32>,
     sink: Box<dyn SnapshotSink>,
     file: Option<PathBuf>,
     snapshots: u64,
@@ -314,7 +308,6 @@ impl Document {
             free: Vec::new(),
             current: 0,
             depth,
-            kept: Vec::new(),
             sink: Box::new(NullSink),
             file: None,
             snapshots: 0,
@@ -464,7 +457,6 @@ impl Document {
                 let start = self.text.len() as u32;
                 let piece = self.text[text as usize..text as usize + len as usize].to_vec();
                 self.text.extend_from_slice(&piece);
-                self.kept.push(start + len);
                 let leaf = self.tree.alloc(Node::leaf(start, len));
                 self.tree.insert_leaf(anchor, leaf);
             }
@@ -484,7 +476,6 @@ impl Document {
                 let piece =
                     self.text[removed as usize..removed as usize + removed_len as usize].to_vec();
                 self.text.extend_from_slice(&piece);
-                self.kept.push(start + removed_len);
                 let leaf = self.tree.alloc(Node::leaf(start, removed_len));
                 self.tree.insert_leaf(anchor, leaf);
             }
@@ -584,20 +575,45 @@ impl Document {
             cursor = version.child;
         }
         self.versions[self.current as usize].child = NIL;
-        // Хвост не режется ниже текста, вставленного отменой удаления: на
-        // него уже ссылаются живые листья.
-        let keep = self.kept.iter().copied().max();
-        self.kept.clear();
-        if let Some(cut) = match (tail, keep) {
-            (Some(tail), Some(keep)) => Some(tail.max(keep)),
-            (tail, None) => tail,
-            (None, _) => None,
-        } {
-            let cut = cut as usize;
-            if cut < self.text.len() {
-                self.text.truncate(cut);
+        // Резать можно только то, на что больше никто не ссылается. На хвост
+        // буфера ссылаются не только отброшенные записи: живые листья дерева и
+        // записи истории на активной ветке. Если хоть один из них смотрит
+        // дальше, резать нельзя — иначе лист останется читать обрезанный
+        // участок и потеряет байты.
+        // Резать можно только то, на что больше никто не смотрит. На хвост
+        // буфера ссылаются не только отброшенные записи: живые листья дерева и
+        // записи истории на активной ветке. Обрезка оставляет начало буфера,
+        // поэтому резать можно только за самым концом живых ссылок — иначе
+        // лист останется читать обрезанный участок и потеряет байты.
+        if tail.is_some() {
+            let end = self.live_end() as usize;
+            if end < self.text.len() {
+                self.text.truncate(end);
             }
         }
+    }
+
+    /// Самое позднее место в буфере, до которого дотягиваются живые ссылки.
+    ///
+    /// Это листья дерева и записи истории, которые ещё можно отменить или
+    /// повторить. Всё, что дальше, никому не нужно и только занимает память.
+    fn live_end(&self) -> u32 {
+        let mut end = 0;
+        for leaf in self.tree.leaves_in_order() {
+            end = end.max(leaf.start + leaf.len);
+        }
+        for (id, version) in self.versions.iter().enumerate() {
+            // Отброшенная запись ни на что не смотрит, её текст можно резать.
+            if self.free.contains(&(id as u32)) {
+                continue;
+            }
+            let record = &version.record;
+            end = end.max(record.text() + record.len());
+            if let Some((at, len)) = record.removed() {
+                end = end.max(at + len);
+            }
+        }
+        end
     }
 
     /// Сколько записей истории занято.
@@ -658,6 +674,39 @@ impl Document {
         &self.text[..self.file_len as usize]
     }
 
+    /// Текст, который эта запись вставила.
+    ///
+    /// Кто повторяет правку — тот и спрашивает здесь кусок: держать текст ещё
+    /// и в записи нельзя.
+    pub fn inserted_text(&self, record: &Record) -> Option<&[u8]> {
+        let len = record.len();
+        if len == 0 {
+            return None;
+        }
+        let at = record.text() as usize;
+        self.text.get(at..at + len as usize)
+    }
+
+    /// Текст вырезанного куска по записи.
+    ///
+    /// Для вставки возвращается `None`: у неё своего вырезанного нет.
+    pub fn removed_text(&self, record: &Record) -> Option<&[u8]> {
+        // Вырезанное лежит в append-буфере записи, а не там, где оно стояло в
+        // документе: после отмены на прежнем месте может быть совсем другой текст.
+        // Смещения берём те же, что и у самой отмены, иначе карта строк и текст
+        // разъедутся. У вставки вырезанного нет вовсе.
+        let (at, len) = match record {
+            Record::Replace {
+                removed,
+                removed_len,
+                ..
+            } => (*removed, *removed_len),
+            Record::Delete { head, text, .. } => (*text, *head - record.anchor()),
+            Record::Insert { .. } => return None,
+        };
+        self.text.get(at as usize..at as usize + len as usize)
+    }
+
     /// Записи активной ветки, от корня к текущей вершине.
     pub fn path(&self) -> Vec<Record> {
         let mut out = Vec::new();
@@ -683,7 +732,6 @@ impl Document {
         self.text = text;
         self.file_len = self.text.len() as u32;
         self.tree.collapse_to(0, self.file_len);
-        self.kept.clear();
         self.free.clear();
         self.versions.truncate(1);
         self.versions[0].record = Record::Delete {

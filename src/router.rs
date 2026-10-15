@@ -30,16 +30,19 @@
 //! | Файл | Что связывает |
 //! | --- | --- |
 //! | [`session`] | буфер и хранилище: открыть документ, снять снапшот на диск |
+//! | [`lines`] | карта строк: номер строки для позиции и обратно |
 //! | [`stats`] | что человек делал: символы, нажатия, занятая история |
 //! | [`settings`] | конфиг и перевод: язык, значения настроек, комментарии |
 //! | [`editor`] | всё вместе: то, с чего начинается запуск |
 
 mod editor;
+mod lines;
 pub mod session;
 mod settings;
 pub mod stats;
 
 pub use editor::{Editor, Reloaded, StartError};
+pub use lines::LineMap;
 pub use session::{Applied, Document, Session, SessionError};
 pub use settings::Settings;
 pub use stats::Stats;

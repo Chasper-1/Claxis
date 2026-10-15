@@ -69,7 +69,7 @@ fn type_until_snapshot(session: &Session, file: &std::path::Path, chunk: &str) -
     let mut i = 0usize;
     while doc.buffer().snapshots_taken() == 0 && i < 40 {
         let pos = doc.buffer().len();
-        doc.buffer().insert(pos, chunk.as_bytes()).unwrap();
+        doc.insert(pos, chunk.as_bytes()).unwrap();
         doc.snapshot_if_due();
         i += 1;
     }
@@ -168,7 +168,7 @@ fn keep_limit_applies_through_session() {
     doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
     for _ in 0..40 {
         let end = doc.buffer().len();
-        doc.buffer().insert(end, b"z").unwrap();
+        doc.insert(end, b"z").unwrap();
         doc.snapshot_if_due();
     }
     assert_eq!(
@@ -226,7 +226,7 @@ fn history_depth_reaches_the_buffer() {
     let file = tmp.file("a.rs");
     let session = tmp.short_session(3, 4);
     assert_eq!(session.history_depth(), 4);
-    let mut doc = session.open_file(&file).unwrap();
+    let doc = session.open_file(&file).unwrap();
     assert_eq!(doc.buffer().history_depth(), 4);
 }
 
@@ -327,7 +327,7 @@ fn persist_false_keeps_snapshots_in_memory_only() {
     doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
     for _ in 0..40 {
         let end = doc.buffer().len();
-        doc.buffer().insert(end, b"z").unwrap();
+        doc.insert(end, b"z").unwrap();
     }
     doc.snapshot();
     // Снапшот взят, текст в буфере есть.
@@ -1178,11 +1178,11 @@ fn history_survives_reopening_the_document() {
 
     {
         let mut doc = session.open_file(&file).unwrap();
-        doc.buffer().insert(3, b"XY").unwrap();
-        doc.buffer().delete(0, 1).unwrap();
+        doc.insert(3, b"XY").unwrap();
+        doc.delete(0, 1).unwrap();
         assert_eq!(doc.text(), b"bcXY\n");
         // Снапшот уносит историю на диск.
-        doc.buffer().snapshot();
+        doc.snapshot();
     }
 
     // Новый процесс читает тот же файл.
@@ -1192,8 +1192,7 @@ fn history_survives_reopening_the_document() {
     // Текст на месте.
     assert_eq!(doc.text(), b"bcXY\n");
     // И история на месте: отмена работает после перезапуска.
-    doc.buffer()
-        .undo()
+    doc.undo()
         .unwrap()
         .expect("отмена доступна после перезапуска");
     assert_eq!(doc.text(), b"abcXY\n");
@@ -1220,8 +1219,8 @@ fn a_foreign_history_blob_does_not_break_the_file() {
     let mut doc = session2.open_file(&file).unwrap();
     assert_eq!(doc.text(), b"abc\n", "текст из снапшота на месте");
     // Истории нет — отменять нечего, и это не ошибка.
-    assert!(doc.buffer().undo().unwrap().is_none());
-    doc.buffer().insert(3, b"Z").unwrap();
+    assert!(doc.undo().unwrap().is_none());
+    doc.insert(3, b"Z").unwrap();
     assert_eq!(doc.text(), b"abcZ\n", "документ рабочий");
 }
 
@@ -1236,8 +1235,8 @@ fn a_rope_snapshot_is_written_in_the_rope_format() {
     let session = crate::router::Session::open_at_with(tmp.dir(), 3, true, 64).unwrap();
     {
         let mut doc = session.open_file(&file).unwrap();
-        doc.buffer().insert(3, b"XY").unwrap();
-        doc.buffer().snapshot();
+        doc.insert(3, b"XY").unwrap();
+        doc.snapshot();
     }
 
     let store = session.store().reopen().unwrap();
@@ -1269,7 +1268,7 @@ fn a_snapshot_is_taken_by_the_clock_and_not_by_the_edit_count() {
     doc.set_clock(Box::new(FixedClock::at(Duration::ZERO)));
     for _ in 0..500 {
         let at = doc.buffer().len() - 1;
-        doc.buffer().insert(at, b"y").unwrap();
+        doc.insert(at, b"y").unwrap();
         doc.snapshot_if_due();
     }
     assert_eq!(doc.text().len(), 502, "правки на месте");
@@ -1414,7 +1413,7 @@ fn a_zero_interval_snapshots_on_every_edit() {
     let mut doc = session.open_file(&file).unwrap();
     for i in 0..5 {
         let at = doc.buffer().len();
-        doc.buffer().insert(at, b"x").unwrap();
+        doc.insert(at, b"x").unwrap();
         doc.snapshot_if_due();
         assert_eq!(i + 1, doc.buffer().snapshots_taken() as u32);
     }
@@ -1438,10 +1437,7 @@ fn a_missing_file_opens_as_an_empty_document() {
     let session2 = tmp.session(3);
     let mut back = session2.open_file(&file).unwrap();
     assert_eq!(back.text(), "новый текст".as_bytes());
-    back.buffer()
-        .undo()
-        .unwrap()
-        .expect("история из снапшота живая");
+    back.undo().unwrap().expect("история из снапшота живая");
     assert_eq!(back.text(), Vec::<u8>::new());
 }
 
@@ -1541,4 +1537,120 @@ history_usage = {
         "{used} of {remaining}"
     );
     assert!(settings.savescreen_include);
+}
+
+#[test]
+fn the_line_map_stays_with_the_document() {
+    // Карта строк обязана ехать вместе с текстом на каждой правке, отмене и
+    // повторе. Эталон — обычная строка с историей правок: любое расхождение
+    // означает, что карта разъехалась.
+    let tmp = Temp::new("line-map");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+
+    let mut text = String::new();
+    let mut history: Vec<Op> = Vec::new();
+    let mut seed = 0x2545F4914F6CDD1Du64;
+    let mut next = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n.max(1) as u64) as usize
+    };
+
+    for _ in 0..600 {
+        // Что именно сделали на этом шаге: без этого расхождение бесполезно.
+        let done: String;
+        match next(4) {
+            0 if !text.is_empty() => {
+                let at = next(text.len());
+                let len = 1 + next((text.len() - at).min(20));
+                let removed = text[at..at + len].to_string();
+                doc.delete(at as u32, len as u32).unwrap();
+                text.replace_range(at..at + len, "");
+                history.push(Op::Delete { at, removed });
+                done = format!("удалить {at}..{}", at + len);
+            }
+            1 => {
+                let at = next(text.len() + 1);
+                let piece = if next(2) == 0 { "\n" } else { "ab" };
+                doc.insert(at as u32, piece.as_bytes()).unwrap();
+                text.insert_str(at, piece);
+                history.push(Op::Insert {
+                    at,
+                    len: piece.len(),
+                });
+                done = format!("вставить {piece:?} на {at}");
+            }
+            2 => {
+                let at = next(text.len() + 1);
+                let len = next((text.len() - at).min(10));
+                let removed = text[at..at + len].to_string();
+                let piece = "xy\n";
+                doc.replace(at as u32, len as u32, piece.as_bytes())
+                    .unwrap();
+                text.replace_range(at..at + len, piece);
+                history.push(Op::Replace { at, removed });
+                done = format!("заменить {at}..{} на {piece:?}", at + len);
+            }
+            _ => {
+                let Some(op) = history.pop() else { continue };
+                doc.undo().unwrap().expect("отменять есть что");
+                done = format!("отменить {op:?}");
+                match op {
+                    Op::Insert { at, len } => text.replace_range(at..at + len, ""),
+                    Op::Delete { at, removed, .. } => text.insert_str(at, &removed),
+                    // Отмена замены убирает вставленное и возвращает вырезанное.
+                    Op::Replace { at, removed, .. } => {
+                        text.replace_range(at..at + 3, "");
+                        text.insert_str(at, &removed);
+                    }
+                }
+            }
+        }
+
+        let fresh = crate::router::LineMap::build(text.as_bytes());
+        assert_eq!(
+            doc.lines().breaks(),
+            fresh.breaks(),
+            "карта строк разошлась с текстом: {done}, текст {:?}",
+            text
+        );
+        assert_eq!(doc.line_count(), fresh.line_count());
+        assert_eq!(
+            doc.text(),
+            text.as_bytes(),
+            "текст разошёлся: {done}, было {:?}",
+            text
+        );
+    }
+}
+
+/// Правка в эталоне: сколько байт затронуто и что было там до неё.
+#[derive(Debug)]
+enum Op {
+    Insert { at: usize, len: usize },
+    Delete { at: usize, removed: String },
+    Replace { at: usize, removed: String },
+}
+
+#[test]
+fn a_line_map_survives_undo_and_replace() {
+    // Отмена вставки убирает её переводы строк, отмена удаления и замены
+    // возвращает их на место.
+    let tmp = Temp::new("lines-undo");
+    let file = tmp.file("a.rs");
+    let session = tmp.session(3);
+    let mut doc = session.open_file(&file).unwrap();
+
+    doc.insert(0, b"one\ntwo\n").unwrap();
+    assert_eq!(doc.lines().breaks(), [3, 7]);
+    doc.undo().unwrap();
+    assert_eq!(doc.lines().breaks(), []);
+
+    doc.replace(0, 0, b"a\nb").unwrap();
+    assert_eq!(doc.lines().breaks(), [1]);
+    doc.undo().unwrap();
+    assert_eq!(doc.lines().breaks(), []);
 }

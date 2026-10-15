@@ -767,3 +767,72 @@ fn every_replace_position_and_length_gives_the_right_text() {
         }
     }
 }
+
+#[test]
+fn the_replace_survives_a_random_mix_with_undo() {
+    // Замена с отменами: структура дерева меняется на каждом шаге, и ошибка
+    // проявляется не на ровном куске, а на том, что осталось от прежних правок.
+    let mut doc = d("");
+    let mut text = String::new();
+    let mut log: Vec<String> = Vec::new();
+    let mut history: Vec<(u8, usize, usize, String)> = Vec::new();
+    let mut rng = Rng(0x2545F4914F6CDD1D);
+
+    for _ in 0..600 {
+        match rng.below(4) {
+            0 if !text.is_empty() => {
+                let at = rng.below(text.len());
+                let len = 1 + rng.below((text.len() - at).min(20));
+                let removed = text[at..at + len].to_string();
+                doc.delete(at as u32, len as u32).unwrap();
+                text.replace_range(at..at + len, "");
+                history.push((0, at, len, removed));
+                log.push(format!("delete {at} {len}"));
+            }
+            1 => {
+                let at = rng.below(text.len() + 1);
+                let piece = if rng.below(2) == 0 { "\n" } else { "ab" };
+                doc.insert(at as u32, piece.as_bytes()).unwrap();
+                text.insert_str(at, piece);
+                history.push((1, at, piece.len(), String::new()));
+                log.push(format!("insert {at} {piece:?}"));
+            }
+            2 => {
+                let at = rng.below(text.len() + 1);
+                let len = rng.below((text.len() - at).min(10));
+                let removed = text[at..at + len].to_string();
+                doc.replace(at as u32, len as u32, b"xy\n").unwrap();
+                text.replace_range(at..at + len, "xy\n");
+                history.push((2, at, 3, removed));
+                log.push(format!("replace {at} {len}"));
+            }
+            _ => {
+                let Some((kind, at, len, removed)) = history.pop() else {
+                    continue;
+                };
+                doc.undo().unwrap().expect("отменять есть что");
+                match kind {
+                    // Отмена вставки: убрать вставленное.
+                    1 => text.replace_range(at..at + len, ""),
+                    // Отмена удаления: вернуть вырезанное.
+                    0 => text.insert_str(at, &removed),
+                    // Отмена замены: убрать вставленное и вернуть вырезанное.
+                    _ => {
+                        text.replace_range(at..at + len, "");
+                        text.insert_str(at, &removed);
+                    }
+                }
+                log.push(format!("undo {at} {len}"));
+            }
+        }
+
+        assert_eq!(
+            doc.read(),
+            text.as_bytes(),
+            "разошлось на {}: {:?}\nвся последовательность: {:?}",
+            log.last().unwrap(),
+            text,
+            log
+        );
+    }
+}
