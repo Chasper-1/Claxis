@@ -1244,17 +1244,87 @@ mod tests {
 }
 
 #[cfg(test)]
-mod sn9 {
+mod generated_files {
+    use super::*;
+    use crate::schema::TABLES;
+
+    /// Каталог без переводов: ключи в комментариях остаются английскими.
+    fn plain() -> claxis_i18n::Catalog {
+        claxis_i18n::Catalog::new()
+    }
+
     #[test]
-    fn show_parsed() {
-        let c = claxis_i18n::Catalog::new();
-        let text = crate::generate::render(crate::ConfigFile::Global, &c);
-        println!("T>>>\n{text}");
-        let loaded = crate::load::parse(crate::ConfigFile::Global, &text);
-        println!("P>>> issues={:?}", loaded.issues);
-        println!(
-            "P>>> table={:?}",
-            loaded.config.table(&crate::schema::TABLES[0])
-        );
+    fn a_generated_file_parses_without_a_single_issue() {
+        // Конфиг, который редактор сам себе создал, обязан быть безупречным:
+        // иначе первый запуск ругается на собственную работу пользователя.
+        for &file in ConfigFile::ALL {
+            let text = render(file, &plain());
+            let loaded = crate::load::parse(file, &text);
+            assert!(
+                loaded.is_ok(),
+                "{}: {:?}",
+                file.file_name(),
+                loaded.issues.iter().map(|i| i.text()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn every_table_of_the_schema_fills_from_the_generated_text() {
+        // Таблица читается по схеме, а не по тому, что написано в файле: иначе
+        // опечатка в имени таблицы тихо отключила бы настройки.
+        for &file in ConfigFile::ALL {
+            let text = render(file, &plain());
+            let loaded = crate::load::parse(file, &text);
+            for table in TABLES.iter().filter(|t| t.file == file) {
+                let values = loaded.config.table(table);
+                assert!(
+                    !values.is_empty(),
+                    "{}: таблица {} не собралась из файла",
+                    file.file_name(),
+                    table.path
+                );
+                for (key, value) in &values {
+                    assert!(
+                        !value.is_empty(),
+                        "{}: в таблице {} ключ {} без значения",
+                        file.file_name(),
+                        table.path,
+                        key
+                    );
+                    // Ключи таблицы перечислены в самой таблице: ключ вне её
+                    // списка приехал бы в файл и в настройки, которых нет.
+                    assert!(
+                        table.default.iter().any(|(name, _)| name == key),
+                        "{}: ключ {} не описан в таблице {}",
+                        file.file_name(),
+                        table.path_of(key),
+                        table.path
+                    );
+                    // В файле строка записана кавычками, в схеме
+                    // хранится без них: сверяем содержимое.
+                    let def = table.default.iter().find(|(name, _)| name == key);
+                    let expected = def.map(|(_, v)| *v);
+                    assert_eq!(
+                        Some(value.trim_matches('"')),
+                        expected,
+                        "{}: значение по умолчанию {} не совпало с файлом",
+                        file.file_name(),
+                        table.path_of(key)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn required_dirs_are_the_theme_and_lang_folders() {
+        let dirs = required_dirs(std::path::Path::new("/cfg"));
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs.contains(&path::theme_dir(std::path::Path::new("/cfg"))));
+        assert!(dirs.contains(&path::lang_dir(std::path::Path::new("/cfg"))));
+        for dir in dirs {
+            assert!(dir.starts_with("/cfg"), "{dir:?} вне каталога конфига");
+        }
     }
 }

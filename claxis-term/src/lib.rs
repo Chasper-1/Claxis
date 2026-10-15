@@ -16,7 +16,7 @@ pub mod reader;
 pub mod size;
 
 pub use error::TermError;
-pub use event::{Event, Key, KeyCode, Modifiers};
+pub use event::{Event, Key, KeyCode, Modifiers, MouseButton};
 pub use messages::{En, Messages};
 pub use size::Size;
 

@@ -5,9 +5,6 @@
 //! даёт один новый, а не три. Функционал тот же, что у `claxis-buffer`:
 //! вставка, удаление, замена, отмена, повтор, чтение, снапшот.
 
-#[cfg(test)]
-mod tests;
-
 pub mod defaults;
 pub mod document;
 pub mod history;

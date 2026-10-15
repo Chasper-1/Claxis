@@ -17,6 +17,3 @@ pub mod snapshots;
 pub use error::{Error, Result};
 pub use path::StorePaths;
 pub use snapshots::SnapshotStore;
-
-#[cfg(test)]
-mod tests;

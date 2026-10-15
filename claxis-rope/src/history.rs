@@ -261,3 +261,170 @@ impl Header {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Error;
+    use crate::document::Document;
+
+    fn d(text: &str) -> Document {
+        Document::new(text.as_bytes())
+    }
+
+    #[test]
+    fn a_foreign_blob_is_not_read_as_our_history() {
+        // Прежний буфер писал в ту же колонку свой формат. Такой блоб обязан быть
+        // распознан как чужой, а не разобран как родной.
+        let mut old = Vec::new();
+        old.extend_from_slice(b"BUFH");
+        old.extend_from_slice(&[0u8; 32]);
+        assert_eq!(History::decode(&old).unwrap_err(), Error::NotOurHistory);
+        assert!(History::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn a_history_from_another_version_is_refused() {
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        let history = History::capture(&doc);
+        let mut bytes = history.as_bytes().to_vec();
+        bytes[4] = 99;
+        assert_eq!(
+            History::decode(&bytes).unwrap_err(),
+            Error::UnknownHistoryVersion { version: 99 }
+        );
+    }
+
+    #[test]
+    fn a_truncated_history_is_refused_not_panicked() {
+        // Снапшот может прийти битым: обрыв, обрезка, чужой мусор. Всё это —
+        // ошибка с текстом, а не паника.
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        doc.delete(0, 1).unwrap();
+        let history = History::capture(&doc);
+        let bytes = history.as_bytes().to_vec();
+        for cut in 1..bytes.len() {
+            let err = History::decode(&bytes[..cut]);
+            assert!(err.is_err(), "обрыв на {cut} байте разобрался как целый");
+        }
+    }
+
+    #[test]
+    fn an_unknown_record_kind_is_refused() {
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        let mut bytes = History::capture(&doc).as_bytes().to_vec();
+        let last = bytes.len() - RECORD_SIZE;
+        bytes[last] = 7;
+        assert_eq!(
+            History::decode(&bytes).unwrap_err(),
+            Error::UnknownRecordKind { kind: 7 }
+        );
+    }
+
+    #[test]
+    fn a_record_with_a_backwards_range_is_refused() {
+        // Из-за `head - anchor` переполнилось бы вычитание, а это паника.
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        let mut bytes = History::capture(&doc).as_bytes().to_vec();
+        let last = bytes.len() - RECORD_SIZE;
+        // anchor и head стоят подряд, начиная с первого поля записи.
+        bytes[last + 1..last + 5].copy_from_slice(&9u32.to_le_bytes());
+        bytes[last + 5..last + 9].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            History::decode(&bytes).unwrap_err(),
+            Error::InvalidRecordRange { anchor: 9, head: 2 }
+        );
+    }
+
+    #[test]
+    fn a_record_pointing_outside_the_buffer_is_refused() {
+        // Куски за границами буфера не существует. Раньше отмена удаления резала
+        // буфер по такому смещению и роняла редактор вместе с текстом.
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        doc.delete(0, 1).unwrap();
+        let mut bytes = History::capture(&doc).as_bytes().to_vec();
+        let last = bytes.len() - RECORD_SIZE;
+        bytes[last + 9..last + 13].copy_from_slice(&9_000u32.to_le_bytes());
+        assert_eq!(
+            History::decode(&bytes).unwrap_err(),
+            Error::HistoryOutOfBounds {
+                offset: 9_000,
+                len: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_captured_history_survives_a_round_trip() {
+        // Обратная сторона проверок: хорошая история разбирается и
+        // восстанавливается.
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        doc.replace(0, 2, b"Z").unwrap();
+        doc.delete(1, 1).unwrap();
+        let history = History::capture(&doc);
+        let mut restored = History::decode(history.as_bytes())
+            .unwrap()
+            .restore()
+            .unwrap();
+        assert_eq!(restored.read(), doc.read());
+        restored.undo().unwrap().expect("отменять есть что");
+        assert_eq!(restored.read(), b"ZcXY");
+    }
+
+    #[test]
+    fn the_history_survives_the_database_round_trip() {
+        // Ровно то, что делает редактор: снапшот уходит в базу байтами и
+        // приходит байтами же.
+        let mut doc = d("начало");
+        for i in 0..50u32 {
+            if i % 3 == 0 {
+                doc.insert(i % (doc.len() + 1), b"pq").unwrap();
+            } else if !doc.is_empty() {
+                let at = i % doc.len();
+                doc.delete(at, 1).unwrap();
+            }
+        }
+        let text = doc.read();
+        let stored = History::capture(&doc).as_bytes().to_vec();
+
+        let back = History::decode(&stored)
+            .expect("блоб из базы разбирается")
+            .restore()
+            .expect("документ собирается");
+        assert_eq!(back.read(), text);
+        assert_eq!(back.path().len(), doc.path().len());
+    }
+
+    #[test]
+    fn an_untouched_document_carries_no_records() {
+        // Пустая история — обычное состояние, а не поломка.
+        let doc = d("текст без правок");
+        let history = History::capture(&doc);
+        // Магия, версия, длина файла, длина буфера, буфер, счётчик записей.
+        // Записей нет, поэтому счётчик идёт последним и равен нулю.
+        let bytes = history.as_bytes();
+        // Счётчик записей стоит сразу после буфера.
+        let at = 13 + doc.buffer().len();
+        assert_eq!(
+            &bytes[at..at + 4],
+            &0u32.to_le_bytes(),
+            "в пустой истории не должно быть ни одной записи, а в блобе: {bytes:?}"
+        );
+        assert!(doc.path().is_empty());
+        assert_eq!(
+            bytes.len(),
+            at + 4,
+            "кроме заголовка, буфера и нулевого счётчика ничего нет"
+        );
+        let mut back = history.restore().expect("пустая история разбирается");
+        assert_eq!(back.read(), doc.read());
+        assert!(back.path().is_empty());
+        assert!(back.undo().unwrap().is_none(), "отменять нечего");
+    }
+}

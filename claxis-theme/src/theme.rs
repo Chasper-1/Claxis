@@ -65,7 +65,14 @@ pub fn list(dir: impl AsRef<Path>) -> Result<Vec<Theme>> {
     };
 
     let mut themes = vec![builtin()];
-    for entry in entries.flatten() {
+    for entry in entries {
+        // Ошибка чтения отдельной записи — это ошибка чтения папки: молчать
+        // здесь нельзя, иначе тема просто исчезнет из списка, и человек будет
+        // искать её в файле, который есть.
+        let entry = entry.map_err(|e| Error::ReadDir {
+            dir: dir.display().to_string(),
+            reason: e.to_string(),
+        })?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -313,5 +320,130 @@ mod tests {
     fn a_leading_dot_is_not_a_theme() {
         // `.hidden.toml` — служебный файл, а не тема.
         assert!(!is_valid_name(".hidden"));
+    }
+
+    #[test]
+    fn names_with_separators_or_spaces_are_refused() {
+        // Имя становится путём: слеши, пробелы и обратный слеш недопустимы.
+        for name in [
+            "a/b",
+            "a\\b",
+            "with space",
+            "tab\there",
+            "нулевой\u{0}нуль",
+            "путь/../выход",
+        ] {
+            assert!(!is_valid_name(name), "{name:?} должно быть отбито");
+        }
+    }
+
+    #[test]
+    fn a_name_of_exactly_sixty_four_characters_is_allowed() {
+        // Граница длины: имя в 64 символа ещё годится, длиннее — уже мусор.
+        let name = "a".repeat(64);
+        assert!(is_valid_name(&name));
+        assert!(!is_valid_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn non_ascii_names_are_refused() {
+        // Буквы кириллицы в имени темы не допускаются: файл на диске может
+        // прийти с любого systems, а лишние правила здесь не нужны.
+        assert!(!is_valid_name("тема"));
+        assert!(!is_valid_name("日本"));
+    }
+
+    #[test]
+    fn two_dots_inside_a_name_are_refused() {
+        // `a..b` читается как путь вверх в глазах человека, даже если им
+        // не является: запрещаем целиком.
+        assert!(!is_valid_name("a..b"));
+        assert!(is_valid_name("a.b"));
+    }
+
+    #[test]
+    fn a_file_with_a_foreign_extension_is_not_a_theme() {
+        // Папка тем — папка пользователя: чужой файл просто не в списке.
+        let tmp = Temp::new("extension");
+        tmp.theme("everforest.txt");
+        tmp.theme("readme");
+        assert_eq!(names_in(&list(&tmp.0).unwrap()), vec!["default"]);
+    }
+
+    #[test]
+    fn an_empty_file_is_still_a_theme() {
+        // Содержимое темы пока не разбирается: важно только имя файла.
+        let tmp = Temp::new("empty-file");
+        tmp.theme("empty.toml");
+        let found = find(&tmp.0, "empty").unwrap();
+        assert!(found.path.ends_with("empty.toml"));
+    }
+
+    #[test]
+    fn names_are_case_sensitive() {
+        // Редактор в Linux различает регистр: `Dark` и `dark` — разные темы.
+        let tmp = Temp::new("case");
+        tmp.theme("dark.toml");
+        assert!(find(&tmp.0, "dark").is_ok());
+        assert!(matches!(
+            find(&tmp.0, "Dark").unwrap_err(),
+            Error::UnknownTheme { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unknown_theme_lists_what_is_there_in_a_message() {
+        let tmp = Temp::new("unknown-list");
+        tmp.theme("everforest.toml");
+        tmp.theme("gruvbox.toml");
+        let error = find(&tmp.0, "нет-такой").unwrap_err();
+        assert!(matches!(error, Error::InvalidName { .. }));
+        let error = find(&tmp.0, "solarized").unwrap_err();
+        let text = error.text();
+        assert!(text.contains("solarized"), "{text}");
+        assert!(text.contains("everforest"), "{text}");
+        assert!(text.contains("gruvbox"), "{text}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_readable_is_an_error_not_a_silent_gap() {
+        // Тема исчезла бы из списка молча, а человек смотрел бы в свой файл.
+        let tmp = Temp::new("unreadable");
+        tmp.theme("visible.toml");
+        let blocked = tmp.0.join("blocked.toml");
+        std::fs::write(&blocked, b"body").unwrap();
+        let mut permissions = std::fs::metadata(&blocked).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o000);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&blocked, permissions).unwrap();
+
+        let result = list(&tmp.0);
+        // Читается ли файл — зависит от прав: проверяем именно то, что при
+        // отказе мы узнаём об этом, а не теряем тему.
+        if let Ok(themes) = &result {
+            let names = names_in(themes);
+            assert!(
+                names.contains(&"blocked".to_string()),
+                "файл есть, но исчез из списка: {names:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&blocked);
+    }
+
+    #[test]
+    fn a_folder_instead_of_themes_is_an_error_with_its_path() {
+        // Не папка тем: об этом надо сказать, а не вернуть список из одной
+        // темы, будто всё в порядке.
+        let file = std::env::temp_dir().join("claxis-theme-not-a-dir");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let error = list(&file).unwrap_err();
+        let text = error.text();
+        assert!(text.contains("claxis-theme-not-a-dir"), "{text}");
+        std::fs::remove_file(&file).unwrap();
     }
 }

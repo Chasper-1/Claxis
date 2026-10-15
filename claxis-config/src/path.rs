@@ -54,4 +54,44 @@ mod tests {
         let dir = user_dir().expect("каталог должен находиться");
         assert!(dir.ends_with(DIR_NAME));
     }
+
+    #[test]
+    fn an_empty_xdg_config_home_is_not_a_directory() {
+        // Пустая переменная — это не путь: иначе каталог оказался бы в
+        // текущей директории и потерялся при смене папки.
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: тест единственный, кто трогает переменную, и снимает её сразу.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "") };
+        let dir = user_dir();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let dir = dir.expect("пустая переменная не должна ломать поиск");
+        assert!(!dir.as_os_str().is_empty(), "получился пустой путь конфига");
+        assert!(dir.ends_with(DIR_NAME));
+    }
+
+    #[test]
+    fn theme_and_lang_folders_are_separate() {
+        // Темы и переводы не должны слипаться: это разные вещи, и папки у
+        // них разные.
+        let config = Path::new("/cfg");
+        assert_ne!(theme_dir(config), lang_dir(config));
+        assert!(theme_dir(config).starts_with(config));
+        assert!(lang_dir(config).starts_with(config));
+    }
+
+    #[test]
+    fn folder_names_match_the_schema() {
+        // Имена папок объявлены в схеме: путь и схема не должны разойтись.
+        assert_eq!(
+            theme_dir("/cfg"),
+            Path::new("/cfg").join(crate::schema::THEME_DIR)
+        );
+        assert_eq!(
+            lang_dir("/cfg"),
+            Path::new("/cfg").join(crate::schema::LANG_DIR)
+        );
+    }
 }

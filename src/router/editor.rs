@@ -398,3 +398,787 @@ fn load_last_good(store_dir: &Path) -> Option<crate::api::config::Config> {
     }
     Some(crate::api::config::Config::from_documents(docs))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Каталог под тест, удаляемый вместе с собой.
+    struct Temp {
+        dir: std::path::PathBuf,
+        store: std::path::PathBuf,
+    }
+
+    impl Temp {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("claxis-editor-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let store = dir.join("store");
+            std::fs::create_dir_all(&store).unwrap();
+            Self { dir, store }
+        }
+
+        /// Каталог конфига под тест.
+        fn dir(&self) -> &std::path::Path {
+            &self.dir
+        }
+
+        /// Каталог хранилища рядом с конфигом, чтобы тесты не трогали кеш
+        /// пользователя.
+        fn store_dir(&self) -> &std::path::Path {
+            &self.store
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Положить файл перевода в каталог конфига под временным тестом.
+    fn write_translation(config_dir: &std::path::Path, lang: &str, body: &str) {
+        let dir = config_dir.join("lang");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{lang}.toml")), body).unwrap();
+    }
+
+    /// Положить файл темы в каталог конфига под временным тестом.
+    fn write_theme(config_dir: &std::path::Path, file: &str) {
+        let dir = config_dir.join("theme");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(file), "").unwrap();
+    }
+
+    // ── Запуск с конфигом ───────────────────────────────────────────────────────
+
+    #[test]
+    fn first_run_creates_every_config_file() {
+        // При первом запуске создаются все файлы разом, со всеми ключами.
+        let tmp = Temp::new("first-run-cfg");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert!(!editor.created.is_empty(), "файлы должны быть созданы");
+        for file in crate::api::config::ConfigFile::ALL {
+            assert!(
+                tmp.dir().join(file.file_name()).exists(),
+                "{} не создан",
+                file.file_name()
+            );
+        }
+        assert!(editor.issues.is_empty(), "проблемы: {:?}", editor.issues);
+        assert!(!editor.used_last_good);
+    }
+
+    #[test]
+    fn generated_files_carry_every_key_with_a_comment() {
+        let tmp = Temp::new("keys-with-comments");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        for key in crate::api::config::KEYS {
+            let path = tmp.dir().join(key.file.file_name());
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains(key.key()),
+                "{}: нет ключа {}",
+                key.file.file_name(),
+                key.key()
+            );
+            assert!(
+                text.contains(key.comment),
+                "{}: нет комментария к {}",
+                key.file.file_name(),
+                key.key()
+            );
+        }
+    }
+
+    #[test]
+    fn settings_from_the_file_reach_the_session() {
+        let tmp = Temp::new("settings-reach");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        std::fs::write(
+            tmp.dir().join("edit.toml"),
+            "[General]\nhistory_depth = 64\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.dir().join("files.toml"),
+            "[General]\nsnapshots_keep = 7\n",
+        )
+        .unwrap();
+
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.session().history_depth(), 64);
+        assert_eq!(editor.session().keep(), 7);
+    }
+
+    #[test]
+    fn broken_config_falls_back_to_the_saved_one() {
+        // Главное: сломанный конфиг не должен оставлять пользователя с пустым
+        // редактором. Работаем на последнем корректном.
+        let tmp = Temp::new("fallback");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+
+        // Первый запуск: всё в порядке, конфиг сохраняется.
+        {
+            let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+            assert!(editor.issues.is_empty());
+            assert!(!editor.used_last_good);
+        }
+
+        // Второй запуск: пользователь сломал файл.
+        std::fs::write(tmp.dir().join("edit.toml"), "[General]\nhistory_dept = 1\n").unwrap();
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        assert!(editor.used_last_good, "должен был пойти на запасной конфиг");
+        assert_eq!(editor.issues.len(), 1);
+        let issue = editor.first_issue().unwrap();
+        assert_eq!(issue.file, "edit.toml");
+        assert_eq!(issue.line, 2);
+        // Настройки те же, что и до поломки.
+        assert_eq!(editor.session().history_depth(), 8192);
+    }
+
+    #[test]
+    fn broken_config_on_first_run_has_nothing_to_fall_back_to() {
+        // Падать можно только когда работать не с чем.
+        let tmp = Temp::new("no-fallback");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        // Готовим сломанный файл ДО первого запуска: сохранять нечего.
+        std::fs::write(tmp.dir().join("edit.toml"), "[General]\nhistory_dept = 1\n").unwrap();
+
+        match Editor::open_in(tmp.dir(), tmp.store_dir()) {
+            Ok(editor) => {
+                // Запасной мог появиться из других файлов — тогда всё в порядке.
+                assert!(editor.used_last_good || !editor.issues.is_empty());
+            }
+            Err(crate::router::StartError::NoUsableConfig { .. }) => {}
+            Err(other) => panic!("не та ошибка: {other}"),
+        }
+    }
+
+    #[test]
+    fn editing_one_key_keeps_the_rest_of_the_file() {
+        // Точечная запись не переписывает файл: комментарии и порядок целы.
+        let tmp = Temp::new("point-write");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        let key = crate::api::config::schema::find(
+            crate::api::config::ConfigFile::Edit,
+            "General.history_depth",
+        )
+        .unwrap();
+        crate::api::config::generate::write_value(tmp.dir(), key, "256").unwrap();
+
+        let text = std::fs::read_to_string(tmp.dir().join("edit.toml")).unwrap();
+        assert!(text.contains("history_depth = 256"), "{text}");
+        assert!(text.contains(key.comment), "комментарий пропал: {text}");
+        assert!(text.contains("0 to 65535"), "диапазон пропал: {text}");
+    }
+
+    // ── Динамический конфиг: сохранил — применилось ────────────────────────────
+
+    #[test]
+    fn saved_config_applies_without_restart() {
+        // Главное: сохранение файла подхватывается сразу.
+        let tmp = Temp::new("dynamic-apply");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        std::fs::write(
+            tmp.dir().join("files.toml"),
+            "[General]\nsnapshots_keep = 9\n",
+        )
+        .unwrap();
+
+        let reloaded = editor.reload();
+        assert!(
+            reloaded.is_ok(),
+            "конфиг должны были принять: {:?}",
+            reloaded
+        );
+        assert!(reloaded.issues.is_empty());
+        // Применилось сразу, без перезапуска.
+        assert!(
+            reloaded.applied.applied.contains(&"snapshots_keep"),
+            "keep должен примениться сразу: {:?}",
+            reloaded.applied
+        );
+        assert!(reloaded.applied.needs_restart.is_empty());
+        assert_eq!(editor.session().keep(), 9);
+    }
+
+    #[test]
+    fn broken_saved_config_is_refused_and_reported() {
+        // Сломанный конфиг не применяется: старые настройки остаются, а где
+        // ошибка — видно, чтобы подсветить.
+        let tmp = Temp::new("dynamic-broken");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        let before = editor.session().keep();
+
+        std::fs::write(
+            tmp.dir().join("files.toml"),
+            "[General]\nsnapshots_keep = 9\nnonsense = 1\n",
+        )
+        .unwrap();
+
+        let reloaded = editor.reload();
+        assert!(!reloaded.is_ok(), "сломанный конфиг принят быть не должен");
+        assert_eq!(reloaded.issues.len(), 1);
+
+        let issue = reloaded.first_issue().expect("где сломалось");
+        assert_eq!(issue.file, "files.toml");
+        assert_eq!(issue.line, 3);
+        assert_eq!(issue.key, "General.nonsense");
+
+        // Настройки те же: сломанный конфиг ничего не поменял.
+        assert_eq!(editor.session().keep(), before);
+    }
+
+    #[test]
+    fn reload_writes_nothing_to_the_file() {
+        // Никто ничего не дописывает: конфиг выглядит ровно так, как его написал
+        // пользователь.
+        let tmp = Temp::new("dynamic-no-write");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        let path = tmp.dir().join("files.toml");
+        let mine = "[General]\nsnapshots_keep = 4\n";
+        std::fs::write(&path, mine).unwrap();
+
+        editor.reload();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            mine,
+            "редактор не должен трогать файл пользователя"
+        );
+    }
+
+    #[test]
+    fn depth_change_asks_for_restart_instead_of_half_applying() {
+        // Размер пула задан при создании буфера: на лету не меняется, и редактор
+        // честно говорит об этом, а не делает вид.
+        let tmp = Temp::new("dynamic-depth");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        std::fs::write(
+            tmp.dir().join("edit.toml"),
+            "[General]\nhistory_depth = 128\n",
+        )
+        .unwrap();
+
+        let reloaded = editor.reload();
+        assert!(reloaded.is_ok());
+        assert!(
+            reloaded.applied.needs_restart.contains(&"history_depth"),
+            "глубина должна просить перезапуск: {:?}",
+            reloaded.applied
+        );
+        // Буфер продолжает работать на прежней глубине: половинчатое применение
+        // хуже, чем честная просьба перезапустить.
+        assert_eq!(editor.session().opened_depth(), 8192);
+    }
+
+    #[test]
+    fn reloading_an_unchanged_file_changes_nothing() {
+        let tmp = Temp::new("dynamic-noop");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        let reloaded = editor.reload();
+        assert!(reloaded.is_ok());
+        assert!(reloaded.applied.applied.is_empty());
+        assert!(reloaded.applied.needs_restart.is_empty());
+    }
+
+    // ── Наблюдение за каталогом конфига ─────────────────────────────────────────
+
+    #[test]
+    fn editor_watches_the_config_directory() {
+        let tmp = Temp::new("watching");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert!(editor.is_watching(), "редактор должен следить за конфигом");
+    }
+
+    #[test]
+    fn external_edit_is_applied_without_touching_the_editor() {
+        // Главное: правка снаружи видна открытому редактору.
+        let tmp = Temp::new("external");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        let before = editor.session().keep();
+
+        // Пишем со стороны, как будто это другой редактор или git.
+        std::fs::write(
+            tmp.dir().join("files.toml"),
+            "[General]\nsnapshots_keep = 6\n",
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut applied = None;
+        while std::time::Instant::now() < deadline && applied.is_none() {
+            if let Some(reloaded) = editor.poll_watch() {
+                applied = Some(reloaded);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let reloaded = applied.expect("правка снаружи должна быть замечена");
+        assert!(reloaded.is_ok(), "конфиг должны были принять: {reloaded:?}");
+        assert!(before != editor.session().keep(), "настройка не сменилась");
+        assert_eq!(editor.session().keep(), 6);
+    }
+
+    #[test]
+    fn nothing_happens_when_the_config_is_quiet() {
+        // Пока файлы не трогают, перечитывания быть не должно.
+        let tmp = Temp::new("quiet");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+
+        for _ in 0..10 {
+            assert!(
+                editor.poll_watch().is_none(),
+                "перечитывание без изменения файла"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    // ── Язык интерфейса ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_language_from_the_config_reaches_the_interface() {
+        // Главное: язык из config.toml действительно попадает в каталог, который
+        // потом берут подписи. Иначе ключ был бы включён, но ничего не менял.
+        let tmp = Temp::new("lang-from-config");
+        write_translation(
+            tmp.dir(),
+            "ru",
+            "\"Open file\" = \"Открыть файл\"\n\"Save file\" = \"Сохранить файл\"\n",
+        );
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\nlanguage = \"ru\"\n",
+        )
+        .unwrap();
+
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.language(), "ru");
+        assert!(
+            editor.language_error.is_none(),
+            "язык не загрузился: {:?}",
+            editor.language_error
+        );
+        assert_eq!(editor.catalog().get("Open file"), Some("Открыть файл"));
+    }
+
+    #[test]
+    fn english_needs_no_file_on_disk() {
+        // Английский зашит в бинарник: папки lang может не быть вообще.
+        let tmp = Temp::new("lang-english");
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.language(), "en");
+        assert!(editor.language_error.is_none());
+    }
+
+    #[test]
+    fn a_missing_language_file_is_reported_not_hidden() {
+        // Пользователь попросил язык, которого нет. Молча отдать английский —
+        // значит показать не тот интерфейс, который он выбрал.
+        let tmp = Temp::new("lang-missing");
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\nlanguage = \"ru\"\n",
+        )
+        .unwrap();
+
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.language(), "ru");
+        let error = editor
+            .language_error
+            .as_ref()
+            .expect("отсутствие файла должно быть сообщено");
+        assert!(
+            error.text().contains("ru.toml"),
+            "в сообщении нет пути: {}",
+            error.text()
+        );
+    }
+
+    #[test]
+    fn a_broken_translation_still_opens_the_editor() {
+        // Поломка перевода — не повод не запускать редактор: конфиг в порядке,
+        // работать есть над чем. Но о поломке сказано.
+        let tmp = Temp::new("lang-broken");
+        write_translation(tmp.dir(), "ru", "\"Open file\" = \n");
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\nlanguage = \"ru\"\n",
+        )
+        .unwrap();
+
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert!(editor.issues.is_empty(), "конфиг цел: {:?}", editor.issues);
+        assert!(
+            editor.language_error.is_some(),
+            "поломка перевода не сообщена"
+        );
+        // Сессия работает: редактор открылся, а не отказался.
+        assert_eq!(editor.session().keep(), 3);
+    }
+
+    #[test]
+    fn switching_the_language_applies_without_restart() {
+        // Язык меняется в конфиге и применяется сразу, как и остальные ключи.
+        let tmp = Temp::new("lang-switch");
+        write_translation(tmp.dir(), "ru", "\"Open file\" = \"Открыть файл\"\n");
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.language(), "en");
+
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\nlanguage = \"ru\"\n",
+        )
+        .unwrap();
+        let reloaded = editor.reload();
+        assert!(reloaded.is_ok(), "{reloaded:?}");
+        assert_eq!(editor.language(), "ru");
+        assert_eq!(editor.catalog().get("Open file"), Some("Открыть файл"));
+    }
+
+    #[test]
+    fn a_language_code_cannot_escape_the_config_directory() {
+        // Код языка приходит из конфига, то есть из файла на диске: уход вверх
+        // через `../../` читался бы чужой файл.
+        let tmp = Temp::new("lang-escape");
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\nlanguage = \"../../etc/passwd\"\n",
+        )
+        .unwrap();
+
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert!(editor.language_error.is_some(), "обход должен быть отбит");
+    }
+
+    #[test]
+    fn the_generated_config_asks_for_a_language_up_front() {
+        // Ключ включён: в свежем конфиге он не закомментирован, иначе язык
+        // пришлось бы сначала раскомментировать вручную.
+        let tmp = Temp::new("lang-generated");
+        Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        let text = std::fs::read_to_string(tmp.dir().join("config.toml")).unwrap();
+        assert!(
+            text.contains("\nlanguage = ") || text.contains("language = \"en\""),
+            "ключ языка должен быть активным: {text}"
+        );
+        assert!(
+            !text.contains("#language"),
+            "ключ языка не должен быть закомментированным: {text}"
+        );
+    }
+
+    // ── Темы ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_fresh_config_starts_without_a_complaint() {
+        // Папки тем на первом запуске нет, и тема «default» встроенная. Если бы
+        // требовался файл, редактор ругался бы на каждом первом запуске.
+        let tmp = Temp::new("theme-fresh");
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert!(!tmp.dir().join("theme").exists(), "папки быть не должно");
+        assert!(
+            editor.theme_error.is_none(),
+            "на первом запуске тема не должна быть претензией: {:?}",
+            editor.theme_error
+        );
+        assert_eq!(editor.settings().theme, "default");
+    }
+
+    #[test]
+    fn a_theme_from_the_config_reaches_the_settings() {
+        // Ключ включён: имя из config.toml доходит до настроек, а тема с таким
+        // именем в папке находится.
+        let tmp = Temp::new("theme-from-config");
+        write_theme(tmp.dir(), "everforest.toml");
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\ntheme = \"everforest\"\n",
+        )
+        .unwrap();
+
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.settings().theme, "everforest");
+        assert!(
+            editor.theme_error.is_none(),
+            "тема не найдена: {:?}",
+            editor.theme_error
+        );
+    }
+
+    #[test]
+    fn an_unknown_theme_is_reported_with_the_list() {
+        // Пользователь назвал тему, которой нет: молча брать «default» —
+        // значит показать не ту тему, которую он выбрал.
+        let tmp = Temp::new("theme-unknown");
+        write_theme(tmp.dir(), "everforest.toml");
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\ntheme = \"solarized\"\n",
+        )
+        .unwrap();
+
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        let error = editor
+            .theme_error
+            .as_ref()
+            .expect("неизвестная тема должна быть сообщена");
+        let text = error.text();
+        assert!(text.contains("solarized"), "{text}");
+        assert!(text.contains("everforest"), "в тексте нет списка: {text}");
+    }
+
+    #[test]
+    fn a_theme_name_cannot_escape_the_config_directory() {
+        // Имя приходит из файла на диске: уход вверх через `../../` искал бы
+        // тему вне папки тем.
+        let tmp = Temp::new("theme-escape");
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\ntheme = \"../../../etc/passwd\"\n",
+        )
+        .unwrap();
+
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert!(editor.theme_error.is_some(), "обход должен быть отбит");
+    }
+
+    #[test]
+    fn switching_the_theme_applies_without_restart() {
+        let tmp = Temp::new("theme-switch");
+        write_theme(tmp.dir(), "everforest.toml");
+        let mut editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.settings().theme, "default");
+
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\ntheme = \"everforest\"\n",
+        )
+        .unwrap();
+        let reloaded = editor.reload();
+        assert!(reloaded.is_ok(), "{reloaded:?}");
+        assert_eq!(editor.settings().theme, "everforest");
+        assert!(editor.theme_error.is_none());
+    }
+
+    #[test]
+    fn a_broken_theme_does_not_stop_the_editor() {
+        // Тема не нашлась, а редактор должен открыться: конфиг цел, работать
+        // есть над чем. О поломке сказано, и ключ остаётся как есть.
+        let tmp = Temp::new("theme-broken");
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\ntheme = \"nope\"\n",
+        )
+        .unwrap();
+
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert!(editor.issues.is_empty(), "конфиг цел: {:?}", editor.issues);
+        assert!(editor.theme_error.is_some());
+        assert_eq!(editor.session().keep(), 3);
+    }
+
+    #[test]
+    fn the_generated_config_asks_for_a_theme_up_front() {
+        let tmp = Temp::new("theme-generated");
+        Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        let text = std::fs::read_to_string(tmp.dir().join("config.toml")).unwrap();
+        assert!(
+            text.contains("theme = \"default\""),
+            "ключ темы должен быть активным: {text}"
+        );
+        assert!(!text.contains("#theme"), "ключ не закомментирован: {text}");
+    }
+
+    #[test]
+    fn themes_in_the_folder_do_not_apply_themselves() {
+        // Папка — склад, а не выбор. Файлов может лежать сколько угодно, но без
+        // имени в конфиге работает `default`: иначе тема применялась бы сама, и
+        // пользователь не знал бы, почему.
+        let tmp = Temp::new("theme-no-choice");
+        write_theme(tmp.dir(), "everforest.toml");
+        write_theme(tmp.dir(), "solarized.toml");
+        // Конфиг создаётся с ключом темы по умолчанию — это `default`.
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.settings().theme, "default");
+        assert!(editor.theme_error.is_none());
+
+        // Как только имя написано — работает именно эта тема.
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\ntheme = \"everforest\"\n",
+        )
+        .unwrap();
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.settings().theme, "everforest");
+    }
+
+    #[test]
+    fn translations_in_the_folder_do_not_apply_themselves() {
+        // Папка переводов — склад, как и папка тем. Файлов может лежать сколько
+        // угодно, и сломанный чужой перевод не должен мешать: работает только
+        // тот, чей код написан в конфиге.
+        let tmp = Temp::new("lang-no-choice");
+        write_translation(tmp.dir(), "ru", "\"Open file\" = \"Открыть файл\"\n");
+        write_translation(tmp.dir(), "de", "\"Open file\" = \n");
+        write_translation(tmp.dir(), "fr", "\"Open file\" = \"Ouvrir le fichier\"\n");
+
+        // Язык по умолчанию — английский, и он зашит, а не взят из папки.
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.language(), "en");
+        assert!(editor.language_error.is_none(), "чужие файлы не мешают");
+
+        // Написан русский — читается русский, сломанный немецкий не мешает.
+        std::fs::write(
+            tmp.dir().join("config.toml"),
+            "[General]\nlanguage = \"ru\"\n",
+        )
+        .unwrap();
+        let editor = Editor::open_in(tmp.dir(), tmp.store_dir()).unwrap();
+        assert_eq!(editor.language(), "ru");
+        assert!(editor.language_error.is_none());
+        assert_eq!(editor.catalog().get("Open file"), Some("Открыть файл"));
+    }
+
+    #[test]
+    fn only_the_config_crate_knows_where_the_folders_are() {
+        // Крейты получают готовый путь и ничего не знают о раскладке на диске.
+        // Если тема или перевод снова начнут собирать путь сами, знание о папках
+        // размажется по двум местам, и правка одной распадётся на другую.
+        //
+        // Проверяем по коду: ни в `claxis-theme`, ни в `claxis-i18n` не должно
+        // быть имён папок. Имена папок — дело одного крейта.
+        let forbidden = ["THEME_DIR", "LANG_DIR", "theme_dir", "lang_dir", "user_dir"];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for crate_name in ["claxis-theme", "claxis-i18n"] {
+            let src = root.join(crate_name).join("src");
+            for entry in std::fs::read_dir(&src).unwrap().flatten() {
+                if entry.path().extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(entry.path()).unwrap();
+                for name in forbidden {
+                    // Только код, не комментарии и не примеры сообщений: текст
+                    // про пути в сообщении — это текст, а не знание о раскладке.
+                    for (n, line) in text.lines().enumerate() {
+                        let line = line.trim();
+                        if line.starts_with("//") || line.contains('"') {
+                            continue;
+                        }
+                        assert!(
+                            !line.contains(name),
+                            "{}:{}: крейт не должен знать про папки ({name}): {line}",
+                            entry.path().display(),
+                            n + 1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_config_crate_resolves_every_folder() {
+        // Раз знает один крейт, он и раздаёт папки. Обе папки собираются оттуда.
+        let config = crate::api::config::path::user_dir().expect("каталог находится");
+        let theme = crate::api::config::path::theme_dir(&config);
+        let lang = crate::api::config::path::lang_dir(&config);
+        assert!(theme.ends_with("theme"), "{theme:?}");
+        assert!(lang.ends_with("lang"), "{lang:?}");
+        assert_ne!(theme, lang);
+    }
+
+    // ── Экран статистики ───────────────────────────────────────────────────────
+
+    #[test]
+    fn the_statistics_screen_is_configurable() {
+        // Настройки экрана доходят из конфига до редактора.
+        let tmp = Temp::new("savescreen");
+        std::fs::write(
+            tmp.dir.join("config.toml"),
+            "[Savescreen]\ninclude = false\nmode = \"message\"\n",
+        )
+        .unwrap();
+        let editor = Editor::open_in(&tmp.dir, &tmp.store).unwrap();
+        assert!(!editor.settings().savescreen_include, "экран выключен");
+        assert_eq!(editor.settings().savescreen_mode, "message");
+    }
+
+    #[test]
+    fn the_history_usage_signature_is_an_inline_table() {
+        // Подписи истории лежат во встроенной таблице, а не плоскими ключами:
+        // их пишут и читают по именам `percent` и `number`.
+        let tmp = Temp::new("history-usage-table");
+        // Ровно так, как это пишет человек: таблица разбита по строкам.
+        std::fs::write(
+            tmp.dir.join("config.toml"),
+            "[Savescreen.Setting]\nhistory_usage = {\n  percent = \"{percent}\",\n  number = \"{remaining}\"\n}\n",
+        )
+        .unwrap();
+        let editor = Editor::open_in(&tmp.dir, &tmp.store).unwrap();
+        let settings = editor.settings();
+        assert_eq!(settings.savescreen_history_usage_percent, "{percent}");
+        assert_eq!(settings.savescreen_history_usage_number, "{remaining}");
+    }
+
+    #[test]
+    fn a_multiline_table_in_a_real_config_reaches_the_settings() {
+        // Весь путь целиком: файл на диске, написанный руками, открывается
+        // редактором, и подписи приходят в настройки без кавычек и переносов.
+        let tmp = Temp::new("multiline-end-to-end");
+        std::fs::write(
+            tmp.dir.join("config.toml"),
+            r#"[General]
+language = "en"
+
+[Savescreen]
+include = true
+
+[Savescreen.Setting]
+history_usage = {
+  percent = "{percent} of {max}",
+  number = "{used} of {remaining}"
+}
+"#,
+        )
+        .unwrap();
+        let editor = Editor::open_in(&tmp.dir, &tmp.store).unwrap();
+        assert!(
+            editor.issues.is_empty(),
+            "конфиг с многострочной таблицей разбирается с проблемами: {:?}",
+            editor.issues
+        );
+        let settings = editor.settings();
+        assert_eq!(
+            settings.savescreen_history_usage_percent,
+            "{percent} of {max}"
+        );
+        assert_eq!(
+            settings.savescreen_history_usage_number,
+            "{used} of {remaining}"
+        );
+        assert!(settings.savescreen_include);
+    }
+}

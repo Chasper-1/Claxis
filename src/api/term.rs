@@ -3,4 +3,4 @@
 //! Один файл на крейт. Здесь только то, что крейт отдаёт наружу.
 
 pub use claxis_term::messages;
-pub use claxis_term::{Event, Key, KeyCode, Modifiers, Size, TermError, Terminal};
+pub use claxis_term::{Event, Key, KeyCode, Modifiers, MouseButton, Size, TermError, Terminal};

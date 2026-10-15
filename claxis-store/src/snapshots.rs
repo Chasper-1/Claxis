@@ -320,3 +320,534 @@ fn query(e: rusqlite::Error) -> Error {
         reason: e.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Отдельный временный каталог под каждый тест: базы не делятся.
+    struct Temp {
+        dir: std::path::PathBuf,
+    }
+
+    impl Temp {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("claxis-store-{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self { dir }
+        }
+
+        fn paths(&self) -> StorePaths {
+            StorePaths::new(self.dir.clone())
+        }
+
+        fn store(&self, keep: u8) -> SnapshotStore {
+            SnapshotStore::open(&self.paths(), keep).unwrap()
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn file(name: &str) -> std::path::PathBuf {
+        Path::new("/temp/project").join(name)
+    }
+
+    #[test]
+    fn database_is_created_on_first_open() {
+        let temp = Temp::new("create");
+        let paths = temp.paths();
+        assert!(!paths.exists());
+        let _ = SnapshotStore::open(&paths, 3).unwrap();
+        assert!(paths.exists(), "каталог должен быть создан");
+        assert!(paths.database().is_file(), "файл базы должен появиться");
+    }
+
+    #[test]
+    fn snapshot_survives_reopen() {
+        let temp = Temp::new("reopen");
+        let target = file("a.rs");
+        {
+            let mut store = temp.store(3);
+            store.put(&target, "первый".as_bytes(), b"").unwrap();
+        }
+        {
+            let store = temp.store(3);
+            let snapshot = store
+                .latest(&target)
+                .unwrap()
+                .expect("снапшот должен сохраниться");
+            assert_eq!(snapshot.text, "первый".as_bytes());
+        }
+    }
+
+    #[test]
+    fn keep_limits_snapshots_per_file() {
+        // Три снапшота на файл: четвёртый вытесняет самый старый.
+        let temp = Temp::new("ring");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+
+        for i in 0..5 {
+            store
+                .put(&target, format!("снапшот {i}").as_bytes(), b"")
+                .unwrap();
+        }
+
+        assert_eq!(store.count(&target).unwrap(), 3);
+        let list = store.list(&target).unwrap();
+        let texts: Vec<String> = list
+            .iter()
+            .map(|s| String::from_utf8_lossy(&s.text).into_owned())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["снапшот 4", "снапшот 3", "снапшот 2"],
+            "остались три свежих, свежие первыми"
+        );
+    }
+
+    #[test]
+    fn zero_keep_saves_nothing_and_destroys_nothing() {
+        // Ноль — честный выбор: на диск не пишется ничего, но вызовы не падают.
+        let temp = Temp::new("keep-zero");
+        let target = file("a.rs");
+        let mut store = temp.store(0);
+        for i in 0..5 {
+            store.put(&target, format!("{i}").as_bytes(), b"").unwrap();
+        }
+        assert_eq!(
+            store.count(&target).unwrap(),
+            0,
+            "при keep = 0 писать нечего"
+        );
+        assert!(store.latest(&target).unwrap().is_none());
+    }
+
+    #[test]
+    fn keep_is_respected_for_any_value() {
+        // Настройка из конфига: хоть один снапшот, хоть десять.
+        for keep in [1u8, 2, 7, 10] {
+            let temp = Temp::new(&format!("keep{keep}"));
+            let target = file("a.rs");
+            let mut store = temp.store(keep);
+            for i in 0..keep + 3 {
+                store.put(&target, format!("{i}").as_bytes(), b"").unwrap();
+            }
+            assert_eq!(
+                store.count(&target).unwrap(),
+                keep as u32,
+                "keep={keep} не соблюдён"
+            );
+        }
+    }
+
+    #[test]
+    fn different_files_have_separate_rings() {
+        // Кольцо у каждого файла своё: снапшоты других файлов не вытесняются.
+        let temp = Temp::new("separate");
+        let a = file("a.rs");
+        let b = file("b.rs");
+        let mut store = temp.store(2);
+
+        store.put(&a, b"a0", b"").unwrap();
+        store.put(&a, b"a1", b"").unwrap();
+        store.put(&a, b"a2", b"").unwrap();
+        store.put(&b, b"b0", b"").unwrap();
+
+        assert_eq!(store.count(&a).unwrap(), 2);
+        assert_eq!(store.count(&b).unwrap(), 1);
+        assert_eq!(store.total().unwrap(), 3);
+        assert_eq!(store.latest(&b).unwrap().unwrap().text, b"b0");
+    }
+
+    #[test]
+    fn empty_text_is_stored_fine() {
+        // Пустой документ — обычный снапшот.
+        let temp = Temp::new("empty");
+        let target = file("empty.rs");
+        let mut store = temp.store(3);
+        store.put(&target, b"", b"").unwrap();
+        let snapshot = store.latest(&target).unwrap().unwrap();
+        assert!(snapshot.text.is_empty());
+    }
+
+    #[test]
+    fn large_text_round_trips_unchanged() {
+        // Много байт с любыми значениями, включая ноль и не-UTF8.
+        let temp = Temp::new("large");
+        let target = file("big.rs");
+        let mut store = temp.store(3);
+        let text: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
+        store.put(&target, &text, b"").unwrap();
+        let snapshot = store.latest(&target).unwrap().unwrap();
+        assert_eq!(snapshot.text.len(), text.len(), "длина не совпала");
+        assert_eq!(snapshot.text, text, "содержимое не совпало");
+        // Нули в данных тоже должны выжить — это проверка на то, что блоб
+        // сохраняется целиком, а не до первого нуля.
+        let zeros = (0..500_000u32).filter(|i| i % 251 == 0).count();
+        assert_eq!(snapshot.text.iter().filter(|&&b| b == 0).count(), zeros);
+    }
+
+    #[test]
+    fn get_by_seq_and_missing_is_none() {
+        let temp = Temp::new("byseq");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store.put(&target, "первый".as_bytes(), b"").unwrap();
+        let seq = store.latest(&target).unwrap().unwrap().seq;
+        let by_seq = store.get(&target, seq).unwrap().expect("снапшот по номеру");
+        assert_eq!(by_seq.text, "первый".as_bytes());
+        assert!(store.get(&target, 999_999).unwrap().is_none());
+        assert!(store.latest(&file("нет-такого.rs")).unwrap().is_none());
+    }
+
+    #[test]
+    fn forget_removes_only_that_file() {
+        let temp = Temp::new("forget");
+        let a = file("a.rs");
+        let b = file("b.rs");
+        let mut store = temp.store(3);
+        store.put(&a, b"a", b"").unwrap();
+        store.put(&b, b"b", b"").unwrap();
+        store.forget(&a).unwrap();
+        assert_eq!(store.count(&a).unwrap(), 0);
+        assert_eq!(store.count(&b).unwrap(), 1);
+    }
+
+    #[test]
+    fn reopening_keeps_existing_snapshots() {
+        // Второе открытие не стирает то, что записано ранее.
+        let temp = Temp::new("keep-on-reopen");
+        let target = file("a.rs");
+        {
+            let mut store = temp.store(3);
+            store
+                .put(&target, "из первого запуска".as_bytes(), b"")
+                .unwrap();
+        }
+        {
+            let mut store = temp.store(3);
+            assert_eq!(store.count(&target).unwrap(), 1);
+            store
+                .put(&target, "из второго запуска".as_bytes(), b"")
+                .unwrap();
+            let list = store.list(&target).unwrap();
+            assert_eq!(list.len(), 2);
+            assert_eq!(list[0].text, "из второго запуска".as_bytes());
+            assert_eq!(list[1].text, "из первого запуска".as_bytes());
+        }
+    }
+
+    #[test]
+    fn two_stores_on_one_database() {
+        // Два независимых подключения к одной базе работают одновременно —
+        // это то, ради чего выбрана sqlite, а не база с эксклюзивным локом.
+        let temp = Temp::new("two");
+        let target = file("a.rs");
+        let mut first = temp.store(3);
+        first.put(&target, "первый".as_bytes(), b"").unwrap();
+
+        let mut second = SnapshotStore::open(&temp.paths(), 3).unwrap();
+        second.put(&target, "второй".as_bytes(), b"").unwrap();
+
+        assert_eq!(
+            first.count(&target).unwrap(),
+            2,
+            "первый видит запись второго"
+        );
+        assert_eq!(
+            second.count(&target).unwrap(),
+            2,
+            "второй видит запись первого"
+        );
+    }
+
+    #[test]
+    fn size_on_disk_is_reported() {
+        let temp = Temp::new("size");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store.put(&target, &vec![b'x'; 100_000], b"").unwrap();
+        let size = store.size_on_disk().unwrap();
+        assert!(size > 0, "размер должен быть известен");
+        assert!(store.keep() == 3);
+    }
+
+    #[test]
+    fn last_good_config_round_trip() {
+        // Последний корректный конфиг переживает перезапуск редактора.
+        let temp = Temp::new("last-good");
+        let store = temp.store(3);
+        assert!(store.last_good("config").unwrap().is_none());
+
+        let mut store = store;
+        store
+            .save_last_good("config", "hold = { alt = 200, ctrl = 200 }")
+            .unwrap();
+        assert_eq!(
+            store.last_good("config").unwrap().as_deref(),
+            Some("hold = { alt = 200, ctrl = 200 }")
+        );
+    }
+
+    #[test]
+    fn last_good_config_overwrites_and_forgets() {
+        let temp = Temp::new("last-good-overwrite");
+        let mut store = temp.store(3);
+
+        store.save_last_good("config", "old").unwrap();
+        store.save_last_good("config", "new").unwrap();
+        assert_eq!(store.last_good("config").unwrap().as_deref(), Some("new"));
+
+        // Другие имена не трогаются: конфиг и тема хранятся раздельно.
+        store.save_last_good("edit", "edit body").unwrap();
+        store.forget_last_good("config").unwrap();
+        assert!(store.last_good("config").unwrap().is_none());
+        assert_eq!(
+            store.last_good("edit").unwrap().as_deref(),
+            Some("edit body")
+        );
+    }
+
+    #[test]
+    fn last_good_survives_reopening() {
+        // Перезапуск редактора не должен терять сохранённый конфиг.
+        let temp = Temp::new("last-good-reopen");
+        {
+            let mut store = temp.store(3);
+            store.save_last_good("config", "body").unwrap();
+        }
+        let store = temp.store(3);
+        assert_eq!(store.last_good("config").unwrap().as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn keep_is_reported_by_the_store() {
+        let temp = Temp::new("keep-report");
+        let store = temp.store(5);
+        assert_eq!(store.keep(), 5);
+    }
+
+    #[test]
+    fn a_new_keep_applies_to_the_next_write() {
+        // Размер кольца меняется на ходу: следующая запись уже учитывает новое
+        // число, а лишние старые снапшоты вытесняются этой же записью.
+        let temp = Temp::new("keep-change");
+        let target = file("a.rs");
+        let mut store = temp.store(5);
+        for i in 0..5 {
+            store.put(&target, format!("{i}").as_bytes(), b"").unwrap();
+        }
+        assert_eq!(store.count(&target).unwrap(), 5);
+
+        store.set_keep(2);
+        assert_eq!(store.keep(), 2);
+        store.put(&target, "ещё".as_bytes(), b"").unwrap();
+
+        assert_eq!(store.count(&target).unwrap(), 2);
+        let list = store.list(&target).unwrap();
+        assert_eq!(list[0].text, "ещё".as_bytes());
+        assert_eq!(list[1].text, "4".as_bytes());
+    }
+
+    #[test]
+    fn a_grown_keep_does_not_resurrect_old_snapshots() {
+        // Увеличение кольца не воскрешает вытесненное: на диске его уже нет.
+        let temp = Temp::new("keep-grow");
+        let target = file("a.rs");
+        let mut store = temp.store(1);
+        store.put(&target, "первый".as_bytes(), b"").unwrap();
+        store.put(&target, "второй".as_bytes(), b"").unwrap();
+
+        store.set_keep(10);
+        store.put(&target, "третий".as_bytes(), b"").unwrap();
+
+        let list = store.list(&target).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            store.latest(&target).unwrap().unwrap().text,
+            "третий".as_bytes()
+        );
+    }
+
+    #[test]
+    fn keep_zero_after_writing_clears_the_file() {
+        // Перевод хранилища в режим «только память» не оставляет старого на диске.
+        let temp = Temp::new("keep-zero-later");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store.put(&target, "старое".as_bytes(), b"").unwrap();
+
+        store.set_keep(0);
+        store.put(&target, "новое".as_bytes(), b"").unwrap();
+
+        assert_eq!(store.count(&target).unwrap(), 0);
+        assert_eq!(store.total().unwrap(), 0);
+    }
+
+    #[test]
+    fn reopen_returns_an_independent_connection_to_the_same_base() {
+        // Нужно сессии, которая живёт дольше той, что открыла буфер. Данные и
+        // размер кольца должны быть теми же.
+        let temp = Temp::new("reopen-fn");
+        let target = file("a.rs");
+        let mut store = temp.store(4);
+        store.put(&target, "первый".as_bytes(), b"").unwrap();
+
+        let mut second = store.reopen().unwrap();
+        assert_eq!(second.keep(), 4);
+        assert_eq!(
+            second.latest(&target).unwrap().unwrap().text,
+            "первый".as_bytes()
+        );
+
+        // Запись во втором подключении видна первому: база одна и та же.
+        second.put(&target, "второй".as_bytes(), b"").unwrap();
+        assert_eq!(store.count(&target).unwrap(), 2);
+    }
+
+    #[test]
+    fn keep_is_not_kept_in_the_base_but_taken_from_the_config() {
+        // Размер кольца — настройка, а не часть данных: он приходит из конфига при
+        // каждом открытии, и в базе не хранится.
+        let temp = Temp::new("keep-persist");
+        let target = file("a.rs");
+        {
+            let mut store = temp.store(1);
+            store.put(&target, "первый".as_bytes(), b"").unwrap();
+            store.set_keep(3);
+            store.put(&target, "второй".as_bytes(), b"").unwrap();
+        }
+        let mut store = temp.store(1);
+        assert_eq!(store.count(&target).unwrap(), 2);
+        store.put(&target, "третий".as_bytes(), b"").unwrap();
+        assert_eq!(store.count(&target).unwrap(), 1);
+        assert_eq!(
+            store.latest(&target).unwrap().unwrap().text,
+            "третий".as_bytes()
+        );
+    }
+
+    #[test]
+    fn history_survives_the_round_trip() {
+        // Без истории после перезапуска отменять было бы нечего.
+        let temp = Temp::new("history-round");
+        let target = file("a.rs");
+        let history: Vec<u8> = (0..1000u32).map(|i| (i % 253) as u8).collect();
+        let mut store = temp.store(3);
+        store.put(&target, "текст".as_bytes(), &history).unwrap();
+
+        let snapshot = store.latest(&target).unwrap().unwrap();
+        assert_eq!(snapshot.history, history);
+        assert_eq!(snapshot.text, "текст".as_bytes());
+        assert_eq!(snapshot.file, target.display().to_string());
+    }
+
+    #[test]
+    fn history_is_empty_when_nothing_was_passed() {
+        let temp = Temp::new("history-empty");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store.put(&target, "текст".as_bytes(), b"").unwrap();
+        assert!(store.latest(&target).unwrap().unwrap().history.is_empty());
+    }
+
+    #[test]
+    fn an_old_base_without_history_still_opens() {
+        // Миграция на месте: у человека уже лежит база без колонки истории, и
+        // терять её из-за новой версии нельзя.
+        let temp = Temp::new("migrate");
+        let paths = temp.paths();
+        paths.ensure_dir().unwrap();
+        {
+            let conn = rusqlite::Connection::open(paths.database()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE snapshots (
+                     seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+                     file    TEXT NOT NULL,
+                     text    BLOB NOT NULL
+                 );
+                 CREATE TABLE last_good (name TEXT PRIMARY KEY, body TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO snapshots (file, text) VALUES (?1, ?2)",
+                rusqlite::params![
+                    file("старый.rs").display().to_string(),
+                    "давний текст".as_bytes()
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = temp.store(3);
+        let snapshot = store
+            .latest(&file("старый.rs"))
+            .unwrap()
+            .expect("старый снапшот должен найтись");
+        assert_eq!(snapshot.text, "давний текст".as_bytes());
+        assert!(snapshot.history.is_empty());
+
+        // И новая запись в старую базу пишется, то есть колонка на месте.
+        let mut store = store;
+        store
+            .put(
+                &file("старый.rs"),
+                "новый текст".as_bytes(),
+                "история".as_bytes(),
+            )
+            .unwrap();
+        let fresh = store.latest(&file("старый.rs")).unwrap().unwrap();
+        assert_eq!(fresh.text, "новый текст".as_bytes());
+        assert_eq!(fresh.history, "история".as_bytes());
+    }
+
+    #[test]
+    fn opening_twice_on_one_database_does_not_duplicate_the_migration() {
+        // `ALTER` падает на уже существующей колонке, а выполняется на каждом
+        // запуске: второе открытие не имеет права закончиться ошибкой.
+        let temp = Temp::new("migrate-twice");
+        let _ = temp.store(3);
+        let _ = temp.store(3);
+        let _ = temp.store(3);
+    }
+
+    #[test]
+    fn total_counts_every_file_together() {
+        let temp = Temp::new("total");
+        let mut store = temp.store(3);
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            store.put(&file(name), "текст".as_bytes(), b"").unwrap();
+            store.put(&file(name), "текст".as_bytes(), b"").unwrap();
+        }
+        assert_eq!(store.total().unwrap(), 6);
+        assert_eq!(store.count(&file("a.rs")).unwrap(), 2);
+        assert_eq!(store.count(&file("нет.rs")).unwrap(), 0);
+    }
+
+    #[test]
+    fn total_is_zero_on_a_fresh_base() {
+        let temp = Temp::new("total-empty");
+        assert_eq!(temp.store(3).total().unwrap(), 0);
+    }
+
+    #[test]
+    fn size_on_disk_grows_with_the_data() {
+        // Реальная проверка: база с данными тяжелее пустой.
+        let temp = Temp::new("size-grow");
+        let mut store = temp.store(3);
+        let empty = store.size_on_disk().unwrap();
+        let target = file("big.rs");
+        let blob = vec![b'x'; 2_000_000];
+        store.put(&target, &blob, b"").unwrap();
+        let full = store.size_on_disk().unwrap();
+        assert!(
+            full > empty,
+            "после записи {empty} байт стало {full} — размер не отражает данные"
+        );
+    }
+}

@@ -49,6 +49,3 @@ pub use lines::LineMap;
 pub use session::{Applied, Document, Session, SessionError};
 pub use settings::Settings;
 pub use stats::Stats;
-
-#[cfg(test)]
-mod tests;

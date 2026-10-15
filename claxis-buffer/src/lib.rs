@@ -14,9 +14,3 @@ pub use history::History;
 pub use messages::{En, Messages, ParseError, substitute};
 pub use segment::{ADDED, ORIGINAL, Segment, TextRef};
 pub use snapshot::{NullSink, SnapshotSink};
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod invariants;
