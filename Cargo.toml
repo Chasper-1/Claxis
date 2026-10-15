@@ -18,7 +18,7 @@ claxis-text = { path = "claxis-text" }                    # all crates
 claxis-config = { path = "claxis-config" }                # Claxis
 claxis-term = { path = "claxis-term" }                    # Claxis
 
-claxis-buffer = { path = "claxis-buffer" }                # claxis-config
+claxis-buffer = { path = "claxis-buffer" }                # Claxis
 claxis-rope = { path = "claxis-rope" }                      # Claxis
 claxis-disk = { path = "claxis-disk" }                     # Claxis, claxis-config
 claxis-input = { path = "claxis-input" }                  # claxis-config

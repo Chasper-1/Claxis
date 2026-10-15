@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "Claxis"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "claxis-buffer",
  "claxis-config",
@@ -50,9 +50,8 @@ dependencies = [
 
 [[package]]
 name = "claxis-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
- "claxis-buffer",
  "claxis-disk",
  "claxis-i18n",
  "claxis-input",
@@ -90,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "claxis-term"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "claxis-text",
  "crossterm",
@@ -102,7 +101,7 @@ version = "0.2.3"
 
 [[package]]
 name = "claxis-theme"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "claxis-text",
 ]
