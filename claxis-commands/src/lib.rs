@@ -22,7 +22,7 @@ pub mod messages;
 pub mod name;
 pub mod registry;
 
-pub use alias::Alias;
+pub use alias::{Alias, Typed};
 pub use bindings::Bindings;
 pub use error::Error;
 pub use level::Level;

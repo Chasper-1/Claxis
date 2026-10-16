@@ -2,7 +2,7 @@
 //!
 //! Один файл на крейт. Здесь только то, что крейт отдаёт наружу.
 
-pub use claxis_commands::alias::Alias;
+pub use claxis_commands::alias::{Alias, Typed};
 pub use claxis_commands::bindings::Bindings;
 pub use claxis_commands::error::Error;
 pub use claxis_commands::level::Level;

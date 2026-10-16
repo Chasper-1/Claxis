@@ -13,6 +13,15 @@ use crate::error::Error;
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Alias(String);
 
+/// Что напечатали: повтор и сам алиас.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Typed {
+    /// Число повторов перед алиасом. `None` — повтор не задан.
+    pub repeat: Option<u32>,
+    /// Алиас без числа повторов.
+    pub alias: Alias,
+}
+
 impl Alias {
     /// Собрать алиас из символов. Пустой алиас — ошибка: его нельзя напечатать.
     pub fn new(symbols: &str) -> Result<Self, Error> {
@@ -31,6 +40,29 @@ impl Alias {
     /// Символы алиаса.
     pub fn symbols(&self) -> &str {
         &self.0
+    }
+
+    /// Разобрать напечатанное: сначала повтор, потом алиас.
+    ///
+    /// Так же, как в командной строке: `5dd` — это пять строк, а не пять
+    /// символов. Повтор отделён от алиаса, чтобы команда получила и то и
+    /// другое и не гадала, где кончилось число.
+    pub fn split(text: &str) -> Result<Typed, Error> {
+        let digits = text
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len());
+        let (count, symbols) = text.split_at(digits);
+        let repeat = if count.is_empty() {
+            None
+        } else {
+            Some(count.parse().map_err(|_| Error::BadRepeatCount {
+                got: count.to_string(),
+            })?)
+        };
+        Ok(Typed {
+            repeat,
+            alias: Alias::new(symbols)?,
+        })
     }
 }
 
@@ -79,5 +111,40 @@ mod tests {
                 "алиас {text:?} должен быть отвергнут"
             );
         }
+    }
+
+    #[test]
+    fn typed_count_comes_before_the_alias() {
+        // `5dd` — это пять повторов алиаса `dd`, а не символы `5dd`.
+        let typed = Alias::split("5dd").unwrap();
+        assert_eq!(typed.repeat, Some(5));
+        assert_eq!(typed.alias.symbols(), "dd");
+    }
+
+    #[test]
+    fn typed_without_a_count_keeps_the_alias_whole() {
+        let typed = Alias::split("dd").unwrap();
+        assert_eq!(typed.repeat, None);
+        assert_eq!(typed.alias.symbols(), "dd");
+    }
+
+    #[test]
+    fn a_multi_digit_count_is_read_as_one_number() {
+        let typed = Alias::split("100dd").unwrap();
+        assert_eq!(typed.repeat, Some(100));
+        assert_eq!(typed.alias.symbols(), "dd");
+    }
+
+    #[test]
+    fn a_count_without_an_alias_is_an_error() {
+        // `5` не команда: цифры без алиаса делать нечего.
+        assert!(Alias::split("5").is_err());
+        assert!(Alias::split("").is_err());
+    }
+
+    #[test]
+    fn a_count_too_large_to_be_one_is_an_error_not_a_wraparound() {
+        let error = Alias::split("99999999999999999999dd").unwrap_err();
+        assert!(matches!(error, Error::BadRepeatCount { .. }));
     }
 }

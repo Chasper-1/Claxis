@@ -87,7 +87,10 @@ pub fn samples() -> Vec<(&'static str, String)> {
             "bad_command_name",
             m.bad_command_name(":std::::edit", "empty segment"),
         ),
-        ("bad_repeat_count", m.bad_repeat_count("many")),
+        (
+            "bad_repeat_count",
+            m.bad_repeat_count("99999999999999999999"),
+        ),
         (
             "binding_conflict",
             m.binding_conflict("dd", "global", "edit"),

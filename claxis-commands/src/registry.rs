@@ -88,6 +88,14 @@ impl Registry {
     }
 }
 
+/// Цифры в начале строки — это повтор, а не имя.
+fn leading_digits(text: &str) -> &str {
+    let end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
 /// Имена встроенных команд.
 fn std_names() -> Vec<CommandName> {
     [
@@ -133,32 +141,31 @@ pub struct CommandLine {
 }
 
 impl CommandLine {
-    /// Разобрать строку вида `:std::edit::delete::line 5`.
+    /// Разобрать строку вида `3:std::edit::move::word::right path`.
     ///
-    /// Порядок задан документацией: имя, потом число повторов, потом
-    /// аргументы. Пустая строка и строка без `:` — ошибка: командная строка
-    /// начинается с двоеточия.
+    /// Порядок задан документацией: сначала число повторов, потом имя, потом
+    /// аргументы. Число пишется перед двоеточием — так же, как в vim, где
+    /// `5dd` идёт быстрее, чем `:delete 5 lines`.
     pub fn parse(text: &str) -> Result<Self, Error> {
-        let mut parts = text.split_whitespace();
+        let digits = leading_digits(text);
+        let rest = &text[digits.len()..];
+        let mut parts = rest.split_whitespace();
         let first = parts.next().ok_or_else(|| Error::BadCommandName {
             got: text.to_string(),
             reason: "empty".to_string(),
         })?;
         let name = CommandName::parse(first)?;
-        let rest: Vec<&str> = parts.collect();
-        let (repeat, args) = match rest.split_first() {
-            Some((head, tail)) if head.chars().all(|c| c.is_ascii_digit()) => {
-                let count: u32 = head.parse().map_err(|_| Error::BadRepeatCount {
-                    got: head.to_string(),
-                })?;
-                (Some(count), tail.to_vec())
-            }
-            _ => (None, rest.clone()),
+        let repeat = if digits.is_empty() {
+            None
+        } else {
+            Some(digits.parse().map_err(|_| Error::BadRepeatCount {
+                got: digits.to_string(),
+            })?)
         };
         Ok(Self {
             name,
             repeat,
-            args: args.into_iter().map(str::to_string).collect(),
+            args: parts.map(str::to_string).collect(),
         })
     }
 
@@ -280,12 +287,12 @@ mod tests {
     }
 
     #[test]
-    fn a_command_line_is_name_then_count_then_arguments() {
-        let line = CommandLine::parse(":std::edit::delete::line 5").unwrap();
-        assert_eq!(line.name.to_string(), ":std::edit::delete::line");
-        assert_eq!(line.repeat, Some(5));
+    fn a_count_goes_before_the_name_like_in_vim() {
+        let line = CommandLine::parse("3:std::edit::move::word::right").unwrap();
+        assert_eq!(line.name.to_string(), ":std::edit::move::word::right");
+        assert_eq!(line.repeat, Some(3));
+        assert_eq!(line.times(), 3);
         assert!(line.args.is_empty());
-        assert_eq!(line.times(), 5);
     }
 
     #[test]
@@ -296,24 +303,35 @@ mod tests {
     }
 
     #[test]
-    fn arguments_survive_after_the_count() {
-        let line = CommandLine::parse(":std::file::open 2 path/to/file").unwrap();
-        assert_eq!(line.repeat, Some(2));
-        assert_eq!(line.args, vec!["path/to/file"]);
+    fn a_multi_digit_count_before_the_name_is_read_as_one_number() {
+        let line = CommandLine::parse("100:std::edit::delete::line").unwrap();
+        assert_eq!(line.repeat, Some(100));
     }
 
     #[test]
-    fn a_count_without_arguments_is_still_a_count() {
-        let line = CommandLine::parse(":std::edit::move::down 10").unwrap();
-        assert_eq!(line.repeat, Some(10));
-        assert!(line.args.is_empty());
-    }
-
-    #[test]
-    fn a_word_that_is_not_a_count_stays_an_argument() {
+    fn arguments_follow_the_name() {
         let line = CommandLine::parse(":std::file::open path/to/file").unwrap();
         assert_eq!(line.repeat, None);
         assert_eq!(line.args, vec!["path/to/file"]);
+        let repeated = CommandLine::parse("2:std::file::open path/to/file").unwrap();
+        assert_eq!(repeated.repeat, Some(2));
+        assert_eq!(repeated.args, vec!["path/to/file"]);
+    }
+
+    #[test]
+    fn a_number_after_the_name_is_an_argument_not_a_count() {
+        // Порядок один: повтор до имени. Всё, что после имени, — аргументы,
+        // даже если это число: иначе `открыть файл 2024` не отличить от
+        // повтора.
+        let line = CommandLine::parse(":std::file::open 2024").unwrap();
+        assert_eq!(line.repeat, None);
+        assert_eq!(line.args, vec!["2024"]);
+    }
+
+    #[test]
+    fn a_count_too_large_to_be_one_is_an_error_not_a_wraparound() {
+        let error = CommandLine::parse("99999999999999999999:std::file::save").unwrap_err();
+        assert!(matches!(error, Error::BadRepeatCount { .. }));
     }
 
     #[test]
@@ -321,5 +339,6 @@ mod tests {
         assert!(CommandLine::parse("").is_err());
         assert!(CommandLine::parse("std::file::save").is_err());
         assert!(CommandLine::parse(":std::::save").is_err());
+        assert!(CommandLine::parse("5").is_err(), "повтор без команды");
     }
 }
