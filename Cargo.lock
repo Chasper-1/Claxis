@@ -7,6 +7,7 @@ name = "Claxis"
 version = "0.4.2"
 dependencies = [
  "claxis-buffer",
+ "claxis-commands",
  "claxis-config",
  "claxis-disk",
  "claxis-i18n",
@@ -44,6 +45,13 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "claxis-buffer"
 version = "0.2.3"
+dependencies = [
+ "claxis-text",
+]
+
+[[package]]
+name = "claxis-commands"
+version = "0.1.0"
 dependencies = [
  "claxis-text",
 ]
