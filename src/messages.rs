@@ -14,6 +14,8 @@ pub trait Messages {
     fn read_file_failed(&self, path: &str, reason: &str) -> String;
     /// Ошибка буфера: делегирует в каталог буфера.
     fn buffer_error(&self, error: &crate::api::rope::Error) -> String;
+    /// Ошибка команды: делегирует в каталог команд.
+    fn commands_error(&self, error: &crate::api::commands::Error) -> String;
     /// Каталог конфига недоступен: `{path}`, `{reason}`.
     fn config_dir_failed(&self, path: &str, reason: &str) -> String;
     /// Домашнего каталога нет: конфиг положить некуда.
@@ -65,6 +67,10 @@ impl Messages for En {
 
     fn buffer_error(&self, error: &crate::api::rope::Error) -> String {
         error.message(&crate::api::rope::En)
+    }
+
+    fn commands_error(&self, error: &crate::api::commands::Error) -> String {
+        error.message(&crate::api::commands::En)
     }
 
     fn config_dir_failed(&self, path: &str, reason: &str) -> String {
@@ -138,6 +144,12 @@ pub fn samples() -> Vec<(&'static str, String)> {
         (
             "buffer_error",
             m.buffer_error(&crate::api::rope::Error::TruncatedHistory),
+        ),
+        (
+            "commands_error",
+            m.commands_error(&crate::api::commands::Error::UnknownCommand {
+                name: ":std::edit::undo".to_string(),
+            }),
         ),
         (
             "config_dir_failed",

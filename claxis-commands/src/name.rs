@@ -102,7 +102,9 @@ fn check_part(part: &str) -> Result<(), Error> {
         got: part.to_string(),
         reason: "bad characters in a segment".to_string(),
     };
-    if part.chars().any(|c| c.is_whitespace() || c == ':') {
+    // Пустой кусок — это опечатка в имени, а не кусок: `edit::::undo` должен
+    // быть отвергнут, а не молча стать `edit::undo`.
+    if part.is_empty() || part.chars().any(|c| c.is_whitespace() || c == ':') {
         return Err(bad());
     }
     Ok(())

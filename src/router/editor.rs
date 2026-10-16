@@ -19,6 +19,11 @@ use crate::router::{Applied, Session, SessionError, Settings};
 pub enum StartError {
     /// Сессия не открылась.
     Session(SessionError),
+    /// Объявления команд не разобрались: `{reason}`.
+    ///
+    /// Список команд приходит из крейтов при сборке программы, поэтому такая
+    /// ошибка означает опечатку в объявлении, а не поломку у пользователя.
+    Commands(crate::api::commands::Error),
     /// Каталог конфига недоступен: `{path}`, `{reason}`.
     ConfigDir {
         /// Путь к каталогу.
@@ -43,6 +48,7 @@ impl StartError {
     pub fn message(&self, m: &dyn crate::messages::Messages) -> String {
         match self {
             StartError::Session(e) => e.message(m),
+            StartError::Commands(e) => m.commands_error(e),
             StartError::ConfigDir { path, reason } => m.config_dir_failed(path, reason),
             StartError::NoHomeDir => m.no_home_dir(),
             StartError::NoUsableConfig { issues } => m.no_usable_config(*issues),
@@ -104,6 +110,11 @@ pub struct Editor {
     pub blind_spots: Vec<String>,
     /// Поломки наблюдения за файлами, ждущие показа.
     watch_failures: Vec<String>,
+    /// Команды, объявленные крейтами.
+    ///
+    /// Собирается один раз при запуске из объявлений: список команд живёт у
+    /// крейтов, а редактор знает, какие имена существуют.
+    pub commands: crate::api::commands::Registry,
 }
 
 /// Что вышло из перечитывания конфига.
@@ -233,6 +244,7 @@ impl Editor {
             watch,
             blind_spots,
             watch_failures: Vec::new(),
+            commands: super::commands::registry().map_err(StartError::Commands)?,
         })
     }
 
@@ -258,6 +270,7 @@ impl Editor {
             watch: None,
             blind_spots: Vec::new(),
             watch_failures: Vec::new(),
+            commands: super::commands::registry().map_err(SessionError::Commands)?,
         })
     }
 

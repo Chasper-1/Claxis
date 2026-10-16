@@ -1,7 +1,7 @@
 //! Реестр команд и разбор командной строки.
 
 use crate::error::Error;
-use crate::name::CommandName;
+use crate::name::{CommandName, SEPARATOR};
 
 /// Реестр известных команд.
 ///
@@ -20,15 +20,23 @@ impl Registry {
         Self::default()
     }
 
-    /// Реестр со встроенными командами.
-    pub fn std() -> Self {
+    /// Реестр, собранный из объявлений крейтов.
+    ///
+    /// Каждый крейт приносит список своих команд, они собираются под
+    /// пространством имён `std`: `edit::undo` из `claxis-rope` становится
+    /// `:std::edit::undo`. Список команд живёт у крейта, здесь он не
+    /// дублируется и не дописывается сбоку.
+    pub fn from_parts(parts: &[(&str, &[&str])]) -> Result<Self, Error> {
         let mut registry = Self::new();
-        for name in std_names() {
-            registry
-                .register(name)
-                .expect("встроенное имя всегда корректно");
+        for (namespace, commands) in parts {
+            for command in *commands {
+                let mut segments = Vec::new();
+                segments.push(namespace.to_string());
+                segments.extend(command.split(SEPARATOR).map(str::to_string));
+                registry.register(CommandName::new(segments)?)?;
+            }
         }
-        registry
+        Ok(registry)
     }
 
     /// Зарегистрировать команду. Повторная регистрация того же имени не
@@ -96,39 +104,6 @@ fn leading_digits(text: &str) -> &str {
     &text[..end]
 }
 
-/// Имена встроенных команд.
-fn std_names() -> Vec<CommandName> {
-    [
-        ":std::edit::move::up",
-        ":std::edit::move::down",
-        ":std::edit::move::left",
-        ":std::edit::move::right",
-        ":std::edit::move::word_start",
-        ":std::edit::move::line_start",
-        ":std::edit::move::line_end",
-        ":std::edit::move::doc_start",
-        ":std::edit::delete::line",
-        ":std::edit::delete::word",
-        ":std::edit::copy::line",
-        ":std::edit::undo",
-        ":std::edit::redo",
-        ":std::edit::paste",
-        ":std::file::save",
-        ":std::file::open",
-        ":std::file::close",
-        ":std::mode::command",
-        ":std::mode::edit",
-        ":std::mode::insert",
-        ":std::search::next",
-        ":std::search::previous",
-        ":std::macro::start",
-        ":std::macro::stop",
-        ":std::macro::replay",
-    ]
-    .map(|name| CommandName::parse(name).expect("встроенное имя всегда корректно"))
-    .to_vec()
-}
-
 /// Разобранная командная строка: имя, число повторов, аргументы.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CommandLine {
@@ -183,9 +158,26 @@ mod tests {
         CommandName::parse(text).unwrap()
     }
 
+    /// Реестр из выдуманных крейтов: тут важна форма, а не состав.
+    fn declared() -> Registry {
+        Registry::from_parts(&[
+            ("std", &["file::open", "file::save", "file::close"]),
+            (
+                "std",
+                &[
+                    "edit::undo",
+                    "edit::redo",
+                    "edit::move::up",
+                    "edit::move::down",
+                ],
+            ),
+        ])
+        .unwrap()
+    }
+
     #[test]
-    fn std_commands_are_registered_and_sorted() {
-        let registry = Registry::std();
+    fn declared_commands_are_registered_and_sorted() {
+        let registry = declared();
         assert!(registry.has(&CommandName::parse(":std::file::save").unwrap()));
         assert!(!registry.has(&CommandName::parse(":std::file::save::all").unwrap()));
         let sorted = registry.names();
@@ -194,9 +186,8 @@ mod tests {
 
     #[test]
     fn an_unknown_command_is_reported_not_silently_dropped() {
-        let registry = Registry::std();
         assert!(matches!(
-            registry.get(":std::file::save::everything"),
+            declared().get(":std::file::save::everything"),
             Err(Error::UnknownCommand { .. })
         ));
     }
@@ -211,8 +202,15 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_lands_next_to_std_in_the_same_registry() {
-        let mut registry = Registry::std();
+    fn a_crate_declaring_the_same_command_twice_is_not_a_double_entry() {
+        let registry =
+            Registry::from_parts(&[("std", &["file::save"]), ("std", &["file::save"])]).unwrap();
+        assert_eq!(registry.names().len(), 1);
+    }
+
+    #[test]
+    fn another_namespace_lands_next_to_std() {
+        let mut registry = declared();
         registry
             .register(CommandName::parse(":my-plugin::file::save").unwrap())
             .unwrap();
@@ -224,28 +222,32 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_declaration_is_an_error_not_a_skipped_command() {
+        // Крейт написал команду с пустым куском — это опечатка, а не повод
+        // молча выкинуть команду из реестра.
+        assert!(matches!(
+            Registry::from_parts(&[("std", &["edit::::undo"])]),
+            Err(Error::BadCommandName { .. })
+        ));
+        assert!(Registry::from_parts(&[("std", &[""])]).is_err());
+    }
+
+    #[test]
     fn completion_walks_the_hierarchy_level_by_level() {
-        let registry = Registry::std();
+        let registry = declared();
         assert_eq!(
             registry.complete(&["std"]),
-            vec!["edit", "file", "macro", "mode", "search"]
+            vec!["edit", "file"],
+            "только те домены, что кто-то объявил"
         );
         assert_eq!(
             registry.complete(&["std", "edit"]),
-            vec!["copy", "delete", "move", "paste", "redo", "undo"]
+            vec!["move", "redo", "undo"]
         );
         assert_eq!(
             registry.complete(&["std", "edit", "move"]),
-            vec![
-                "doc_start",
-                "down",
-                "left",
-                "line_end",
-                "line_start",
-                "right",
-                "up",
-                "word_start",
-            ]
+            vec!["down", "up"],
+            "вложенный кусок продолжается после своего куска"
         );
     }
 
@@ -270,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_fully_typed_name_has_nothing_to_add() {
-        let registry = Registry::std();
+        let registry = declared();
         assert_eq!(
             registry.complete(&["std", "edit", "move", "up"]),
             Vec::<&str>::new(),
@@ -281,7 +283,7 @@ mod tests {
 
     #[test]
     fn completion_for_a_dead_prefix_is_empty_and_not_an_error() {
-        let registry = Registry::std();
+        let registry = declared();
         assert!(registry.complete(&["nope"]).is_empty());
         assert_eq!(registry.complete_one(&["nope"]), None);
     }

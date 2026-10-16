@@ -31,6 +31,11 @@ pub enum SessionError {
     ReadFile { path: String, reason: String },
     /// Файл больше, чем помещается в `u32`.
     FileTooLarge { bytes: u64 },
+    /// Объявления команд не разобрались.
+    ///
+    /// Список команд приходит из крейтов при сборке программы, поэтому такая
+    /// ошибка означает опечатку в объявлении, а не поломку у пользователя.
+    Commands(crate::api::commands::Error),
 }
 
 impl SessionError {
@@ -38,6 +43,7 @@ impl SessionError {
     pub fn message(&self, messages: &dyn Messages) -> String {
         match self {
             SessionError::Buffer(e) => messages.buffer_error(e),
+            SessionError::Commands(e) => messages.commands_error(e),
             SessionError::Store { path, reason } => messages.store_failed(path, reason),
             SessionError::ReadFile { path, reason } => messages.read_file_failed(path, reason),
             SessionError::FileTooLarge { bytes } => messages.file_too_large(
