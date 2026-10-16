@@ -92,6 +92,13 @@ struct StoreSink {
     cursor: Option<u64>,
 }
 
+/// Сколько раз пишется снимок, прежде чем признать запись негодной.
+///
+/// Повтор спасает от сбоя записи и не спасает от порчи извне: если содержимое
+/// переписали между попытками, переписывание будет затирать чужое. Разница
+/// видна по тому, что именно вернулось, и на пятый раз об этом сказано.
+const WRITE_ATTEMPTS: u32 = 5;
+
 /// Снимок в памяти приёмника.
 #[derive(Debug)]
 struct Stored {
@@ -104,18 +111,40 @@ impl SnapshotSink for StoreSink {
     fn accept(&mut self, file: &Path, text: &[u8], history: &[u8]) {
         // История идёт вместе с текстом: без неё после перезапуска отменять
         // было бы нечего, то есть снапшот сохранил бы половину работы.
-        match self.store.put(file, text, history) {
-            Ok(seq) => {
-                // Новый снимок становится буфером: вытесняет предыдущий из
-                // памяти, но в кольце предыдущий остаётся.
-                self.latest = Some(Stored {
-                    seq,
-                    history: history.to_vec(),
-                });
-                self.cursor = None;
+        //
+        // Запись проверяется чтением обратно. Если содержимое разошлось, его
+        // переписывают: с первого раза это может быть сбой записи, и повтор
+        // проходит. Пять попыток подряд — уже не сбой, а порча извне, и
+        // перезапись тут бессильна: она затрёт то, что сделали руками.
+        let mut last: Option<crate::api::disk::Error> = None;
+        for _ in 0..WRITE_ATTEMPTS {
+            let seq = match self.store.put(file, text, history) {
+                Ok(seq) => seq,
+                Err(e) => {
+                    last = Some(e);
+                    continue;
+                }
+            };
+            match self.read_back(file, seq, text, history) {
+                Ok(()) => {
+                    // Новый снимок становится буфером: вытесняет предыдущий из
+                    // памяти, но в кольце предыдущий остаётся.
+                    self.latest = Some(Stored {
+                        seq,
+                        history: history.to_vec(),
+                    });
+                    self.cursor = None;
+                    return;
+                }
+                Err(e) => last = Some(e),
             }
-            Err(e) => *self.failed.borrow_mut() = Some(e.text()),
         }
+        // Пять попыток не помогли. Что именно — известно: ошибка с файлом,
+        // номером снимка и обеими суммами, а не «не получилось».
+        *self.failed.borrow_mut() = Some(
+            last.map(|e| e.text())
+                .unwrap_or_else(|| format!("snapshot write failed after {WRITE_ATTEMPTS} tries")),
+        );
     }
 
     fn older(&mut self, file: &Path) -> Option<Vec<u8>> {
@@ -135,6 +164,37 @@ impl SnapshotSink for StoreSink {
                 Some(older.history)
             }
         }
+    }
+}
+
+impl StoreSink {
+    /// Прочитать только что записанный снимок и сверить с тем, что писали.
+    ///
+    /// Сверку делает хранилище по своей сумме: если содержимое переписали
+    /// между записью и чтением, вернётся ошибка порчи, и вызывающий решит,
+    /// переписывать или жаловаться.
+    fn read_back(
+        &self,
+        file: &Path,
+        seq: u64,
+        text: &[u8],
+        history: &[u8],
+    ) -> Result<(), crate::api::disk::Error> {
+        let snapshot =
+            self.store
+                .get(file, seq)?
+                .ok_or_else(|| crate::api::disk::Error::NoSnapshot {
+                    file: file.display().to_string(),
+                })?;
+        if snapshot.text != text || snapshot.history != history {
+            return Err(crate::api::disk::Error::Corrupted {
+                file: file.display().to_string(),
+                seq,
+                expected: crate::api::disk::checksum::of_pair(text, history),
+                got: snapshot.checksum,
+            });
+        }
+        Ok(())
     }
 }
 

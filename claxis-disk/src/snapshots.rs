@@ -11,6 +11,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::checksum;
 use crate::error::{Error, Result};
 use crate::path::StorePaths;
 
@@ -25,6 +26,52 @@ pub struct Snapshot {
     pub text: Vec<u8>,
     /// История правок, чтобы отменять было что после перезапуска.
     pub history: Vec<u8>,
+    /// Сумма текста и истории, какая была при записи.
+    ///
+    /// По ней видно, что содержимое переписали извне: то, что мы писали,
+    /// всегда сходится само с собой.
+    pub checksum: u64,
+}
+
+/// Сырая строка базы: номер, текст, история, сумма.
+///
+/// Суммы может не быть: строка записана до её появления. `None` — это «нечем
+/// сверять», а не ноль.
+type Raw = (i64, Vec<u8>, Vec<u8>, Option<i64>);
+
+/// Прочитать сырую строку.
+fn raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<Raw> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+/// Собрать снапшот и сверить сумму.
+///
+/// Сумма сходится всегда, если содержимое не трогали. Не сходится — значит
+/// запись испортили извне, и это надо назвать, а не отдать текст как есть:
+/// иначе человек увидит битый документ и не поймёт, откуда он.
+fn checked(file: &str, (seq, text, history, checksum): Raw) -> Result<Snapshot> {
+    let expected = checksum::of_pair(&text, &history);
+    let got = checksum.unwrap_or_default() as u64;
+    if expected != got {
+        return Err(Error::Corrupted {
+            file: file.to_string(),
+            seq: seq as u64,
+            expected,
+            got,
+        });
+    }
+    Ok(snapshot(file, seq as u64, text, history, expected))
+}
+
+/// Собрать снапшот из разобранной строки.
+fn snapshot(file: &str, seq: u64, text: Vec<u8>, history: Vec<u8>, checksum: u64) -> Snapshot {
+    Snapshot {
+        file: file.to_string(),
+        seq,
+        text,
+        history,
+        checksum,
+    }
 }
 
 /// Хранилище снапшотов.
@@ -99,22 +146,61 @@ impl SnapshotStore {
         self.conn
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS snapshots (
-                    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file    TEXT NOT NULL,
-                    text    BLOB NOT NULL,
-                    history BLOB NOT NULL DEFAULT x''
+                    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file     TEXT NOT NULL,
+                    text     BLOB NOT NULL,
+                    history  BLOB NOT NULL DEFAULT x'',
+                    checksum INTEGER
                  );
 
                  CREATE INDEX IF NOT EXISTS snapshots_file ON snapshots(file, seq);
                  CREATE TABLE IF NOT EXISTS last_good (
                     name TEXT PRIMARY KEY,
                     body TEXT NOT NULL
-                 );",
+                 );
+",
             )
             .map_err(query)?;
         // Колонка истории появляется после таблицы: на старой базе таблица уже
         // есть, на новой её только что создали, и `ALTER` добавит недостающее.
-        self.add_history_column()
+        self.add_history_column()?;
+        // Сумма появилась позже истории: у пользователя база уже лежит, и
+        // терять её из-за нового столбца нельзя.
+        self.add_checksum_column()
+    }
+
+    /// Добавить колонку с суммой в базу, созданную до её появления.
+    fn add_checksum_column(&self) -> Result<()> {
+        let sql = "ALTER TABLE snapshots ADD COLUMN checksum INTEGER";
+        match self.conn.execute_batch(sql) {
+            Ok(()) => Ok(()),
+            // Колонка уже есть: база не старше миграции, всё в порядке.
+            Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+            Err(e) => Err(Error::Query {
+                reason: e.to_string(),
+            }),
+        }
+    }
+
+    /// Взять снимок из строки базы.
+    ///
+    /// Строка, записанная до появления суммы, суммы не имеет: сверить её
+    /// нечем, и называть её порчей — враньё. Такая принимается как есть, а
+    /// сумма дописывается, чтобы дальше она уже проверялась.
+    fn take(&self, file: &str, row: Raw) -> Result<Snapshot> {
+        if row.3.is_some() {
+            return checked(file, row);
+        }
+        let (seq, text, history, _) = row;
+        let sum = checksum::of_pair(&text, &history);
+        let taken = snapshot(file, seq as u64, text, history, sum);
+        self.conn
+            .execute(
+                "UPDATE snapshots SET checksum = ?1 WHERE seq = ?2",
+                params![taken.checksum as i64, taken.seq as i64],
+            )
+            .map_err(query)?;
+        Ok(taken)
     }
 
     /// Сохранить последний корректный конфиг.
@@ -161,10 +247,11 @@ impl SnapshotStore {
     /// сделано ничего.
     pub fn put(&mut self, file: &Path, text: &[u8], history: &[u8]) -> Result<u64> {
         let file = file.display().to_string();
+        let checksum = checksum::of_pair(text, history);
         let tx = self.conn.transaction().map_err(query)?;
         tx.execute(
-            "INSERT INTO snapshots (file, text, history) VALUES (?1, ?2, ?3)",
-            params![file, text, history],
+            "INSERT INTO snapshots (file, text, history, checksum) VALUES (?1, ?2, ?3, ?4)",
+            params![file, text, history, checksum as i64],
         )
         .map_err(query)?;
 
@@ -215,41 +302,32 @@ impl SnapshotStore {
     /// Самый свежий снапшот файла.
     pub fn latest(&self, file: &Path) -> Result<Option<Snapshot>> {
         let file = file.display().to_string();
-        self.conn
+        let found = self
+            .conn
             .query_row(
-                "SELECT seq, text, history FROM snapshots WHERE file = ?1 ORDER BY seq DESC LIMIT 1",
+                "SELECT seq, text, history, checksum FROM snapshots
+                 WHERE file = ?1 ORDER BY seq DESC LIMIT 1",
                 params![file],
-                |r| {
-                    Ok(Snapshot {
-                        file: file.clone(),
-                        seq: r.get::<_, i64>(0)? as u64,
-                        text: r.get(1)?,
-                        history: r.get(2)?,
-                    })
-                },
+                raw,
             )
             .optional()
-            .map_err(query)
+            .map_err(query)?;
+        found.map(|row| self.take(&file, row)).transpose()
     }
 
     /// Снапшот по номеру.
     pub fn get(&self, file: &Path, seq: u64) -> Result<Option<Snapshot>> {
         let file = file.display().to_string();
-        self.conn
+        let found = self
+            .conn
             .query_row(
-                "SELECT seq, text, history FROM snapshots WHERE file = ?1 AND seq = ?2",
+                "SELECT seq, text, history, checksum FROM snapshots WHERE file = ?1 AND seq = ?2",
                 params![file, seq as i64],
-                |r| {
-                    Ok(Snapshot {
-                        file: file.clone(),
-                        seq: r.get::<_, i64>(0)? as u64,
-                        text: r.get(1)?,
-                        history: r.get(2)?,
-                    })
-                },
+                raw,
             )
             .optional()
-            .map_err(query)
+            .map_err(query)?;
+        found.map(|row| self.take(&file, row)).transpose()
     }
 
     /// Снимок старее указанного номера — тот, который подставляется в память,
@@ -260,23 +338,18 @@ impl SnapshotStore {
     /// новый снимок и кольцо переполнено.
     pub fn older(&self, file: &Path, seq: u64) -> Result<Option<Snapshot>> {
         let file = file.display().to_string();
-        self.conn
+        let found = self
+            .conn
             .query_row(
-                "SELECT seq, text, history FROM snapshots
+                "SELECT seq, text, history, checksum FROM snapshots
                  WHERE file = ?1 AND seq < ?2
                  ORDER BY seq DESC LIMIT 1",
                 params![file, seq as i64],
-                |r| {
-                    Ok(Snapshot {
-                        file: file.clone(),
-                        seq: r.get::<_, i64>(0)? as u64,
-                        text: r.get(1)?,
-                        history: r.get(2)?,
-                    })
-                },
+                raw,
             )
             .optional()
-            .map_err(query)
+            .map_err(query)?;
+        found.map(|row| self.take(&file, row)).transpose()
     }
 
     /// Все снапшоты файла, свежие первыми.
@@ -284,23 +357,18 @@ impl SnapshotStore {
         let file = file.display().to_string();
         let mut stmt = self
             .conn
-            .prepare("SELECT seq, text, history FROM snapshots WHERE file = ?1 ORDER BY seq DESC")
+            .prepare("SELECT seq, text, history, checksum FROM snapshots WHERE file = ?1 ORDER BY seq DESC")
             .map_err(query)?;
-        let rows = stmt
-            .query_map(params![file], |r| {
-                Ok(Snapshot {
-                    file: file.clone(),
-                    seq: r.get::<_, i64>(0)? as u64,
-                    text: r.get(1)?,
-                    history: r.get(2)?,
-                })
-            })
-            .map_err(query)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(|e| Error::Query {
+        let mut rows = stmt
+            .query_map(params![file], raw)
+            .map_err(query)?
+            .collect::<std::result::Result<Vec<Raw>, _>>()
+            .map_err(|e| Error::Query {
                 reason: e.to_string(),
-            })?);
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows.drain(..) {
+            out.push(self.take(&file, row)?);
         }
         Ok(out)
     }
@@ -814,6 +882,118 @@ mod tests {
             store.latest(&target).unwrap().unwrap().text,
             "третий".as_bytes()
         );
+    }
+
+    #[test]
+    fn a_snapshot_written_by_us_always_matches_its_checksum() {
+        let temp = Temp::new("checksum-ok");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store
+            .put(&target, "текст".as_bytes(), "история".as_bytes())
+            .unwrap();
+
+        let snapshot = store.latest(&target).unwrap().unwrap();
+        assert_eq!(
+            snapshot.checksum,
+            checksum::of_pair("текст".as_bytes(), "история".as_bytes())
+        );
+    }
+
+    #[test]
+    fn a_snapshot_changed_outside_is_reported_as_corruption() {
+        // Ровно то, ради чего сумма и нужна: переписали содержимое в базе
+        // извне — это не «плохо записалось», это чужое вместо нашего.
+        let temp = Temp::new("checksum-bad");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store
+            .put(&target, "текст".as_bytes(), "история".as_bytes())
+            .unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE snapshots SET text = ?1",
+                params!["подмена".as_bytes()],
+            )
+            .unwrap();
+
+        let error = store.latest(&target).unwrap_err();
+        assert!(
+            matches!(&error, Error::Corrupted { file, seq, .. }
+                if file == &target.display().to_string() && *seq == 1),
+            "ожидалась порча, получили {error:?}"
+        );
+        assert!(
+            error.text().contains("changed outside"),
+            "в сообщении сказано, что это порча извне: {error}"
+        );
+    }
+
+    #[test]
+    fn corruption_is_caught_on_every_read_not_just_on_the_newest() {
+        let temp = Temp::new("checksum-older");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store.put(&target, "первый".as_bytes(), b"").unwrap();
+        store.put(&target, "второй".as_bytes(), b"").unwrap();
+        let older = store.older(&target, 2).unwrap().unwrap();
+        assert_eq!(older.text, "первый".as_bytes());
+
+        store
+            .conn
+            .execute(
+                "UPDATE snapshots SET history = ?1 WHERE seq = ?2",
+                params!["подмена".as_bytes().to_vec(), older.seq as i64],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.older(&target, 2).unwrap_err(),
+            Error::Corrupted { .. }
+        ));
+        assert!(matches!(
+            store.list(&target).unwrap_err(),
+            Error::Corrupted { .. }
+        ));
+        assert!(matches!(
+            store.get(&target, older.seq).unwrap_err(),
+            Error::Corrupted { .. }
+        ));
+    }
+
+    #[test]
+    fn a_row_without_a_checksum_is_adopted_and_gains_one() {
+        // База, созданная до появления суммы. Сверять нечем, и объявлять её
+        // порчей — враньё: принимаем как есть и дописываем сумму.
+        let temp = Temp::new("checksum-absent");
+        let target = file("старый.rs");
+        let store = temp.store(3);
+        store
+            .conn
+            .execute(
+                "INSERT INTO snapshots (file, text, checksum) VALUES (?1, ?2, NULL)",
+                params![target.display().to_string(), "давний текст".as_bytes()],
+            )
+            .unwrap();
+
+        let snapshot = store.latest(&target).unwrap().unwrap();
+        assert_eq!(snapshot.text, "давний текст".as_bytes());
+        assert!(snapshot.checksum != 0);
+
+        // Сумма дописана: следующее чтение уже сверяет её по-настоящему.
+        store
+            .conn
+            .execute(
+                "UPDATE snapshots SET text = ?1",
+                params!["подмена".as_bytes()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.latest(&target).unwrap_err(),
+            Error::Corrupted { .. }
+        ));
     }
 
     #[test]

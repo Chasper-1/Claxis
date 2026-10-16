@@ -3,7 +3,7 @@
 //! Крейт не знает языка: он отдаёт ошибку со структурными данными, а текст
 //! собирает каталог. По умолчанию — английский.
 
-use claxis_text::substitute;
+use claxis_text::{group_digits, substitute};
 
 /// Каталог сообщений об ошибках диска.
 ///
@@ -27,6 +27,9 @@ pub trait Messages {
     fn query_failed(&self, reason: &str) -> String;
     /// Снапшота для файла нет.
     fn no_snapshot(&self, file: &str) -> String;
+
+    /// Снапшот испорчен извне: `{file}`, `{seq}`, `{expected}`, `{got}`.
+    fn corrupted(&self, file: &str, seq: u64, expected: u64, got: u64) -> String;
 }
 
 /// Английские сообщения — язык по умолчанию.
@@ -96,6 +99,18 @@ impl Messages for En {
             &[("file", file.to_string())],
         )
     }
+
+    fn corrupted(&self, file: &str, seq: u64, expected: u64, got: u64) -> String {
+        substitute(
+            "snapshot {seq} of {file} was changed outside the editor: checksum is {got}, expected {expected}",
+            &[
+                ("file", file.to_string()),
+                ("seq", group_digits(seq)),
+                ("expected", group_digits(expected)),
+                ("got", group_digits(got)),
+            ],
+        )
+    }
 }
 
 /// Все сообщения крейте с примерами значений.
@@ -132,5 +147,14 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ),
         ("query_failed", m.query_failed("database is locked")),
         ("no_snapshot", m.no_snapshot("/home/u/project/src/main.rs")),
+        (
+            "corrupted",
+            m.corrupted(
+                "/home/u/project/src/main.rs",
+                1_024,
+                0x1a2b_3c4d_5e6f_7788,
+                0,
+            ),
+        ),
     ]
 }

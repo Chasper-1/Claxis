@@ -4,6 +4,7 @@
 //! функции. Реализация лежит в самом крейте, а связь с ручками других
 //! крейтов делает маршрутизатор `crate::router`.
 
+pub use claxis_disk::checksum;
 pub use claxis_disk::defaults::{CACHE_DIR, KEEP, PERSIST};
 pub use claxis_disk::messages;
 pub use claxis_disk::watch::{BlindSpot, Changed};

@@ -16,6 +16,7 @@
 //! Раскладку на диске крейт не знает. Где лежит конфиг — дело `claxis-config`,
 //! сюда приносят готовый путь.
 
+pub mod checksum;
 pub mod defaults;
 pub mod error;
 pub mod file;
@@ -25,7 +26,7 @@ pub mod snapshots;
 pub mod watch;
 
 pub use error::{Error, Result};
-pub use file::{Fingerprint, create_dir, fingerprint, write_blob, write_text};
+pub use file::{Change, Fingerprint, create_dir, fingerprint, write_blob, write_text};
 pub use messages::{En, Messages};
 pub use path::StorePaths;
 pub use snapshots::{Snapshot, SnapshotStore};

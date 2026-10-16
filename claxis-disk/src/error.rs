@@ -24,7 +24,26 @@ pub enum Error {
     /// Запрос к базе не выполнился: `{reason}`.
     Query { reason: String },
     /// Снапшота для файла нет: `{file}`.
-    NoSnapshot { file: String },
+    NoSnapshot {
+        /// Какой файл.
+        file: String,
+    },
+    /// Снапшот испорчен извне: `{file}`, `{seq}`, `{expected}`, `{got}`.
+    ///
+    /// Отдельная ошибка не ради вежливости: если запись виновата, снимок надо
+    /// переписать, и всё. А если содержимое переписали после нас, перезапись
+    /// бесполезна — она затрёт то, что человек сделал руками, и вот тут уже
+    /// надо сказать человеку.
+    Corrupted {
+        /// Какой файл.
+        file: String,
+        /// Какой снапшот по счёту.
+        seq: u64,
+        /// Какая сумма должна была быть.
+        expected: u64,
+        /// Какая сумма оказалась.
+        got: u64,
+    },
 }
 
 impl Error {
@@ -40,6 +59,12 @@ impl Error {
             Error::Open { path, reason } => messages.open_failed(path, reason),
             Error::Query { reason } => messages.query_failed(reason),
             Error::NoSnapshot { file } => messages.no_snapshot(file),
+            Error::Corrupted {
+                file,
+                seq,
+                expected,
+                got,
+            } => messages.corrupted(file, *seq, *expected, *got),
         }
     }
 
