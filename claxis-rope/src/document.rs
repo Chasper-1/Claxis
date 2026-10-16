@@ -131,12 +131,30 @@ pub enum Kind {
     Replace,
 }
 
-/// Вершина истории: запись плюс родитель и ребёнок.
+/// Самое позднее место буфера, куда смотрит запись: её собственный текст и
+/// вырезанный ею.
+fn record_end(record: &Record) -> u32 {
+    let mut end = record.text_offset().saturating_add(record.len());
+    if let Some((offset, len)) = record.removed() {
+        end = end.max(offset.saturating_add(len));
+    }
+    end
+}
+
+/// Вершина истории: запись, родитель, ребёнок и граница буфера.
 #[derive(Clone, Copy, Debug)]
 struct Version {
     record: Record,
     parent: u32,
     child: u32,
+    /// Самое позднее место буфера, куда заглядывает эта вершина или любая
+    /// выше неё по родителям.
+    ///
+    /// Считается один раз при добавлении вершины, а обходом ветки не
+    /// пересчитывается: иначе граница обрезки буфера стоила бы столько же,
+    /// сколько вся история. Разрез зависит только от записей, и у каждой
+    /// вершины он известен сразу.
+    live: u32,
 }
 
 /// Что пошло не так.
@@ -380,6 +398,7 @@ impl Document {
                 },
                 parent: NIL,
                 child: NIL,
+                live: 0,
             }],
             free: Vec::new(),
             current: 0,
@@ -548,8 +567,7 @@ impl Document {
                 text_offset,
             } => {
                 let len = head - anchor;
-                let restored = self.read_buffer(text_offset, len)?;
-                self.restore(anchor, restored);
+                self.restore(anchor, text_offset, len)?;
             }
             // Отмена замены: вырезать вставленное и вернуть вырезанное.
             Record::Replace {
@@ -563,8 +581,7 @@ impl Document {
                 if removed_len == 0 {
                     return Ok(Some(id));
                 }
-                let restored = self.read_buffer(removed_offset, removed_len)?;
-                self.restore(anchor, restored);
+                self.restore(anchor, removed_offset, removed_len)?;
             }
         }
         Ok(Some(id))
@@ -598,24 +615,25 @@ impl Document {
         self.undo()
     }
 
-    /// Скопировать кусок буфера, начиная со смещения из записи истории.
+    /// Положить копию куска в хвост буфера и вставить её на место.
     ///
-    /// Смещение приходит из блоба, который писал прошлый запуск: доверять ему
-    /// нельзя, а паника из-за битой записи уронила бы редактор вместе с
-    /// несохранённым текстом. Не попали — ошибка, документ остаётся целым.
-    fn read_buffer(&self, offset: u32, len: u32) -> Result<Vec<u8>> {
-        self.bytes
-            .get(offset as usize..offset as usize + len as usize)
-            .map(<[u8]>::to_vec)
-            .ok_or(Error::HistoryOutOfBounds { offset, len })
-    }
-
-    /// Положить кусок в хвост буфера и вставить его на место.
-    fn restore(&mut self, anchor: u32, restored: Vec<u8>) {
-        let len = restored.len() as u32;
+    /// Копия, а не ссылка на прежнее место: запись, чей текст возвращается,
+    /// после отмены уходит в redo-ветку, а redo-ветку следующая правка
+    /// отбрасывает вместе с текстом. Лист, смотрящий на этот текст, пережил бы
+    /// обрезку буфера и прочитал бы чужое.
+    fn restore(&mut self, anchor: u32, from: u32, len: u32) -> Result<()> {
+        let end = from
+            .checked_add(len)
+            .ok_or(Error::HistoryOutOfBounds { offset: from, len })?;
+        let restored = self
+            .bytes
+            .get(from as usize..end as usize)
+            .ok_or(Error::HistoryOutOfBounds { offset: from, len })?
+            .to_vec();
         let start = self.append(&restored);
         let leaf = self.tree.alloc(Node::leaf(start, len));
         self.tree.insert_leaf(anchor, leaf);
+        Ok(())
     }
 
     /// Повторить отменённую правку.
@@ -705,6 +723,9 @@ impl Document {
 
     /// Новая вершина истории от текущей.
     fn push(&mut self, record: Record) {
+        let live = self.versions[self.current as usize]
+            .live
+            .max(record_end(&record));
         let id = match self.free.pop() {
             Some(id) => id,
             None => {
@@ -712,6 +733,7 @@ impl Document {
                     record,
                     parent: NIL,
                     child: NIL,
+                    live,
                 });
                 (self.versions.len() - 1) as u32
             }
@@ -720,6 +742,7 @@ impl Document {
             record,
             parent: self.current,
             child: NIL,
+            live,
         };
         let parent = self.current;
         self.versions[parent as usize].child = id;
@@ -738,11 +761,6 @@ impl Document {
             cursor = version.child;
         }
         self.versions[self.current as usize].child = NIL;
-        // Резать можно только то, на что больше никто не ссылается. На хвост
-        // буфера ссылаются не только отброшенные записи: живые листья дерева и
-        // записи истории на активной ветке. Если хоть один из них смотрит
-        // дальше, резать нельзя — иначе лист останется читать обрезанный
-        // участок и потеряет байты.
         // Резать можно только то, на что больше никто не смотрит. На хвост
         // буфера ссылаются не только отброшенные записи: живые листья дерева и
         // записи истории на активной ветке. Обрезка оставляет начало буфера,
@@ -758,25 +776,19 @@ impl Document {
 
     /// Самое позднее место в буфере, до которого дотягиваются живые ссылки.
     ///
-    /// Это листья дерева и записи истории, которые ещё можно отменить или
-    /// повторить. Всё, что дальше, никому не нужно и только занимает память.
+    /// Три источника. Исходный файл: его лист один и он вечен. Записи живой
+    /// ветки: их текст лежит в буфере, хотя в дереве его уже нет, — без него
+    /// отмена удаления нечем вернуть. Листья дерева: вставленный текст и те
+    /// копии, которые положила отмена.
+    ///
+    /// Записи ветки берутся готовым числом у вершины, а не обходом: иначе
+    /// граница обрезки стоила бы столько же, сколько вся история. Листья
+    /// смотрятся обходом дерева — он идёт только при отброшенной ветке, то
+    /// есть не на каждое нажатие, а на замену ветки на другую.
     fn live_end(&self) -> u32 {
-        let mut end = 0;
-        for leaf in self.tree.leaves_in_order() {
-            end = end.max(leaf.start + leaf.len);
-        }
-        for (id, version) in self.versions.iter().enumerate() {
-            // Отброшенная запись ни на что не смотрит, её текст можно резать.
-            if self.free.contains(&(id as u32)) {
-                continue;
-            }
-            let record = &version.record;
-            end = end.max(record.text_offset() + record.len());
-            if let Some((offset, len)) = record.removed() {
-                end = end.max(offset + len);
-            }
-        }
-        end
+        self.file_len
+            .max(self.versions[self.current as usize].live)
+            .max(self.tree.leaf_end())
     }
 
     /// Сколько записей истории занято.
@@ -1243,6 +1255,100 @@ mod tests {
         assert!(doc.delete(2, 5).is_err());
         assert!(doc.insert(99, b"x").is_err());
         assert_eq!(doc.read(), b"abc");
+    }
+
+    #[test]
+    fn the_leaf_counter_tells_the_truth() {
+        // Счётчик листьев живёт в дереве, а на него смотрят диагностика и
+        // выделение памяти. Разъехаться он может незаметно: листья появляются и
+        // исчезают в полудюжине мест, и забыть уменьшить счётчик в одном из
+        // них ничего не ломает, кроме самого счётчика. Поэтому он и сверяется
+        // здесь с настоящим обходом на смеси правок.
+        let mut doc = d("0123456789");
+        let mut rng = Rng(7);
+        for _ in 0..3000 {
+            let len = doc.len();
+            let pos = rng.below(len.max(1) as usize) as u32;
+            if len > 4 && rng.below(3) == 0 {
+                let _ = doc.delete(pos.min(len - 2), 1 + rng.below(4) as u32);
+            } else if rng.below(5) == 0 {
+                let _ = doc.replace(pos.min(len.saturating_sub(2)), 2, b"q");
+            } else {
+                doc.insert(pos, b"xy").unwrap();
+            }
+            let counted = doc.memory().leaves;
+            let real = doc.leaves().len();
+            assert_eq!(counted, real, "счётчик листьев разошёлся с деревом");
+        }
+    }
+
+    #[test]
+    fn typing_into_the_middle_does_not_double_the_leaves() {
+        // Каждое нажатие разрезает лист, и если склейки нет, на нажатие
+        // остаётся два листа: набор в середину файла раздувает дерево
+        // линейно. Со смежными диапазонами склейка идёт в `concat`, поэтому
+        // нажатие подряд добавляет ровно один лист — столько же, сколько
+        // вставлено байт, и меньше быть не может: текст разбросан по буферу.
+        let mut doc = Document::from_buffer(vec![b'x'; 64 * 1024], 64 * 1024);
+        for _ in 0..1000 {
+            doc.insert(32_000, b"y").unwrap();
+        }
+        // Первое нажатие разрезает лист на три — голова, вставка и хвост, — а
+        // каждое следующее добавляет один: вставленный тект примыкает к
+        // предыдущему в буфере и склеивается с ним.
+        assert_eq!(
+            doc.leaves().len(),
+            1002,
+            "на нажатие должен оставаться один лист"
+        );
+    }
+
+    #[test]
+    fn undoing_everything_puts_the_leaves_back_together() {
+        // Отмена вставки вырезает вставленное, и оставшиеся куски листа
+        // снова смыкаются в буфере. Дерево после полного отката обязано
+        // вернуться к одному листу: иначе отмена не «схлопывает» документ, а
+        // оставляет после себя мусор, который растёт с каждой серией правок.
+        let mut doc = d("0123456789");
+        for _ in 0..200 {
+            doc.insert(0, b"xy").unwrap();
+        }
+        assert!(doc.leaves().len() > 1, "правки должны были порезать лист");
+        while doc.undo().unwrap().is_some() {}
+        assert_eq!(doc.read(), b"0123456789");
+        assert_eq!(doc.leaves().len(), 1, "после отката всё должно слипться");
+    }
+
+    #[test]
+    fn merging_leaves_keeps_the_text_and_the_history() {
+        // Склейка не должна ломать ни текст, ни отмену: запись правки живёт в
+        // байтах и границ листьев не знает, но проверить это надо на живом
+        // документе, где склейка действительно происходит.
+        let mut doc = d("0123456789");
+        doc.insert(5, b"ab").unwrap();
+        doc.delete(0, 3).unwrap();
+        doc.replace(1, 2, b"ZZ").unwrap();
+        let end = doc.read();
+        let leaves_after_edits = doc.leaves().len();
+
+        for _ in 0..3 {
+            doc.undo().unwrap().expect("отменяемо");
+        }
+        assert_eq!(doc.read(), b"0123456789");
+        for _ in 0..3 {
+            doc.redo().unwrap().expect("повторяемо");
+        }
+        assert_eq!(doc.read(), end);
+        assert_eq!(
+            doc.leaves().len(),
+            leaves_after_edits,
+            "повтор сломал листья"
+        );
+
+        // Полный откат после серии правок обязан вернуть исходный текст байт
+        // в байт: буфер мог порезаться при отброшенной ветке.
+        while doc.undo().unwrap().is_some() {}
+        assert_eq!(doc.read(), b"0123456789");
     }
 
     #[test]

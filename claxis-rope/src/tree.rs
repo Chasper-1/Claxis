@@ -52,7 +52,6 @@ impl Tree {
         if len > 0 {
             tree.root = tree.alloc(Node::leaf(start, len));
             tree.len = len;
-            tree.leaves = 1;
         }
         tree
     }
@@ -122,38 +121,50 @@ impl Tree {
     }
 
     /// Взять свободный узел или выделить новый.
+    ///
+    /// Счётчик листьев живёт здесь и в [`Tree::release`] и больше нигде: узел
+    /// появляется и исчезает только через эти две функции, а счётчик,
+    /// который надо помнить в каждом месте отдельно, разъезжается — уже
+    /// разъезжался.
     #[inline]
     pub fn alloc(&mut self, node: Node) -> u32 {
-        if self.free_head != NIL {
+        let leaf = node.is_leaf();
+        let id = if self.free_head != NIL {
             let id = self.free_head;
             self.free_head = self.nodes[id as usize].free_next();
-            self.nodes[id as usize] = node;
-            return id;
-        }
-        let id = self.next_unused;
-        while self.nodes.len() as u32 <= id {
-            self.nodes.push(FREE);
-            self.next_unused += 1;
-        }
+            id
+        } else {
+            let id = self.next_unused;
+            while self.nodes.len() as u32 <= id {
+                self.nodes.push(FREE);
+                self.next_unused += 1;
+            }
+            id
+        };
         self.nodes[id as usize] = node;
+        if leaf {
+            self.leaves += 1;
+        }
         id
     }
 
     /// Вернуть узел в свободные.
     pub fn release(&mut self, id: u32) {
+        if self.nodes[id as usize].is_leaf() {
+            self.leaves -= 1;
+        }
         self.nodes[id as usize] = Node::new(self.free_head & !(1 << 31), 0, 0);
         self.free_head = id;
     }
 
     /// Вернуть поддерево в свободные.
+    #[cfg(test)]
     pub fn release_tree(&mut self, id: u32) {
         if id == NIL {
             return;
         }
         let node = self.nodes[id as usize];
-        if node.is_leaf() {
-            self.leaves -= 1;
-        } else {
+        if !node.is_leaf() {
             let (l, r) = (node.left(), node.right());
             self.release_tree(l);
             self.release_tree(r);
@@ -178,19 +189,32 @@ impl Tree {
         if len > 0 {
             self.root = self.alloc(Node::leaf(start, len));
             self.len = len;
-            self.leaves = 1;
         }
     }
 
     // ── сборка ───────────────────────────────────────────────────────────
 
     /// Склеить два поддерева с балансировкой по высоте.
+    ///
+    /// Соседние листья со смежными диапазонами буфера склеиваются в один: в
+    /// дереве они описывают один кусок текста подряд, а значит и диапазоны
+    /// буфера идут вплотную. Лист — это диапазон буфера, а не ссылка на
+    /// запись, поэтому склейка ничего не ломает: ни текст, ни история не
+    /// хранят границы листьев.
+    ///
+    /// Склеиваются не все соседи, а только те, чьи куски в буфере идут
+    /// вплотную. Разрыв означает, что между ними лежит текст, который
+    /// документ уже не показывает, но отмена его вернёт, — такой лист
+    /// разорван не зря, и место между диапазонами закрывать нельзя.
     pub fn concat(&mut self, left: u32, right: u32) -> u32 {
         if left == NIL {
             return right;
         }
         if right == NIL {
             return left;
+        }
+        if self.joinable(left, right) {
+            return self.join(left, right);
         }
         if self.height_of(left) > self.height_of(right) + 1 {
             let node = self.nodes[left as usize];
@@ -209,9 +233,27 @@ impl Tree {
         }
     }
 
+    /// Идут ли два листа в буфере вплотную друг к другу.
+    fn joinable(&self, left: u32, right: u32) -> bool {
+        let l = self.nodes[left as usize];
+        let r = self.nodes[right as usize];
+        l.is_leaf() && r.is_leaf() && r.start() == l.start().saturating_add(l.leaf_len())
+    }
+
+    /// Склеить два смежных листа в один.
+    ///
+    /// Левый узел переписывается на месте: он уже принадлежит дереву, а
+    /// новый узел только ради удлинения диапазона взял бы слот из пула.
+    fn join(&mut self, left: u32, right: u32) -> u32 {
+        let l = self.nodes[left as usize];
+        let len = l.leaf_len() + self.nodes[right as usize].leaf_len();
+        self.nodes[left as usize] = Node::leaf(l.start(), len);
+        self.release(right);
+        left
+    }
+
     /// Вставить лист `leaf` на позицию `pos` документа.
     pub fn insert_leaf(&mut self, pos: u32, leaf: u32) {
-        self.leaves += 1;
         let len = self.node_len(leaf);
         self.root = self.insert_rec(self.root, 0, pos, leaf);
         self.len += len;
@@ -392,8 +434,9 @@ impl Tree {
 
     /// Разрезать лист `id`: оставить `from..len` и `to..len`, среднее выкинуть.
     ///
-    /// Один узел превращается в два, поэтому листьев становится на один
-    /// больше; исходный слот уходит в свободные.
+    /// Один узел превращается в два, поэтому листьев становится на один больше;
+    /// исходный слот уходит в свободные. Счётчик листьев поправляют `alloc`
+    /// и `release`, здесь он не трогается.
     fn halve(&mut self, id: u32, from: u32, to: u32) -> (u32, u32) {
         let node = self.nodes[id as usize];
         let start_in_buffer = node.start();
@@ -409,7 +452,6 @@ impl Tree {
             NIL
         };
         self.release(id);
-        self.leaves += 1;
         (head, tail)
     }
 
@@ -531,6 +573,29 @@ impl Tree {
         let mut out = Vec::with_capacity(self.leaves);
         self.collect(self.root, &mut out);
         out
+    }
+
+    /// Самое позднее место буфера, куда заглядывает хоть один лист.
+    ///
+    /// За хвостом этого места буфер не читает ни один лист, и обрезать его
+    /// можно по этому месту. Считается обходом дерева, без выделения памяти.
+    pub fn leaf_end(&self) -> u32 {
+        let mut end = 0;
+        self.max_end(self.root, &mut end);
+        end
+    }
+
+    fn max_end(&self, idx: u32, end: &mut u32) {
+        if idx == NIL {
+            return;
+        }
+        let node = self.nodes[idx as usize];
+        if node.is_leaf() {
+            *end = (*end).max(node.start().saturating_add(node.leaf_len()));
+        } else {
+            self.max_end(node.left(), end);
+            self.max_end(node.right(), end);
+        }
     }
 
     fn collect(&self, idx: u32, out: &mut Vec<Leaf>) {
