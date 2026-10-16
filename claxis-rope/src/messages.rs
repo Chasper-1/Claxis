@@ -50,6 +50,10 @@ pub trait Messages {
     /// `{anchor}` и `{head}` — границы диапазона из записи.
     fn invalid_record_range(&self, anchor: u32, head: u32) -> String;
 
+    /// Снимок, который подтянулся из базы для отката дальше, не разобрался:
+    /// `{reason}`.
+    fn older_snapshot_broken(&self, reason: &str) -> String;
+
     /// В переводе встретилось имя, которого нет среди известных.
     ///
     /// `{got}` — что пришло, `{expected}` — какие имена допустимы.
@@ -166,6 +170,13 @@ impl Messages for En {
         )
     }
 
+    fn older_snapshot_broken(&self, reason: &str) -> String {
+        substitute(
+            "the older snapshot cannot be read: {reason}; undo stops here",
+            &[("reason", reason.to_string())],
+        )
+    }
+
     fn bad_placeholder(&self, got: &str, expected: &[&str]) -> String {
         substitute(
             "unknown placeholder {{{got}}}: expected one of {expected}",
@@ -197,6 +208,10 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ("unknown_record_kind", m.unknown_record_kind(9)),
         ("history_out_of_bounds", m.history_out_of_bounds(100, 150)),
         ("invalid_record_range", m.invalid_record_range(90, 10)),
+        (
+            "older_snapshot_broken",
+            m.older_snapshot_broken("not a rope history blob"),
+        ),
         (
             "bad_placeholder",
             m.bad_placeholder("capasity", &["capacity", "depth"]),

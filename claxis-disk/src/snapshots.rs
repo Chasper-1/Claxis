@@ -252,6 +252,33 @@ impl SnapshotStore {
             .map_err(query)
     }
 
+    /// Снимок старее указанного номера — тот, который подставляется в память,
+    /// когда откат дошёл до границы.
+    ///
+    /// Снапшот из базы **не удаляется**: он уже записан и лежит на месте,
+    /// отсюда он просто читается. Удаляет кольцо, и только когда приходит
+    /// новый снимок и кольцо переполнено.
+    pub fn older(&self, file: &Path, seq: u64) -> Result<Option<Snapshot>> {
+        let file = file.display().to_string();
+        self.conn
+            .query_row(
+                "SELECT seq, text, history FROM snapshots
+                 WHERE file = ?1 AND seq < ?2
+                 ORDER BY seq DESC LIMIT 1",
+                params![file, seq as i64],
+                |r| {
+                    Ok(Snapshot {
+                        file: file.clone(),
+                        seq: r.get::<_, i64>(0)? as u64,
+                        text: r.get(1)?,
+                        history: r.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(query)
+    }
+
     /// Все снапшоты файла, свежие первыми.
     pub fn list(&self, file: &Path) -> Result<Vec<Snapshot>> {
         let file = file.display().to_string();
@@ -499,6 +526,54 @@ mod tests {
         // сохраняется целиком, а не до первого нуля.
         let zeros = (0..500_000u32).filter(|i| i % 251 == 0).count();
         assert_eq!(snapshot.text.iter().filter(|&&b| b == 0).count(), zeros);
+    }
+
+    #[test]
+    fn older_walks_backwards_without_removing_anything() {
+        // Откат тянет снимки из базы по одному назад. Читать их надо, не
+        // стирая: пока в кольцо не пришёл новый, старые лежат на месте.
+        let temp = Temp::new("older");
+        let target = file("a.rs");
+        let mut store = temp.store(5);
+        for i in 0..4 {
+            store
+                .put(&target, format!("снимок {i}").as_bytes(), b"")
+                .unwrap();
+        }
+
+        let newest = store.latest(&target).unwrap().unwrap();
+        let third = store
+            .older(&target, newest.seq)
+            .unwrap()
+            .expect("есть предыдущий");
+        let second = store.older(&target, third.seq).unwrap().expect("есть и он");
+        let first = store.older(&target, second.seq).unwrap().expect("и первый");
+        assert!(
+            store.older(&target, first.seq).unwrap().is_none(),
+            "раньше первого некуда идти"
+        );
+
+        assert_eq!(third.text, "снимок 2".as_bytes());
+        assert_eq!(second.text, "снимок 1".as_bytes());
+        assert_eq!(first.text, "снимок 0".as_bytes());
+
+        // И все они на месте: чтение ничего не удалило.
+        assert_eq!(store.count(&target).unwrap(), 4);
+    }
+
+    #[test]
+    fn older_of_an_unknown_number_returns_the_newest_that_is_left() {
+        // Номера может не быть в базе — например, после переоткрытия. Откат всё
+        // равно должен идти, а не упираться в несуществующий номер.
+        let temp = Temp::new("older-unknown");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store.put(&target, "единственный".as_bytes(), b"").unwrap();
+        assert_eq!(
+            store.older(&target, 999).unwrap().unwrap().text,
+            "единственный".as_bytes()
+        );
+        assert!(store.older(&file("нет-такого.rs"), 999).unwrap().is_none());
     }
 
     #[test]

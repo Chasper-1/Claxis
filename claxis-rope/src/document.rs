@@ -140,7 +140,7 @@ struct Version {
 }
 
 /// Что пошло не так.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Error {
     /// Диапазон вышел за пределы документа.
     OutOfBounds { anchor: u32, len: u32, doc_len: u32 },
@@ -184,6 +184,14 @@ pub enum Error {
         /// Куда диапазон.
         head: u32,
     },
+    /// Снимок, который подтянулся из базы для отката дальше, не разобрался.
+    ///
+    /// Откат на этом заканчивается: продолжать нечего, а молча остановиться
+    /// значит выглядеть так, будто отменять больше нечего.
+    OlderSnapshotBroken {
+        /// Что с блобом.
+        reason: String,
+    },
 }
 
 impl Error {
@@ -210,6 +218,7 @@ impl Error {
             Error::InvalidRecordRange { anchor, head } => {
                 messages.invalid_record_range(*anchor, *head)
             }
+            Error::OlderSnapshotBroken { reason } => messages.older_snapshot_broken(reason),
         }
     }
 
@@ -276,6 +285,18 @@ pub trait SnapshotSink: std::fmt::Debug {
     /// Ошибка не возвращается: потеря кеша не должна стоить пользователю
     /// работы.
     fn accept(&mut self, path: &std::path::Path, document: &[u8], history: &[u8]);
+
+    /// Блок истории снимка старее того, на котором история в памяти закончилась.
+    ///
+    /// Вызывается, когда отмена дошла до конца памяти: в ней лежит всего один
+    /// снимок, а откатиться надо дальше. Приёмник отдаёт следующий и держит
+    /// его в памяти вместо прежнего — так следующая граница не читает диск.
+    ///
+    /// `None`, когда идти дальше некуда: снимков больше нет.
+    fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
+        let _ = path;
+        None
+    }
 }
 
 /// Приёмник, который ничего не делает.
@@ -304,6 +325,14 @@ pub struct Document {
     sink: Box<dyn SnapshotSink>,
     file: Option<PathBuf>,
     snapshots: u64,
+    /// Сколько раз документ схлопывался в базу после сохранения.
+    compacts: u64,
+    /// Сколько раз откат переходил через границу памяти.
+    ///
+    /// Переход означает, что текст сменился целиком: документ взят из
+    /// снимка. Всё, что строилось по тексту по частям — карта строк, например,
+    /// — после такого надо собирать заново, а не править дельтой.
+    crossings: u64,
 }
 
 impl Document {
@@ -358,6 +387,8 @@ impl Document {
             sink: Box::new(NullSink),
             file: None,
             snapshots: 0,
+            compacts: 0,
+            crossings: 0,
         }
     }
 
@@ -487,9 +518,19 @@ impl Document {
     }
 
     /// Отменить одну правку обратной операцией.
+    ///
+    /// Отмена не заканчивается там, где кончилась память: дойдя до конца,
+    /// документ подтягивает из приёмника снимок старее и продолжает откат с
+    /// него. В памяти лежит всего один снимок, поэтому переход за границу
+    /// читает диск — но он происходит один раз на снимок, а не на правку.
     pub fn undo(&mut self) -> Result<Option<u32>> {
         // Вершина 0 — корень, до первой правки. Отменять нечего, а её
         // `parent` тоже ноль, поэтому смотрим на саму вершину.
+        if self.current == NIL
+            && let Some(step) = self.step_over_the_boundary()?
+        {
+            return Ok(Some(step));
+        }
         let id = self.current;
         if id == NIL {
             return Ok(None);
@@ -527,6 +568,34 @@ impl Document {
             }
         }
         Ok(Some(id))
+    }
+
+    /// Перейти за границу памяти: взять снимок старее и отменить в нём одну
+    /// правку.
+    ///
+    /// Снимок приходит целиком — с текстом и с историей, — поэтому документ
+    /// просто восстанавливается целиком. Дальше откат идёт по его истории, а он
+    /// в приёмнике остаётся: следующая граница не читает диск заново.
+    fn step_over_the_boundary(&mut self) -> Result<Option<u32>> {
+        let Some(file) = self.file.clone() else {
+            return Ok(None);
+        };
+        let Some(history) = self.sink.older(&file) else {
+            return Ok(None);
+        };
+        let snapshot = crate::history::History::decode(&history)
+            .and_then(|h| h.restore())
+            .map_err(|e| Error::OlderSnapshotBroken { reason: e.text() })?;
+        let sink = std::mem::replace(&mut self.sink, Box::new(NullSink));
+        let file = self.file.clone();
+        let crossings = self.crossings;
+        *self = snapshot;
+        // Приёмник и путь переживают смену документа: они принадлежат файлу,
+        // а не состоянию. Без них следующая граница была бы последней.
+        self.sink = sink;
+        self.file = file;
+        self.crossings = crossings + 1;
+        self.undo()
     }
 
     /// Скопировать кусок буфера, начиная со смещения из записи истории.
@@ -831,10 +900,32 @@ impl Document {
 
     // ── снапшот ──────────────────────────────────────────────────────────
 
-    /// Снять снапшот: текст и история уезжают, буфер встаёт на место файла.
+    /// Снять снапшот: текст и вся история уезжают, память встаёт на место снимка.
+    ///
+    /// В памяти остаётся **один** снимок — тот, что снят последним, — и он же
+    /// лежит в кольце на диске. Откат доходит до него по памяти, а уйти дальше
+    /// приёмник отдаёт из базы следующий: в базе он уже есть, его читают, а не
+    /// забирают.
     pub fn snapshot(&mut self) {
         let document = self.read();
         let history = crate::history::History::capture(self);
+        self.snapshots += 1;
+        let Some(file) = self.file.clone() else {
+            // Снимку некуда уйти, значит он не сделан. Схлопывать память
+            // тогда нельзя: история нигде не лежит и пропала бы вместе с
+            // возможностью отменить.
+            return;
+        };
+        self.sink.accept(&file, &document, history.as_bytes());
+        self.compact();
+    }
+
+    /// Схлопнуть документ в одну базу и обрезать историю в памяти.
+    ///
+    /// Память не должна расти вместе с правками, поэтому после снимка
+    /// история обрезается, а то, что было до неё, лежит в снимке.
+    fn compact(&mut self) {
+        let document = self.read();
         self.bytes = document;
         self.file_len = self.bytes.len() as u32;
         self.tree.collapse_to(0, self.file_len);
@@ -848,15 +939,25 @@ impl Document {
         self.versions[0].parent = NIL;
         self.versions[0].child = NIL;
         self.current = 0;
-        self.snapshots += 1;
-        if let Some(file) = self.file.clone() {
-            self.sink.accept(&file, &self.bytes, history.as_bytes());
-        }
+        self.compacts += 1;
     }
 
     /// Сколько раз брался снапшот.
     pub fn snapshots_taken(&self) -> u64 {
         self.snapshots
+    }
+
+    /// Сколько раз документ схлопывался после сохранения.
+    pub fn compacts_taken(&self) -> u64 {
+        self.compacts
+    }
+
+    /// Сколько раз откат переходил через границу памяти.
+    ///
+    /// Число растёт, когда текст сменился целиком: значит, всё построенное по
+    /// тексту по частям после этого уже не годится.
+    pub fn crossings(&self) -> u64 {
+        self.crossings
     }
 
     // ── диагностика ──────────────────────────────────────────────────────
@@ -916,6 +1017,90 @@ mod tests {
     //! обычная строка, и любое расхождение означает битый документ.
 
     use super::*;
+
+    /// Кольцо снимков в памяти: пишется всё, отдаётся по убыванию.
+    ///
+    /// Так же устроено кольцо на диске, только без второй копии под рукой.
+    #[derive(Debug, Default)]
+    struct Ring {
+        written: Vec<(Vec<u8>, Vec<u8>)>,
+        served: usize,
+    }
+
+    /// Приёмник, умеющий делиться кольцом с тестом: приёмник уезжает внутрь
+    /// документа, а кольцо нужно и там, и снаружи.
+    #[derive(Debug, Clone)]
+    struct Share(std::rc::Rc<std::cell::RefCell<Ring>>);
+
+    impl SnapshotSink for Share {
+        fn accept(&mut self, path: &std::path::Path, text: &[u8], history: &[u8]) {
+            self.0
+                .borrow_mut()
+                .written
+                .push((text.to_vec(), history.to_vec()));
+            let _ = path;
+        }
+
+        fn older(&mut self, _path: &std::path::Path) -> Option<Vec<u8>> {
+            let ring = &mut *self.0.borrow_mut();
+            // Снимки лежат по убыванию: последний, предпоследний, и так
+            // далее. В базе они остаются — отсюда просто читаются.
+            let at = ring.written.len().checked_sub(ring.served + 1)?;
+            ring.served += 1;
+            ring.written.get(at).map(|(_, history)| history.clone())
+        }
+    }
+
+    #[test]
+    fn undo_crosses_the_memory_boundary_into_the_ring() {
+        // Три снимка, между ними по одной правке. В памяти после каждого
+        // снимка пусто, но откат идёт дальше по кольцу — и не должен кончаться
+        // на границе.
+        let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
+        let mut doc = Document::new(b"abc");
+        doc.set_sink(
+            std::path::PathBuf::from("/tmp/d.txt"),
+            Box::new(Share(std::rc::Rc::clone(&ring))),
+        );
+        for _ in 0..3 {
+            doc.insert(doc.len(), b"x").unwrap();
+            doc.snapshot();
+        }
+        assert_eq!(ring.borrow().written.len(), 3, "все три в кольце");
+        assert_eq!(doc.path().len(), 0, "в памяти пусто");
+
+        doc.undo().unwrap().expect("откат за границу памяти");
+        assert_eq!(doc.read(), b"abcxx");
+        doc.undo().unwrap().expect("и следующий снимок");
+        assert_eq!(doc.read(), b"abcx");
+        doc.undo().unwrap().expect("и третий");
+        assert_eq!(doc.read(), b"abc");
+        assert!(doc.undo().unwrap().is_none(), "дальше снимков нет");
+    }
+
+    #[test]
+    fn an_undo_that_crosses_the_boundary_stays_in_memory() {
+        // После перехода через границу отказ должен продолжать работать
+        // в том же сеансе: границ сколько угодно, и каждая не конец света.
+        let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
+        let mut doc = Document::new(b"");
+        doc.set_sink(
+            std::path::PathBuf::from("/tmp/d.txt"),
+            Box::new(Share(std::rc::Rc::clone(&ring))),
+        );
+        for i in 0..4u32 {
+            doc.insert(doc.len(), b"x").unwrap();
+            doc.snapshot();
+            assert_eq!(doc.read(), "x".repeat(i as usize + 1).into_bytes());
+        }
+
+        for i in (0..4u32).rev() {
+            doc.undo().unwrap().expect("откат идёт");
+            assert_eq!(doc.read(), "x".repeat(i as usize).into_bytes());
+        }
+        assert!(doc.undo().unwrap().is_none());
+    }
+
     use crate::history;
 
     fn d(text: &str) -> Document {
@@ -1103,23 +1288,70 @@ mod tests {
     }
 
     #[test]
-    fn history_never_snapshots_on_its_own() {
-        // Снапшот снимает время, а не число правок: документ сам ничего не решает
-        // и ждёт прямой просьбы.
+    fn a_snapshot_keeps_only_the_newest_edit_in_memory() {
+        // Снапшот схлопывает память: всё, что было до него, уезжает в кольцо,
+        // а в памяти остаётся ровно один снимок. Откат доходит до него без
+        // диска, дальше — приёмник отдаёт следующий из базы.
         let mut doc = Document::with_depth(b"abc", 4).unwrap();
         doc.set_sink(std::path::PathBuf::from("/tmp/d.txt"), Box::new(NullSink));
         for i in 0..100 {
             doc.insert(i as u32, b"x").unwrap();
         }
-        assert_eq!(doc.snapshots_taken(), 0, "сто правок снапшота не заслужили");
         assert_eq!(doc.path().len(), 100, "история росла вместе с правками");
 
         doc.snapshot();
         assert_eq!(doc.snapshots_taken(), 1, "по прямой просьбе снимается");
-        assert!(
-            doc.path().is_empty(),
-            "после снапшота история начинается заново"
-        );
+        assert_eq!(doc.path().len(), 0, "в памяти один снимок и ничего");
+        assert_eq!(doc.read().len(), 103, "текст на месте");
+    }
+
+    #[test]
+    fn compacting_cuts_the_history_on_purpose() {
+        // Схлопывание — отдельная операция после сохранения файла. Вот тут
+        // история обрезается, и это осознанно.
+        let mut doc = Document::new(b"abc");
+        doc.insert(3, b"XY").unwrap();
+        assert_eq!(doc.path().len(), 1);
+
+        doc.compact();
+        assert_eq!(doc.compacts_taken(), 1);
+        assert_eq!(doc.path().len(), 0, "после схлопывания история пуста");
+        assert_eq!(doc.read(), b"abcXY", "текст при этом цел");
+        assert!(doc.undo().unwrap().is_none(), "отменять больше нечего");
+
+        // И документ продолжает работать.
+        doc.insert(5, b"Z").unwrap();
+        assert_eq!(doc.read(), b"abcXYZ");
+    }
+
+    #[test]
+    fn a_snapshot_leaves_undo_working_after_it() {
+        // Главное про память: отмена после снимка живая. Дальше по границу
+        // уходит приёмник, а не обрыв цепочки.
+        let mut doc = Document::new(b"abc");
+        doc.set_sink(std::path::PathBuf::from("/tmp/d.txt"), Box::new(NullSink));
+        doc.insert(3, b"XY").unwrap();
+        doc.snapshot();
+
+        doc.insert(5, b"Z").unwrap();
+        assert_eq!(doc.read(), b"abcXYZ");
+        doc.undo().unwrap().expect("правка после снимка отменяется");
+        assert_eq!(doc.read(), b"abcXY");
+    }
+
+    #[test]
+    fn the_newest_snapshot_replaces_the_previous_one_in_memory() {
+        // В памяти снимок один: новый вытесняет старый, но старый остаётся в
+        // кольце. Откат за границу идёт по ним в порядке убывания.
+        let mut doc = Document::new(b"abc");
+        doc.set_sink(std::path::PathBuf::from("/tmp/d.txt"), Box::new(NullSink));
+        for _ in 0..5 {
+            doc.insert(doc.len(), b"x").unwrap();
+            doc.snapshot();
+        }
+        assert_eq!(doc.snapshots_taken(), 5);
+        assert_eq!(doc.path().len(), 0, "в памяти один снимок, не пять");
+        assert_eq!(doc.read(), b"abcxxxxx");
     }
 
     #[test]

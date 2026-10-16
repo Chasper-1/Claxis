@@ -63,7 +63,7 @@ impl fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-/// Приёмник снапшота, пишущий в хранилище.
+/// Приёмник снапшота: кольцо на диске и один снимок в памяти.
 ///
 /// Это тот самый стык: документ отдаёт текст и историю, дальше они уходят в
 /// sqlite байтами, в том формате, в котором их собрал rope.
@@ -77,14 +77,57 @@ struct StoreSink {
     /// кладётся в общую ячейку, документ забирает её после снятия снапшота и
     /// говорит о ней пользователю. Молчаливая потеря работы хуже всего.
     failed: Rc<RefCell<Option<String>>>,
+    /// Снимок, на котором сейчас стоит документ: буфер отката в памяти.
+    ///
+    /// Он же лежит в кольце, но в памяти хранится один — чтобы первая граница
+    /// отката не читала диск. Дальше идут снимки из базы.
+    latest: Option<Stored>,
+    /// Номер, с которого идти в базу: пока не начали, отдаём буфер из памяти.
+    cursor: Option<u64>,
+}
+
+/// Снимок в памяти приёмника.
+#[derive(Debug)]
+struct Stored {
+    /// Номер в кольце: по нему ищем следующий, более старый.
+    seq: u64,
+    history: Vec<u8>,
 }
 
 impl SnapshotSink for StoreSink {
     fn accept(&mut self, file: &Path, text: &[u8], history: &[u8]) {
         // История идёт вместе с текстом: без неё после перезапуска отменять
         // было бы нечего, то есть снапшот сохранил бы половину работы.
-        if let Err(e) = self.store.put(file, text, history) {
-            *self.failed.borrow_mut() = Some(e.text());
+        match self.store.put(file, text, history) {
+            Ok(seq) => {
+                // Новый снимок становится буфером: вытесняет предыдущий из
+                // памяти, но в кольце предыдущий остаётся.
+                self.latest = Some(Stored {
+                    seq,
+                    history: history.to_vec(),
+                });
+                self.cursor = None;
+            }
+            Err(e) => *self.failed.borrow_mut() = Some(e.text()),
+        }
+    }
+
+    fn older(&mut self, file: &Path) -> Option<Vec<u8>> {
+        match self.cursor {
+            // Первая граница отката: документ стоит на последнем снимке, его
+            // история уже в памяти — диск не трогаем.
+            None => {
+                let buffer = self.latest.as_ref()?;
+                self.cursor = Some(buffer.seq);
+                Some(buffer.history.clone())
+            }
+            // Дальше идём по кольцу назад. В базе снимки остаются, их оттуда
+            // просто читают; убирает их кольцо, и только когда придёт новый.
+            Some(from) => {
+                let older = self.store.older(file, from).ok().flatten()?;
+                self.cursor = Some(older.seq);
+                Some(older.history)
+            }
         }
     }
 }
@@ -260,10 +303,18 @@ impl Document {
 
     /// Отменить правку. Карта строк едет вместе с текстом.
     pub fn undo(&mut self) -> Result<Option<u32>, RopeError> {
+        let crossings = self.buffer.crossings();
         let path = self.buffer.path();
         let Some(id) = self.buffer.undo()? else {
             return Ok(None);
         };
+        // Переход через границу памяти меняет текст целиком: документ взят из
+        // снимка. Дельта от прежнего состояния тут бессмысленна — карту надо
+        // собрать заново из того, что документ теперь содержит.
+        if self.buffer.crossings() != crossings {
+            self.lines = LineMap::build(&self.buffer.read());
+            return Ok(Some(id));
+        }
         // Запись узнаём по её месту в ветке: отмена убрала последнюю.
         if let Some(record) = path.get(path.len().wrapping_sub(1)) {
             self.undo_line(record);
@@ -366,6 +417,12 @@ impl Document {
     /// десять минут, и снапшот каждые пять минут отдаст память обратно. И
     /// наоборот — сто правок подряд за минуту снапшот не заслужили.
     pub fn snapshot_if_due(&mut self) {
+        // Ноль — это «снимков нет вообще», а не «на каждой правке». Иначе
+        // человек, выключивший интервал, получил бы обратный смысл настройки
+        // и вдвое больше работы на диске, чем просил.
+        if self.interval.is_zero() {
+            return;
+        }
         if self.clock.elapsed().saturating_sub(self.last_snapshot) >= self.interval {
             self.snapshot();
         }
@@ -647,6 +704,8 @@ impl Session {
                 Box::new(StoreSink {
                     store,
                     failed: Rc::clone(&failed),
+                    latest: None,
+                    cursor: None,
                 }),
             );
             Some(failed)
@@ -776,6 +835,222 @@ mod tests {
             doc.snapshot_error().is_none(),
             "одна ошибка — одно сообщение"
         );
+    }
+
+    #[test]
+    fn the_line_map_is_rebuilt_when_undo_crosses_a_boundary() {
+        // Переход через границу берёт текст из снимка целиком. Если карту
+        // править дельтой от прежнего документа, она разъедется с текстом
+        // сразу же — и разъезд будет невидим до первой отрисовки.
+        let tmp = Temp::new("lines-through-ring");
+        let file = tmp.file("a.rs");
+        let session = tmp.short_session(3, 1_000);
+        let mut doc = session.open_file(&file).unwrap();
+
+        // Три строки, между снимками переводы строк двигаются.
+        doc.insert(0, "один\nдва\nтри".as_bytes()).unwrap();
+        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(300))));
+        doc.snapshot_if_due();
+
+        doc.insert(0, "ноль\n".as_bytes()).unwrap();
+        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(600))));
+        doc.snapshot_if_due();
+
+        let before = LineMap::build(&doc.text());
+        assert_eq!(
+            doc.lines().breaks(),
+            before.breaks(),
+            "до отката карта жива"
+        );
+
+        // Откатываем так, чтобы пересечь границу памяти.
+        let mut crossed = false;
+        while doc.undo().unwrap().is_some() {
+            let fresh = LineMap::build(&doc.text());
+            assert_eq!(
+                doc.lines().breaks(),
+                fresh.breaks(),
+                "карта разошлась с текстом {:?}",
+                doc.text()
+            );
+            assert_eq!(doc.line_count(), fresh.line_count());
+            crossed = true;
+        }
+        assert!(crossed, "откат должен был что-то отменить");
+        assert_eq!(doc.text(), Vec::<u8>::new(), "откатилось всё");
+        assert_eq!(
+            doc.lines().breaks(),
+            LineMap::build(&doc.text()).breaks(),
+            "после полного отката карта совпадает"
+        );
+    }
+
+    #[test]
+    fn undo_walks_back_through_the_snapshots_on_disk() {
+        // Главное: откат не должен кончаться там, где кончилась память.
+        // В памяти снимок один, дальше идёт кольцо на диске — и человек
+        // отматывает всё, что наработал за четыре интервала.
+        let tmp = Temp::new("undo-through-ring");
+        let file = tmp.file("a.rs");
+        let session = tmp.short_session(4, 1_000);
+        let mut doc = session.open_file(&file).unwrap();
+
+        // Четыре снимка, между ними по одной правке.
+        for round in 0..4u32 {
+            doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
+            doc.insert(doc.buffer().len(), b"x").unwrap();
+            doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(
+                300 * (round as u64 + 1),
+            ))));
+            doc.snapshot_if_due();
+        }
+        assert_eq!(session.store().count(&file).unwrap(), 4, "кольцо полное");
+
+        // Теперь четыре правки назад — через четыре границы памяти.
+        for _ in 0..4 {
+            doc.undo()
+                .unwrap()
+                .expect("откат через кольцо должен продолжаться");
+        }
+        assert!(doc.text().is_empty(), "откатилось не всё");
+    }
+
+    #[test]
+    fn undo_stops_when_the_ring_runs_out() {
+        // Дальше первого снимка идти некуда, и это должно быть понятно, а не
+        // выглядеть как зависшая отмена.
+        let tmp = Temp::new("undo-ring-end");
+        let file = tmp.file("a.rs");
+        let session = tmp.short_session(4, 1_000);
+        let mut doc = session.open_file(&file).unwrap();
+
+        doc.insert(doc.buffer().len(), b"x").unwrap();
+        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(300))));
+        doc.snapshot_if_due();
+        assert_eq!(doc.buffer().snapshots_taken(), 1, "снимок снят");
+        assert_eq!(session.store().count(&file).unwrap(), 1, "и лежит в кольце");
+
+        doc.undo()
+            .unwrap()
+            .expect("правка отменяется через снимок из кольца");
+        assert!(doc.text().is_empty(), "первая правка откатилась");
+        assert!(
+            doc.undo().unwrap().is_none(),
+            "снимок один, за ним откатываться некуда"
+        );
+    }
+
+    #[test]
+    fn no_snapshots_at_all_means_undo_stops_at_the_first_snapshot() {
+        // `keep = 0` — снимки на диск не пишутся. Откат тогда упирается в
+        // память: это честное «дальше некуда», а не выдуманная граница.
+        let tmp = Temp::new("undo-no-ring");
+        let file = tmp.file("a.rs");
+        let session = tmp.no_persist_session(0, 1_000);
+        let mut doc = session.open_file(&file).unwrap();
+
+        doc.insert(doc.buffer().len(), b"x").unwrap();
+        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(300))));
+        doc.snapshot_if_due();
+
+        doc.undo()
+            .unwrap()
+            .expect("правка отменяется по памяти, кольца нет");
+        assert!(doc.text().is_empty());
+        assert!(
+            doc.undo().unwrap().is_none(),
+            "без кольца откат дальше не идёт"
+        );
+    }
+
+    #[test]
+    fn without_a_ring_the_memory_keeps_the_whole_undo_chain() {
+        // `keep = 0` — это «снимков не делаем», а не «снимки делаем и роняем
+        // историю». Без кольца схлопывать нечего и нельзя: иначе отменять
+        // было бы нечем, а правки пропали бы безвозвратно.
+        let tmp = Temp::new("no-ring-history");
+        let file = tmp.file("a.rs");
+        let session = tmp.session(0);
+        let mut doc = session.open_file(&file).unwrap();
+        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
+
+        for _ in 0..5 {
+            let at = doc.buffer().len();
+            doc.insert(at, b"x").unwrap();
+            doc.snapshot_if_due();
+        }
+        assert_eq!(
+            session.store().count(&file).unwrap(),
+            0,
+            "на диск ничего не пишется"
+        );
+        assert_eq!(
+            doc.buffer().path().len(),
+            5,
+            "история в памяти осталась целой"
+        );
+
+        for i in (0..5u32).rev() {
+            doc.undo().unwrap().expect("откат по памяти");
+            assert_eq!(doc.text(), "x".repeat(i as usize).into_bytes());
+        }
+        assert!(doc.undo().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_snapshot_does_not_stop_undo_while_it_is_still_written_to_disk() {
+        // Обе способности сразу: история живёт в памяти целиком, и та же
+        // история уезжает на диск. Отменять можно через любой снапшот.
+        let tmp = Temp::new("undo-through-snapshot");
+        let file = tmp.file("a.rs");
+        let session = tmp.short_session(3, 1_000);
+        let mut doc = session.open_file(&file).unwrap();
+
+        // Часы стоят: правки идут, но пять минут ещё не прошло.
+        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
+        for _ in 0..3 {
+            let at = doc.buffer().len();
+            doc.insert(at, b"x").unwrap();
+            doc.snapshot_if_due();
+        }
+        assert_eq!(
+            doc.buffer().snapshots_taken(),
+            0,
+            "за три правки подряд снапшот не заслужили"
+        );
+
+        // Пять минут прошло — снапшот снят, история на диске.
+        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(600))));
+        doc.snapshot_if_due();
+        let stored = session.store().count(&file).unwrap();
+        assert!(stored > 0, "на диске должен быть хоть один снапшот");
+
+        // Отмена идёт через снапшот насквозь: все три правки.
+        for i in (0..3).rev() {
+            doc.undo().unwrap().expect("отменять есть что");
+            assert_eq!(doc.text(), b"x".repeat(i));
+        }
+        assert!(doc.undo().unwrap().is_none(), "дальше отменять нечего");
+    }
+
+    #[test]
+    fn an_untouched_document_has_no_snapshot_to_restore_from() {
+        // Обратная сторона: файл не трогали, но снапшот есть. Он и должен
+        // применяться — иначе правка пропала бы.
+        let tmp = Temp::new("untouched-snapshot");
+        let file = tmp.file("a.rs");
+        let session = tmp.short_session(3, 1_000);
+        let mut doc = session.open_file(&file).unwrap();
+        doc.insert(0, b"abc").unwrap();
+        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(600))));
+        doc.snapshot_if_due();
+        assert!(doc.snapshot_error().is_none());
+
+        let session2 = tmp.short_session(3, 1_000);
+        let mut back = session2.open_file(&file).unwrap();
+        assert_eq!(back.text(), b"abc");
+        back.undo().unwrap().expect("история из снапшота жива");
+        assert!(back.text().is_empty());
     }
 
     #[test]
@@ -1294,21 +1569,53 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_interval_snapshots_on_every_edit() {
-        // Нулевой интервал — это «на каждой правке». В конфиге так не выставляют,
-        // но без него не проверить, что счётчик не врёт.
+    fn a_zero_interval_means_no_snapshots_at_all() {
+        // Ноль — это «снимков нет вообще», а не «на каждой правке». Иначе
+        // человек, выключивший интервал, получил бы обратный смысл настройки и
+        // вдвое больше работы на диске, чем просил.
         let tmp = Temp::new("zero-interval");
         let file = tmp.file("a.rs");
         let mut session = tmp.session(3);
         session.set_snapshot_interval(Duration::ZERO);
 
         let mut doc = session.open_file(&file).unwrap();
-        for i in 0..5 {
+        for _ in 0..5 {
             let at = doc.buffer().len();
             doc.insert(at, b"x").unwrap();
             doc.snapshot_if_due();
-            assert_eq!(i + 1, doc.buffer().snapshots_taken() as u32);
         }
+        assert_eq!(
+            doc.buffer().snapshots_taken(),
+            0,
+            "при нулевом интервале снимков быть не должно"
+        );
+        assert_eq!(session.store().count(&file).unwrap(), 0, "и на диске тоже");
+    }
+
+    #[test]
+    fn a_one_second_interval_snapshots_on_every_edit_past_it() {
+        // Обратная сторона: интервал в секунду — это снимок раз в секунду, а не
+        // раз в правку. Часы двигаем сами.
+        let tmp = Temp::new("one-second");
+        let file = tmp.file("a.rs");
+        let mut session = tmp.session(3);
+        session.set_snapshot_interval(Duration::from_secs(1));
+
+        let mut doc = session.open_file(&file).unwrap();
+        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
+        for _ in 0..3 {
+            let at = doc.buffer().len();
+            doc.insert(at, b"x").unwrap();
+            doc.snapshot_if_due();
+            assert_eq!(
+                doc.buffer().snapshots_taken(),
+                0,
+                "за секунду снимок не заслужен"
+            );
+        }
+        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(1))));
+        doc.snapshot_if_due();
+        assert_eq!(doc.buffer().snapshots_taken(), 1, "секунда прошла");
     }
 
     #[test]
@@ -1443,9 +1750,12 @@ mod tests {
         // Карта строк обязана ехать вместе с текстом на каждой правке, отмене и
         // повторе. Эталон — обычная строка с историей правок: любое расхождение
         // означает, что карта разъехалась.
+        //
+        // Снимки на диск не пишутся (`keep = 0`): откат упирается в память, и
+        // эталон ведёт себя так же. Про откат через кольцо — отдельный тест.
         let tmp = Temp::new("line-map");
         let file = tmp.file("a.rs");
-        let session = tmp.session(3);
+        let session = tmp.session(0);
         let mut doc = session.open_file(&file).unwrap();
 
         let mut text = String::new();
@@ -1495,9 +1805,11 @@ mod tests {
                     done = format!("заменить {at}..{} на {typed:?}", at + len);
                 }
                 3 => {
-                    // Снапшот текста не меняет, и карта строк после него обязана
-                    // остаться в силе. Раньше её пересобирали зря. Зато история
-                    // правок обнуляется — как и в эталоне.
+                    // Снапшот схлопывает память, и карта строк после него
+                    // обязана остаться в силе. Эталон делает то же самое:
+                    // история правок в памяти обрезается, а дальше откат идёт
+                    // через кольцо — здесь его нет, потому что снимки на
+                    // диск не пишутся.
                     doc.snapshot();
                     history.clear();
                     done = "снапшот".to_string();

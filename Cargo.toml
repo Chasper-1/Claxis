@@ -19,8 +19,9 @@ claxis-config = { path = "claxis-config" }                # Claxis
 claxis-term = { path = "claxis-term" }                    # Claxis
 
 claxis-buffer = { path = "claxis-buffer" }                # Claxis
-claxis-rope = { path = "claxis-rope" }                      # Claxis
-claxis-disk = { path = "claxis-disk" }                     # Claxis, claxis-config
+claxis-rope = { path = "claxis-rope" }                    # Claxis
+claxis-disk = { path = "claxis-disk" }                    # Claxis, claxis-config
+
 claxis-input = { path = "claxis-input" }                  # claxis-config
 claxis-i18n = { path = "claxis-i18n" }                    # claxis-config
 claxis-theme = { path = "claxis-theme" }                  # claxis-config

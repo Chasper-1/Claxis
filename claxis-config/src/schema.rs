@@ -288,7 +288,7 @@ pub const KEYS: &[KeyDef] = &[
         path: "General.snapshots_interval",
         default: "300",
         kind: Kind::U16,
-        comment: "Seconds between snapshots of one document. Zero means snapshot on every edit.",
+        comment: "Seconds between snapshots of one document. Zero means no snapshots at all.",
         active: true,
     },
     // ── экран статистики после сохранения ────────────────────────────────
