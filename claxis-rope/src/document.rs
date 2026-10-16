@@ -141,6 +141,67 @@ fn record_end(record: &Record) -> u32 {
     end
 }
 
+/// Куда переехало смещение `offset` в буфере.
+///
+/// `moved` отсортирован по прежнему началу, поэтому ищется делением пополам.
+/// `None` означает, что на это смещение никто не смотрит: там либо ничего не
+/// было, либо кусок отброшен вместе со своей записью.
+fn moved_offset(moved: &[(u32, u32, u32)], offset: u32) -> Option<u32> {
+    let at = moved.partition_point(|(start, _, _)| *start <= offset);
+    if at == 0 {
+        return None;
+    }
+    let (start, len, new) = moved[at - 1];
+    (offset < start + len).then_some(new + (offset - start))
+}
+
+/// Запись с переставленными смещениями.
+///
+/// Пустое смещение переставлять незачем: кусок нулевой длины не смотрит ни на
+/// какие байты, и в буфере такого куска нет.
+fn record_moved(record: &Record, find: &impl Fn(u32) -> Option<u32>) -> Record {
+    let moved = |offset: u32, len: u32| -> u32 {
+        if len == 0 {
+            offset
+        } else {
+            find(offset).unwrap_or(offset)
+        }
+    };
+    match *record {
+        Record::Insert {
+            anchor,
+            head,
+            text_offset,
+        } => Record::Insert {
+            anchor,
+            head,
+            text_offset: moved(text_offset, head - anchor),
+        },
+        Record::Delete {
+            anchor,
+            head,
+            text_offset,
+        } => Record::Delete {
+            anchor,
+            head,
+            text_offset: moved(text_offset, head - anchor),
+        },
+        Record::Replace {
+            anchor,
+            head,
+            text_offset,
+            removed_offset,
+            removed_len,
+        } => Record::Replace {
+            anchor,
+            head,
+            text_offset: moved(text_offset, head - anchor),
+            removed_offset: moved(removed_offset, removed_len),
+            removed_len,
+        },
+    }
+}
+
 /// Вершина истории: запись, родитель, ребёнок и граница буфера.
 #[derive(Clone, Copy, Debug)]
 struct Version {
@@ -475,6 +536,7 @@ impl Document {
             text_offset,
         };
         self.apply(record);
+        self.gather_when_full();
         Ok(())
     }
 
@@ -495,6 +557,7 @@ impl Document {
             text_offset,
         };
         self.apply(record);
+        self.gather_when_full();
         Ok(())
     }
 
@@ -523,7 +586,18 @@ impl Document {
             removed_len: len,
         };
         self.apply_replace(record);
+        self.gather_when_full();
         Ok(())
+    }
+
+    /// Собрать вставленный текст, когда история доросла до своей глубины.
+    ///
+    /// Глубина истории — это ровно то, сколько записанных кусков в буфере мы
+    /// готовы терпеть до уборки. Проверка одна и стоит сравнения.
+    fn gather_when_full(&mut self) {
+        if self.history_used() >= self.depth {
+            self.gather_inserted_text();
+        }
     }
 
     /// Положить текст в хвост буфера и сказать, с какого места он лежит.
@@ -952,6 +1026,148 @@ impl Document {
         self.versions[0].child = NIL;
         self.current = 0;
         self.compacts += 1;
+    }
+
+    /// Собрать вставленный и вырезанный текст вплотную, чтобы листья слиплись.
+    ///
+    /// Дыры между кусками — это ровно то, что мешает листьям быть соседями:
+    /// лист указывает на диапазон буфера, и два куска, разнесённые мусором,
+    /// не смежны, склеить их нельзя. Здесь куски кладутся подряд **по порядку
+    /// документа**, становятся смежными, и `concat` склеивает их в один лист.
+    /// По порядку документа, а не по адресу в буфере: раскладка обязана
+    /// совпасть с порядком чтения, иначе соседей так и не появится.
+    ///
+    /// Основа — часть файла в начале буфера — не двигается: она ниже всего и
+    /// на месте. Тексты записей истории, на которые не смотрит ни один лист,
+    /// кладутся в конец: между листьями им стоять нельзя, иначе они разорвут
+    /// соседство. Отброшенные записи в уборке не участвуют: на их текст уже
+    /// никто не смотрит, и тащить его в буфер незачем.
+    ///
+    /// Смещения в записях истории переписываются по карте переезда. Формат тот
+    /// же самый — поля и их размеры не меняются, меняются только значения. Без
+    /// этого отмена и повтор читали бы чужое.
+    ///
+    /// Это не `compact`: там документ пересобирается целиком и история в
+    /// памяти обрезается, потому что всё ушло в снимок. Здесь история остаётся
+    /// в памяти целиком и работает дальше.
+    pub fn gather_inserted_text(&mut self) {
+        if self.tree.leaves < 2 {
+            return;
+        }
+        let leaves = self.tree.leaves_in_order();
+
+        // Кто ещё смотрит в буфер, кроме листьев: записи истории, которые ещё
+        // можно отменить или повторить. Отброшенные отмечены во `free`, и их
+        // текст уходит вместе с ними.
+        let mut dropped = vec![false; self.versions.len()];
+        for id in &self.free {
+            dropped[*id as usize] = true;
+        }
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(self.bytes.len());
+        bytes.extend_from_slice(&self.bytes[..self.file_len as usize]);
+        let mut moved: Vec<(u32, u32, u32)> = Vec::with_capacity(leaves.len());
+
+        // Сначала листья, по порядку документа: именно их смежность и есть
+        // цель уборки. Куски за основой переезжают, куски основы остаются.
+        for leaf in &leaves {
+            if leaf.len == 0 {
+                continue;
+            }
+            if leaf.start < self.file_len {
+                continue;
+            }
+            let start = bytes.len() as u32;
+            bytes.extend_from_slice(
+                &self.bytes[leaf.start as usize..(leaf.start + leaf.len) as usize],
+            );
+            moved.push((leaf.start, leaf.len, start));
+        }
+        moved.sort_unstable_by_key(|(start, len, _)| (*start, std::cmp::Reverse(*len)));
+
+        // Переехавший кусок находят по прежнему началу. Список отсортирован по
+        // прежнему началу, ищется делением пополам — без карты и без хеша.
+        // Теперь тексты истории. Те, что уже уехали вместе со своим листом,
+        // повторно не копируются: это тот же самый диапазон.
+        let mut texts: Vec<(u32, u32)> = Vec::new();
+        for (id, version) in self.versions.iter().enumerate() {
+            if dropped[id] {
+                continue;
+            }
+            let record = &version.record;
+            texts.push((record.text_offset(), record.len()));
+            if let Some((offset, len)) = record.removed() {
+                texts.push((offset, len));
+            }
+        }
+        for (offset, len) in texts {
+            if len == 0 || moved_offset(&moved, offset).is_some() {
+                continue;
+            }
+            let start = bytes.len() as u32;
+            bytes.extend_from_slice(&self.bytes[offset as usize..(offset + len) as usize]);
+            moved.push((offset, len, start));
+        }
+        // Список снова по старому началу, а при равном начале — длинным вперёд:
+        // тексты истории дописаны в конец, искать дальше придётся делением
+        // пополам. Из одинаковых начал остаётся самое длинное: короткий кусок
+        // с тем же началом — это его начало, и на него смотрит тот же длинный.
+        moved.sort_unstable_by_key(|(start, len, _)| (*start, std::cmp::Reverse(*len)));
+        moved.dedup_by_key(|(start, _, _)| *start);
+
+        self.bytes = bytes;
+
+        // Листья ставятся на место по порядку документа, а не собираются через
+        // `concat`: тот склеивает два листа напрямую и не видит лист на краю
+        // уже собранного дерева, а `insert_leaf` спускается до края и склеивает
+        // там, поэтому соседние куски срастаются каскадом.
+        let mut tree = Tree::new();
+        let mut at = 0u32;
+        for leaf in &leaves {
+            let start = if leaf.start >= self.file_len {
+                moved_offset(&moved, leaf.start).unwrap_or(leaf.start)
+            } else {
+                leaf.start
+            };
+            let node = tree.alloc(Node::leaf(start, leaf.len));
+            tree.insert_leaf(at, node);
+            at += leaf.len;
+        }
+        self.tree = tree;
+
+        for (id, version) in self.versions.iter_mut().enumerate() {
+            if dropped[id] {
+                continue;
+            }
+            version.record = record_moved(&version.record, &|offset| moved_offset(&moved, offset));
+        }
+        self.recompute_live();
+    }
+
+    /// Пересчитать границу буфера у всех вершин по родителям.
+    ///
+    /// После уборки смещения поменялись, а вместе с ними и то, до чего каждая
+    /// ветка дотягивается. Обход от корня вниз: у корня своя граница, у детей
+    /// своя плюс родительская. От текущей вершины идти нельзя — её предки
+    /// выше, и у них остались бы старые значения.
+    ///
+    /// Каждая вершина попадает в очередь один раз, от своего родителя, и
+    /// кладёт туда только своего ребёнка: обход в ширину. Спуск по всей ветке
+    /// на каждом её узле обошёл бы каждую вершину по разу на каждого предка —
+    /// на длинной истории это минуты вместо миллисекунд.
+    fn recompute_live(&mut self) {
+        self.versions[0].live = record_end(&self.versions[0].record);
+        let mut queue = std::collections::VecDeque::from([0u32]);
+        while let Some(id) = queue.pop_front() {
+            let live = self.versions[id as usize].live;
+            let child = self.versions[id as usize].child;
+            if child == NIL {
+                continue;
+            }
+            let version = &mut self.versions[child as usize];
+            version.live = live.max(record_end(&version.record));
+            queue.push_back(child);
+        }
     }
 
     /// Сколько раз брался снапшот.
@@ -2081,5 +2297,179 @@ mod tests {
                 log
             );
         }
+    }
+
+    #[test]
+    fn gathering_the_inserted_text_survives_a_random_mix_with_undo() {
+        // Уборка двигает куски буфера и переставляет смещения в записях. Ошибка
+        // здесь не в тексте, а в отмене: она читает буфер по смещениям, и если
+        // хоть одно осталось старым, отмена вернёт чужое. Поэтому та же
+        // случайная смесь, но с короткой историей — уборка идёт каждые восемь
+        // записей, то есть часто, но не после каждой правки.
+        let mut doc = Document::with_depth(b"", 8).unwrap();
+        let mut text = String::new();
+        let mut log: Vec<String> = Vec::new();
+        let mut steps: Vec<(u8, usize, usize, String)> = Vec::new();
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+
+        for _ in 0..400 {
+            match rng.below(4) {
+                0 if !text.is_empty() => {
+                    let at = rng.below(text.len());
+                    let len = 1 + rng.below((text.len() - at).min(20));
+                    let removed = text[at..at + len].to_string();
+                    doc.delete(at as u32, len as u32).unwrap();
+                    text.replace_range(at..at + len, "");
+                    steps.push((0, at, len, removed));
+                    log.push(format!("delete {at} {len}"));
+                }
+                1 => {
+                    let at = rng.below(text.len() + 1);
+                    let typed = if rng.below(2) == 0 { "\n" } else { "ab" };
+                    doc.insert(at as u32, typed.as_bytes()).unwrap();
+                    text.insert_str(at, typed);
+                    steps.push((1, at, typed.len(), String::new()));
+                    log.push(format!("insert {at} {typed:?}"));
+                }
+                2 => {
+                    let at = rng.below(text.len() + 1);
+                    let len = rng.below((text.len() - at).min(10));
+                    let removed = text[at..at + len].to_string();
+                    doc.replace(at as u32, len as u32, b"xy\n").unwrap();
+                    text.replace_range(at..at + len, "xy\n");
+                    steps.push((2, at, 3, removed));
+                    log.push(format!("replace {at} {len}"));
+                }
+                _ => {
+                    let Some((kind, at, len, removed)) = steps.pop() else {
+                        continue;
+                    };
+                    doc.undo().unwrap().expect("отменять есть что");
+                    match kind {
+                        1 => text.replace_range(at..at + len, ""),
+                        0 => text.insert_str(at, &removed),
+                        _ => {
+                            text.replace_range(at..at + len, "");
+                            text.insert_str(at, &removed);
+                        }
+                    }
+                    log.push(format!("undo {at} {len}"));
+                }
+            }
+
+            assert_eq!(
+                doc.read(),
+                text.as_bytes(),
+                "разошлось на {}: {:?}\nвся последовательность: {:?}",
+                log.last().unwrap(),
+                text,
+                log
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_memory() {
+        for (name, spread) in [("набор подряд", false), ("размазано", true)] {
+            let mut doc = Document::with_depth(vec![b'x'; 8 << 20], 8192).unwrap();
+            for i in 0..200_000u32 {
+                let at = if spread {
+                    (8 << 20) as u32 - 10 - (i * 37) % 3_000_000
+                } else {
+                    (4 << 20) as u32 + i % 1000
+                };
+                doc.insert(at, b"y").unwrap();
+            }
+            let m = doc.memory();
+            println!(
+                "{name}: правок 200000 | листьев {:>7} | дерево {:>6} КБ | история {:>6} КБ | буфер {:>7}/{:>7} КБ | всего {:>7} КБ",
+                m.leaves,
+                m.tree_bytes() / 1024,
+                m.versions * m.version_size / 1024,
+                m.text_len / 1024,
+                m.text_capacity / 1024,
+                (m.tree_bytes() + m.text_capacity + m.versions * m.version_size) / 1024,
+            );
+        }
+    }
+
+    #[test]
+    fn gathering_collapses_the_leaves_and_leaves_no_gaps() {
+        // Уборка кладёт вставленное вплотную по порядку документа, поэтому
+        // куски набора подряд становятся соседями и склеиваются в лист. Дыр в
+        // буфере не остаётся: он равен основе плюс живые куски.
+        let mut doc = Document::with_depth(vec![b'x'; 256 * 1024], 64).unwrap();
+        for i in 0..2000u32 {
+            doc.insert(128 * 1024 + i, b"yz").unwrap();
+        }
+
+        doc.gather_inserted_text();
+        let leaves = doc.leaves();
+        assert!(
+            leaves.len() <= 3,
+            "после уборки листьев осталось {}",
+            leaves.len()
+        );
+        assert_eq!(
+            doc.memory().leaves,
+            leaves.len(),
+            "счётчик листьев разошёлся с обходом"
+        );
+
+        // Дыр не остаётся: повторная уборка ничего не двигает и не укорачивает —
+        // значит, подобрано всё, что в буфере живого, и лежит оно вплотную.
+        let buffer = doc.buffer_len();
+        let text = doc.read();
+        doc.gather_inserted_text();
+        assert_eq!(doc.buffer_len(), buffer, "буфер продолжает таять");
+        assert_eq!(doc.leaves().len(), leaves.len(), "листья разъехались");
+        assert_eq!(doc.read(), text, "текст разошёлся при повторной уборке");
+    }
+
+    #[test]
+    fn gathering_keeps_the_text_and_the_whole_undo_chain() {
+        // Главное свойство уборки: она ничего не теряет. Текст собирается из
+        // листьев, отмена читает буфер по смещениям из записей — значит после
+        // уборки и то и другое обязано остаться прежним, а откат до конца
+        // вернуть исходный файл байт в байт.
+        let mut doc = d("0123456789");
+        doc.insert(5, b"ab").unwrap();
+        doc.delete(0, 3).unwrap();
+        doc.replace(1, 2, b"ZZ").unwrap();
+        let before = doc.read();
+        let history = doc.path().len();
+
+        doc.gather_inserted_text();
+        assert_eq!(doc.read(), before, "текст после уборки разошёлся");
+        assert_eq!(doc.path().len(), history, "история после уборки потерялась");
+
+        while doc.undo().unwrap().is_some() {}
+        assert_eq!(
+            doc.read(),
+            b"0123456789",
+            "откат до конца не вернул исходник"
+        );
+
+        for _ in 0..history {
+            doc.redo().unwrap().expect("повторяемо");
+        }
+        assert_eq!(doc.read(), before, "повтор до конца не вернул текст");
+    }
+
+    #[test]
+    fn gathering_happens_when_the_history_is_full() {
+        // Глубина истории — это сколько записанных кусков мы готовы терпеть до
+        // уборки. Проверка одна, и она должна срабатывать сама.
+        let mut doc = Document::with_depth(b"abc", 8).unwrap();
+        for i in 0..8u32 {
+            doc.insert(i, b"x").unwrap();
+        }
+        assert!(
+            doc.leaves().len() < 8,
+            "уборка должна была схлопнуть листья, их {}",
+            doc.leaves().len()
+        );
+        assert_eq!(doc.read(), b"xxxxxxxxabc");
     }
 }
