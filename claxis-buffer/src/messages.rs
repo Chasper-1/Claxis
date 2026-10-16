@@ -1,27 +1,58 @@
-//! Сообщения об ошибках буфера.
+//! Сообщения об ошибках rope.
 //!
-//! Буфер не знает языка: он отдаёт ошибку со структурными данными, а текст
+//! Крейт не знает языка: он отдаёт ошибку со структурными данными, а текст
 //! собирает каталог. По умолчанию — английский, другие языки подключаются
-//! снаружи: редактор берёт каталог из конфига и зовёт [`crate::buffer::Error::message`].
+//! снаружи: редактор берёт каталог из конфига и зовёт
+//! [`crate::Error::message`].
 //!
-//! Имена в фигурных скобках — это места под значения. Написано в конфиге
-//! `пул исчерпан: узлов {capacity}, глубина {depth}` — на экране будет `пул
-//! исчерпан: узлов 408, глубина 100`. Переводчик ставит имена туда, куда надо
-//! по правилам своего языка, буфер подставляет вместо них числа.
+//! Имена в фигурных скобках — это места под значения. Написано в переводе
+//! `вне документа: {anchor}..{end}, длина {doc_len}` — на экране будет
+//! `вне документа: 1000..2000, длина 1500`. Переводчик ставит имена туда,
+//! куда надо по правилам своего языка, rope подставляет вместо них числа.
 
-/// Каталог сообщений об ошибках буфера.
+/// Каталог сообщений об ошибках rope.
 ///
 /// Места под значения: `{anchor}`, `{end}`, `{doc_len}`, `{depth}`, `{min}`,
-/// `{max}`, `{capacity}`.
+/// `{version}`, `{kind}`, `{got}`, `{expected}`, `{tail}`.
 pub trait Messages {
     /// Вставка или удаление вышли за границы документа.
     fn out_of_bounds(&self, anchor: u32, end: u32, doc_len: u32) -> String;
 
     /// Глубина истории вне допустимого диапазона.
-    fn invalid_history_depth(&self, depth: u32, min: u32, max: u32) -> String;
+    ///
+    /// Потолка нет: история растёт вместе с правками. Отвергается только ноль
+    /// — с ним снимался бы снапшот после каждой правки.
+    fn invalid_history_depth(&self, depth: u32, min: u32) -> String;
 
-    /// Пул узлов дерева исчерпан: документ вырос сверх рассчитанного предела.
-    fn tree_pool_exhausted(&self, capacity: usize, depth: u32) -> String;
+    /// В истории лежит не формат rope: чужой блоб.
+    fn not_our_history(&self) -> String;
+
+    /// Версия истории не та, что ждёт крейт.
+    ///
+    /// `{version}` — что пришло.
+    fn unknown_history_version(&self, version: u8) -> String;
+
+    /// История оборвана: данных меньше, чем записано в заголовке.
+    fn truncated_history(&self) -> String;
+
+    /// Запись истории неизвестного вида.
+    ///
+    /// `{kind}` — что пришло в байте вида.
+    fn unknown_record_kind(&self, kind: u8) -> String;
+
+    /// Запись истории ссылается на кусок буфера, которого нет.
+    ///
+    /// `{from}` и `{to}` — границы куска, которого не оказалось.
+    fn history_out_of_bounds(&self, from: u32, to: u32) -> String;
+
+    /// Запись истории вывернута: начало дальше конца.
+    ///
+    /// `{anchor}` и `{head}` — границы диапазона из записи.
+    fn invalid_record_range(&self, anchor: u32, head: u32) -> String;
+
+    /// Снимок, который подтянулся из базы для отката дальше, не разобрался:
+    /// `{reason}`.
+    fn older_snapshot_broken(&self, reason: &str) -> String;
 
     /// В переводе встретилось имя, которого нет среди известных.
     ///
@@ -93,24 +124,56 @@ impl Messages for En {
         )
     }
 
-    fn invalid_history_depth(&self, depth: u32, min: u32, max: u32) -> String {
+    fn invalid_history_depth(&self, depth: u32, min: u32) -> String {
         substitute(
-            "invalid history depth {depth}: must be between {min} and {max} records",
+            "invalid history depth {depth}: must be at least {min} records",
             &[
                 ("depth", group_digits(depth as u64)),
                 ("min", group_digits(min as u64)),
-                ("max", group_digits(max as u64)),
             ],
         )
     }
 
-    fn tree_pool_exhausted(&self, capacity: usize, depth: u32) -> String {
+    fn not_our_history(&self) -> String {
+        substitute("not a rope history blob", &[])
+    }
+
+    fn unknown_history_version(&self, version: u8) -> String {
         substitute(
-            "buffer tree pool exhausted: {capacity} nodes is not enough for depth {depth}",
-            &[
-                ("capacity", group_digits(capacity as u64)),
-                ("depth", group_digits(depth as u64)),
-            ],
+            "unknown rope history version {version}: expected version 1",
+            &[("version", version.to_string())],
+        )
+    }
+
+    fn truncated_history(&self) -> String {
+        substitute("rope history is truncated", &[])
+    }
+
+    fn unknown_record_kind(&self, kind: u8) -> String {
+        substitute(
+            "unknown record kind {kind} in rope history",
+            &[("kind", kind.to_string())],
+        )
+    }
+
+    fn history_out_of_bounds(&self, from: u32, to: u32) -> String {
+        substitute(
+            "rope history points outside the buffer: {from}..{to}",
+            &[("from", from.to_string()), ("to", to.to_string())],
+        )
+    }
+
+    fn invalid_record_range(&self, anchor: u32, head: u32) -> String {
+        substitute(
+            "rope history record has a backwards range: {anchor}..{head}",
+            &[("anchor", anchor.to_string()), ("head", head.to_string())],
+        )
+    }
+
+    fn older_snapshot_broken(&self, reason: &str) -> String {
+        substitute(
+            "the older snapshot cannot be read: {reason}; undo stops here",
+            &[("reason", reason.to_string())],
         )
     }
 
@@ -128,6 +191,7 @@ impl Messages for En {
         )
     }
 }
+
 /// Все сообщения крейте с примерами значений.
 ///
 /// Нужны для отладочного вывода и для переводчика: он видит не ключ, а то,
@@ -137,11 +201,17 @@ pub fn samples() -> Vec<(&'static str, String)> {
     let m = En;
     vec![
         ("out_of_bounds", m.out_of_bounds(1_000, 2_000, 1_500)),
+        ("invalid_history_depth", m.invalid_history_depth(0, 1)),
+        ("not_our_history", m.not_our_history()),
+        ("unknown_history_version", m.unknown_history_version(7)),
+        ("truncated_history", m.truncated_history()),
+        ("unknown_record_kind", m.unknown_record_kind(9)),
+        ("history_out_of_bounds", m.history_out_of_bounds(100, 150)),
+        ("invalid_record_range", m.invalid_record_range(90, 10)),
         (
-            "invalid_history_depth",
-            m.invalid_history_depth(90_000, 1, 8192),
+            "older_snapshot_broken",
+            m.older_snapshot_broken("not a rope history blob"),
         ),
-        ("tree_pool_exhausted", m.tree_pool_exhausted(32_776, 8192)),
         (
             "bad_placeholder",
             m.bad_placeholder("capasity", &["capacity", "depth"]),

@@ -1,203 +1,430 @@
-//! История правок, которая переживает снапшот.
+//! Сохранённое состояние документа: текстовая база и ветка правок.
 //!
-//! Снапшот отдаёт наружу не только текст, но и историю: иначе после
-//! перезапуска отменять было бы нечего, хотя правки ещё на экране.
+//! Формат свой, rope его владеет целиком. Снапшот нужен затем, чтобы после
+//! перезапуска отменять было что: без истории документ верный, но работа,
+//! сделанная после прошлого запуска, отменяться не будет.
 //!
-//! Формат — плотный, без выравнивания: одна запись 13 байт. Размер значения
-//! неважен, важен порядок: записи идут от самой старой к самой новой.
+//! Начало файла — четыре байта магии и версия. Магия нужна не для красоты:
+//! прежний буфер писал в ту же колонку свой формат, и такой блоб должен
+//! распознаваться как чужой и отбрасываться, а не разбираться как родной.
+//!
+//! ```text
+//! "CLRP" u8:версия | u32:длина файла | u32:длина буфера | буфер
+//!            | u32:сколько записей | запись...
+//! запись:    u8:вид | u32:якорь | u32:голова | u32:текст
+//! ```
 
-/// Запись истории в виде байт.
-pub type Bytes = Vec<u8>;
+use crate::Result;
+use crate::document::{Document, Record};
 
-/// История: стеки отмены и повтора плюс тексты вставок.
+/// Магия формата rope.
+pub const MAGIC: [u8; 4] = *b"CLRP";
+
+/// Версия формата rope.
 ///
-/// Хранится уже готовым к записи, потому что буфер не должен знать, куда его
-/// положить: это дело приёмника снапшота.
+/// Вторая: запись замены выросла на два поля, и разбор первой версии такую
+/// запись не поймёт. Старый блоб отвергается целиком — текст из базы при этом
+/// остаётся верным, теряется только история.
+pub const VERSION: u8 = 2;
+
+/// Байт записи вставки.
+const INSERT: u8 = 0;
+
+/// Байт записи удаления.
+const DELETE: u8 = 1;
+
+/// Байт записи замены.
+const REPLACE: u8 = 2;
+
+/// Размер одной записи: вид, якорь, голова, текст, вырезанное и его длина.
+///
+/// Записи одинаковой длины даже там, где часть полей не используется: сквозной
+/// размер разбирается без сдвига и ветвлений, а лишние нули стоят копейки.
+const RECORD: usize = 21;
+
+/// Размер одной записи истории в байтах.
+///
+/// Открыто наружу: тесты и хранилище должны знать, сколько байт занимает
+/// запись, иначе проверка формата будет гадать.
+pub const RECORD_SIZE: usize = RECORD;
+
+/// Сохранённая ветка правок.
+///
+/// Обёртка над байтами: пока это просто содержимое снапшота, но с собственным
+/// именем у него появятся поля, и менять их можно будет внутри крейта.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct History {
-    /// Текст, к которому применяются записи: `Original` на момент снапшота.
-    ///
-    /// Без него историю применять не к чему: записи описывают переход
-    /// **от** этого текста. Сохранять надо состояние целиком, а не только
-    /// результат, — иначе после перезапуска текст верный, а отменять
-    /// нечего.
-    base: Bytes,
-    undo: Bytes,
-    redo: Bytes,
-    added: Bytes,
-}
-
-/// Запись вставки: где вставлено, где в Added лежит текст.
-const INSERT: u8 = 0;
-/// Запись удаления: что вырезано.
-const DELETE: u8 = 1;
-/// Длина одной записи: метка и три `u32`.
-pub const RECORD_LEN: usize = 13;
-/// Заголовок: четыре длины, каждая `u32`.
-const HEADER_LEN: usize = 16;
-
-/// Пустая история: отменять нечего.
-pub fn empty() -> History {
-    History::default()
+    bytes: Vec<u8>,
 }
 
 impl History {
-    /// Собрать историю из базы, стеков и текстов.
-    pub fn new(base: Bytes, undo: Bytes, redo: Bytes, added: Bytes) -> Self {
-        Self {
-            base,
-            undo,
-            redo,
-            added,
-        }
+    /// Пустая история: документа как будто не трогали.
+    pub fn empty() -> Self {
+        Self::default()
     }
 
-    /// Текст, к которому применяются записи.
-    pub fn base(&self) -> &[u8] {
-        &self.base
+    /// Байты истории — то, что уходит в хранилище.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
-    /// Записи отмены.
-    pub fn undo(&self) -> &[u8] {
-        &self.undo
-    }
-
-    /// Записи повтора.
-    pub fn redo(&self) -> &[u8] {
-        &self.redo
-    }
-
-    /// Тексты вставок.
-    pub fn added(&self) -> &[u8] {
-        &self.added
-    }
-
-    /// История пустая: отменять нечего.
+    /// Есть ли что восстанавливать.
     pub fn is_empty(&self) -> bool {
-        self.undo.is_empty() && self.redo.is_empty()
+        self.bytes.is_empty()
     }
 
-    /// Запаковать в байты: три длины, потом сами данные.
-    pub fn encode(&self) -> Bytes {
-        let mut out = Vec::with_capacity(
-            HEADER_LEN + self.base.len() + self.undo.len() + self.redo.len() + self.added.len(),
-        );
-        for part in [&self.base, &self.undo, &self.redo, &self.added] {
-            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
-            out.extend_from_slice(part);
+    /// Файл таков, каким был, когда бралась история.
+    ///
+    /// Это первые `file_len` байт буфера: основа документа, от которой
+    /// считались все правки. Сверяется с файлом на диске — иначе правка,
+    /// сделанная снаружи, молча уедет под следующей записью.
+    pub fn base(&self) -> Result<&[u8]> {
+        let header = Header::parse(&self.bytes)?;
+        let end = header
+            .buffer_at
+            .checked_add(header.file_len)
+            .ok_or(crate::Error::TruncatedHistory)?;
+        self.bytes
+            .get(header.buffer_at..end)
+            .ok_or(crate::Error::TruncatedHistory)
+    }
+
+    /// Принять байты из хранилища и проверить, что блоб наш и целый.
+    ///
+    /// В базе лежит то, что положил прошлый запуск: прежний буфер писал
+    /// туда свой формат, блоб мог оборваться. Разбор проверяет всё, до
+    /// последней записи, и отвечает заранее: годный блоб или нет.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let header = Header::parse(bytes)?;
+        let mut offset = header.records_at;
+        for _ in 0..header.count {
+            let chunk = bytes
+                .get(offset..offset + RECORD)
+                .ok_or(crate::Error::TruncatedHistory)?;
+            let read =
+                |i: usize| u32::from_le_bytes([chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]]);
+            let kind = chunk[0];
+            if kind != INSERT && kind != DELETE && kind != REPLACE {
+                return Err(crate::Error::UnknownRecordKind { kind });
+            }
+            // Смещения пришли из базы, доверять им нельзя: из-за вывернутого
+            // диапазона вычитание переполнилось бы, а кусок за границами
+            // буфера уронил бы редактор вместе с несохранённым текстом.
+            let (anchor, head, text_offset) = (read(1), read(5), read(9));
+            if head < anchor {
+                return Err(crate::Error::InvalidRecordRange { anchor, head });
+            }
+            fits(text_offset, head - anchor, header.buf_len)?;
+            if kind == REPLACE {
+                fits(read(13), read(17), header.buf_len)?;
+            }
+            offset += RECORD;
         }
-        out
+        Ok(Self {
+            bytes: bytes.to_vec(),
+        })
     }
 
-    /// Распаковать. Мусор на входе — пустая история, а не паника:
-    /// потеря истории не должна ломать открытие документа.
-    pub fn decode(bytes: &[u8]) -> Self {
-        let mut cursor = Cursor::new(bytes);
-        let (Some(base), Some(undo), Some(redo), Some(added)) = (
-            cursor.take_part(),
-            cursor.take_part(),
-            cursor.take_part(),
-            cursor.take_part(),
-        ) else {
-            return History::default();
-        };
-        History::new(base, undo, redo, added)
-    }
-}
-
-/// Чтение частей по длине, объявленной в заголовке.
-struct Cursor<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> Cursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    /// Собрать историю из документа.
+    ///
+    /// Уезжает весь текстовый буфер, а не только текст файла: записи ссылаются
+    /// на хвост, куда уезжает вставленное и вырезанное, и эти смещения должны
+    /// остаться верными после восстановления.
+    pub fn capture(doc: &Document) -> Self {
+        let records = doc.path();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.push(VERSION);
+        bytes.extend_from_slice(&doc.file_len().to_le_bytes());
+        bytes.extend_from_slice(&(doc.buffer_len() as u32).to_le_bytes());
+        bytes.extend_from_slice(doc.buffer());
+        bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        for record in records {
+            let (removed, removed_len) = record.removed().unwrap_or((0, 0));
+            bytes.push(match record {
+                Record::Insert { .. } => INSERT,
+                Record::Delete { .. } => DELETE,
+                Record::Replace { .. } => REPLACE,
+            });
+            bytes.extend_from_slice(&record.anchor().to_le_bytes());
+            bytes.extend_from_slice(&record.head().to_le_bytes());
+            bytes.extend_from_slice(&record.text_offset().to_le_bytes());
+            bytes.extend_from_slice(&removed.to_le_bytes());
+            bytes.extend_from_slice(&removed_len.to_le_bytes());
+        }
         Self { bytes }
     }
 
-    /// Длина и содержимое следующей части. `None`, если не хватило байт.
-    fn take_part(&mut self) -> Option<Bytes> {
-        let head = self.bytes.get(..4)?;
-        let len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let rest = self.bytes.get(4..)?;
-        let (part, tail) = rest.split_at_checked(len)?;
-        self.bytes = tail;
-        Some(part.to_vec())
+    /// Разобрать сохранённое состояние и собрать документ.
+    ///
+    /// Текст документа берётся из истории: он и есть состояние. Отдельный
+    /// `text` не нужен — он записан рядом, тем же файлом.
+    pub fn restore(&self) -> Result<Document> {
+        let header = Header::parse(&self.bytes)?;
+        let bytes = self.bytes.as_slice();
+        let file_len = header.file_len;
+        let buf_len = header.buf_len;
+        let buffer = bytes
+            .get(header.buffer_at..header.buffer_at + buf_len)
+            .ok_or(crate::Error::TruncatedHistory)?;
+        let mut offset = header.records_at;
+        let count = header.count;
+
+        let mut doc = Document::from_buffer(buffer.to_vec(), file_len);
+        for _ in 0..count {
+            let chunk = bytes
+                .get(offset..offset + RECORD)
+                .ok_or(crate::Error::TruncatedHistory)?;
+            let read =
+                |i: usize| u32::from_le_bytes([chunk[i], chunk[i + 1], chunk[i + 2], chunk[i + 3]]);
+            let record = match chunk[0] {
+                INSERT => Record::Insert {
+                    anchor: read(1),
+                    head: read(5),
+                    text_offset: read(9),
+                },
+                DELETE => Record::Delete {
+                    anchor: read(1),
+                    head: read(5),
+                    text_offset: read(9),
+                },
+                _ => Record::Replace {
+                    anchor: read(1),
+                    head: read(5),
+                    text_offset: read(9),
+                    removed_offset: read(13),
+                    removed_len: read(17),
+                },
+            };
+            offset += RECORD;
+            doc.apply(record);
+        }
+        Ok(doc)
     }
 }
-
-/// Записать одну запись истории в конец буфера.
-pub fn write_record(out: &mut Bytes, tag: u8, anchor: u32, head: u32, text: u32) {
-    out.push(tag);
-    out.extend_from_slice(&anchor.to_le_bytes());
-    out.extend_from_slice(&head.to_le_bytes());
-    out.extend_from_slice(&text.to_le_bytes());
+/// Помещается ли кусок `len` байт, начиная со смещения `offset`, в буфер `buf_len`.
+fn fits(offset: u32, len: u32, buf_len: usize) -> Result<()> {
+    let end = offset as u64 + len as u64;
+    if end > buf_len as u64 {
+        return Err(crate::Error::HistoryOutOfBounds { offset, len });
+    }
+    Ok(())
 }
 
-/// Разобрать одну запись истории.
-pub fn read_record(bytes: &[u8]) -> Option<(u8, u32, u32, u32)> {
-    let part = bytes.get(..RECORD_LEN)?;
-    Some((
-        part[0],
-        u32::from_le_bytes([part[1], part[2], part[3], part[4]]),
-        u32::from_le_bytes([part[5], part[6], part[7], part[8]]),
-        u32::from_le_bytes([part[9], part[10], part[11], part[12]]),
-    ))
+/// Разобранный заголовок: где что лежит.
+struct Header {
+    /// Длина текста файла.
+    file_len: usize,
+    /// Длина текстового буфера.
+    buf_len: usize,
+    /// Смещение, где начинается текст.
+    buffer_at: usize,
+    /// Смещение, где начинаются записи.
+    records_at: usize,
+    /// Сколько записей.
+    count: usize,
 }
 
-/// Метка записи удаления.
-pub const DELETE_TAG: u8 = DELETE;
-/// Метка записи вставки.
-pub const INSERT_TAG: u8 = INSERT;
+impl Header {
+    fn parse(b: &[u8]) -> Result<Header> {
+        let read_u32 = |offset: usize| -> Option<u32> {
+            let c = b.get(offset..offset + 4)?;
+            Some(u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        };
+        if b.get(..4) != Some(MAGIC.as_slice()) {
+            return Err(crate::Error::NotOurHistory);
+        }
+        let version = *b.get(4).ok_or(crate::Error::TruncatedHistory)?;
+        if version != VERSION {
+            return Err(crate::Error::UnknownHistoryVersion { version });
+        }
+        let file_len = read_u32(5).ok_or(crate::Error::TruncatedHistory)? as usize;
+        let buf_len = read_u32(9).ok_or(crate::Error::TruncatedHistory)? as usize;
+        let buffer_at: usize = 13;
+        let records_at = buffer_at
+            .checked_add(buf_len)
+            .ok_or(crate::Error::TruncatedHistory)?;
+        let count = read_u32(records_at).ok_or(crate::Error::TruncatedHistory)? as usize;
+        let needed = records_at
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(count.checked_mul(RECORD)?))
+            .ok_or(crate::Error::TruncatedHistory)?;
+        if b.len() < needed {
+            return Err(crate::Error::TruncatedHistory);
+        }
+        Ok(Header {
+            file_len,
+            buf_len,
+            buffer_at,
+            records_at: records_at + 4,
+            count,
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
+    use crate::document::Document;
 
-    #[test]
-    fn the_base_travels_with_the_history() {
-        let history = History::new(b"abc".to_vec(), Bytes::new(), Bytes::new(), b"XY".to_vec());
-        assert_eq!(History::decode(&history.encode()).base(), b"abc");
+    fn d(text: &str) -> Document {
+        Document::new(text.as_bytes())
     }
 
     #[test]
-    fn a_record_is_thirteen_bytes() {
-        let mut out = Bytes::new();
-        write_record(&mut out, INSERT_TAG, 1, 5, 9);
-        assert_eq!(out.len(), RECORD_LEN);
-        assert_eq!(read_record(&out), Some((INSERT_TAG, 1, 5, 9)));
+    fn a_foreign_blob_is_not_read_as_our_history() {
+        // Прежний буфер писал в ту же колонку свой формат. Такой блоб обязан быть
+        // распознан как чужой, а не разобран как родной.
+        let mut old = Vec::new();
+        old.extend_from_slice(b"BUFH");
+        old.extend_from_slice(&[0u8; 32]);
+        assert_eq!(History::decode(&old).unwrap_err(), Error::NotOurHistory);
+        assert!(History::decode(&[]).is_err());
     }
 
     #[test]
-    fn history_survives_the_round_trip() {
-        let mut undo = Bytes::new();
-        write_record(&mut undo, INSERT_TAG, 3, 8, 0);
-        let mut redo = Bytes::new();
-        write_record(&mut redo, DELETE_TAG, 0, 4, 0);
-        let history = History::new(b"base".to_vec(), undo, redo, b"hello".to_vec());
-
-        let back = History::decode(&history.encode());
-        assert_eq!(back, history);
+    fn a_history_from_another_version_is_refused() {
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        let history = History::capture(&doc);
+        let mut bytes = history.as_bytes().to_vec();
+        bytes[4] = 99;
+        assert_eq!(
+            History::decode(&bytes).unwrap_err(),
+            Error::UnknownHistoryVersion { version: 99 }
+        );
     }
 
     #[test]
-    fn an_empty_history_is_empty() {
-        assert!(empty().is_empty());
-        assert_eq!(History::decode(&[]), empty());
+    fn a_truncated_history_is_refused_not_panicked() {
+        // Снапшот может прийти битым: обрыв, обрезка, чужой мусор. Всё это —
+        // ошибка с текстом, а не паника.
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        doc.delete(0, 1).unwrap();
+        let history = History::capture(&doc);
+        let bytes = history.as_bytes().to_vec();
+        for cut in 1..bytes.len() {
+            let err = History::decode(&bytes[..cut]);
+            assert!(err.is_err(), "обрыв на {cut} байте разобрался как целый");
+        }
     }
 
     #[test]
-    fn broken_bytes_give_an_empty_history() {
-        // Потеря истории не должна ломать открытие документа.
-        assert_eq!(History::decode(&[1, 2, 3]), empty());
-        assert_eq!(History::decode(&[255; 32]), empty());
+    fn an_unknown_record_kind_is_refused() {
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        let mut bytes = History::capture(&doc).as_bytes().to_vec();
+        let last = bytes.len() - RECORD_SIZE;
+        bytes[last] = 7;
+        assert_eq!(
+            History::decode(&bytes).unwrap_err(),
+            Error::UnknownRecordKind { kind: 7 }
+        );
     }
 
     #[test]
-    fn a_truncated_record_does_not_panic() {
-        let mut undo = Bytes::new();
-        write_record(&mut undo, INSERT_TAG, 1, 2, 3);
-        undo.pop();
-        assert_eq!(read_record(&undo), None);
+    fn a_record_with_a_backwards_range_is_refused() {
+        // Из-за `head - anchor` переполнилось бы вычитание, а это паника.
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        let mut bytes = History::capture(&doc).as_bytes().to_vec();
+        let last = bytes.len() - RECORD_SIZE;
+        // anchor и head стоят подряд, начиная с первого поля записи.
+        bytes[last + 1..last + 5].copy_from_slice(&9u32.to_le_bytes());
+        bytes[last + 5..last + 9].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            History::decode(&bytes).unwrap_err(),
+            Error::InvalidRecordRange { anchor: 9, head: 2 }
+        );
+    }
+
+    #[test]
+    fn a_record_pointing_outside_the_buffer_is_refused() {
+        // Куски за границами буфера не существует. Раньше отмена удаления резала
+        // буфер по такому смещению и роняла редактор вместе с текстом.
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        doc.delete(0, 1).unwrap();
+        let mut bytes = History::capture(&doc).as_bytes().to_vec();
+        let last = bytes.len() - RECORD_SIZE;
+        bytes[last + 9..last + 13].copy_from_slice(&9_000u32.to_le_bytes());
+        assert_eq!(
+            History::decode(&bytes).unwrap_err(),
+            Error::HistoryOutOfBounds {
+                offset: 9_000,
+                len: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_captured_history_survives_a_round_trip() {
+        // Обратная сторона проверок: хорошая история разбирается и
+        // восстанавливается.
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        doc.replace(0, 2, b"Z").unwrap();
+        doc.delete(1, 1).unwrap();
+        let history = History::capture(&doc);
+        let mut restored = History::decode(history.as_bytes())
+            .unwrap()
+            .restore()
+            .unwrap();
+        assert_eq!(restored.read(), doc.read());
+        restored.undo().unwrap().expect("отменять есть что");
+        assert_eq!(restored.read(), b"ZcXY");
+    }
+
+    #[test]
+    fn the_history_survives_the_database_round_trip() {
+        // Ровно то, что делает редактор: снапшот уходит в базу байтами и
+        // приходит байтами же.
+        let mut doc = d("начало");
+        for i in 0..50u32 {
+            if i % 3 == 0 {
+                doc.insert(i % (doc.len() + 1), b"pq").unwrap();
+            } else if !doc.is_empty() {
+                let at = i % doc.len();
+                doc.delete(at, 1).unwrap();
+            }
+        }
+        let text = doc.read();
+        let stored = History::capture(&doc).as_bytes().to_vec();
+
+        let back = History::decode(&stored)
+            .expect("блоб из базы разбирается")
+            .restore()
+            .expect("документ собирается");
+        assert_eq!(back.read(), text);
+        assert_eq!(back.path().len(), doc.path().len());
+    }
+
+    #[test]
+    fn an_untouched_document_carries_no_records() {
+        // Пустая история — обычное состояние, а не поломка.
+        let doc = d("текст без правок");
+        let history = History::capture(&doc);
+        // Магия, версия, длина файла, длина буфера, буфер, счётчик записей.
+        // Записей нет, поэтому счётчик идёт последним и равен нулю.
+        let bytes = history.as_bytes();
+        // Счётчик записей стоит сразу после буфера.
+        let at = 13 + doc.buffer().len();
+        assert_eq!(
+            &bytes[at..at + 4],
+            &0u32.to_le_bytes(),
+            "в пустой истории не должно быть ни одной записи, а в блобе: {bytes:?}"
+        );
+        assert!(doc.path().is_empty());
+        assert_eq!(
+            bytes.len(),
+            at + 4,
+            "кроме заголовка, буфера и нулевого счётчика ничего нет"
+        );
+        let mut back = history.restore().expect("пустая история разбирается");
+        assert_eq!(back.read(), doc.read());
+        assert!(back.path().is_empty());
+        assert!(back.undo().unwrap().is_none(), "отменять нечего");
     }
 }
