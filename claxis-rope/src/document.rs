@@ -1621,6 +1621,26 @@ mod tests {
     }
 
     #[test]
+    fn undo_and_discard_keep_the_buffer_intact() {
+        // Последовательность найдена сжатием падения: отмена удаления
+        // возвращает текст в конец буфера, отмена замены его вырезает, а
+        // следующая правка отбрасывает redo-ветку. Обрезка резала буфер по
+        // отброшенным записям и оставляла лист читать участок, которого уже
+        // нет.
+        let mut doc = Document::new(b"");
+        doc.replace(0, 0, b"xy\n").unwrap();
+        doc.replace(3, 0, b"xy\n").unwrap();
+        doc.delete(1, 4).unwrap();
+        doc.undo().unwrap().expect("отменять есть что");
+        doc.insert(3, b"ab").unwrap();
+        doc.undo().unwrap().expect("отменять есть что");
+        doc.undo().unwrap().expect("отменять есть что");
+        assert_eq!(doc.read(), b"xy\n");
+        doc.insert(2, b"\n").unwrap();
+        assert_eq!(doc.read(), b"xy\n\n");
+    }
+
+    #[test]
     fn a_snapshot_survives_a_random_history() {
         // Снапшот снимается в произвольный момент под нагрузкой: восстановленный
         // документ должен совпасть и текстом, и историей.

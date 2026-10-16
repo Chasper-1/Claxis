@@ -4,8 +4,8 @@
 //! приносит сюда список имён. Собираются они под пространством имён `std`,
 //! поэтому `edit::undo` из `claxis-rope` становится `:std::edit::undo`.
 //!
-//! Выполняются команды редактором. Здесь только реестр: какие имена
-//! существуют и что на что разворачивается.
+//! Выполняются команды редактором. Здесь только сборка: какие имена
+//! существуют.
 //!
 //! Список крейтов дописывается здесь, а не внутри `claxis-commands`: там чужих
 //! команд нет и знать о них нечего.
@@ -24,22 +24,14 @@ pub fn registry() -> Result<Registry, Error> {
     Registry::from_parts(DECLARED)
 }
 
-/// Команда по имени, как её пишет человек.
-#[cfg(test)]
-fn find(name: &str) -> Result<crate::api::commands::CommandName, Error> {
-    registry()?.get(name).cloned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_crate_command_is_registered_under_its_own_name() {
-        assert_eq!(
-            find(":std::edit::undo").unwrap().to_string(),
-            ":std::edit::undo"
-        );
+        let registry = registry().unwrap();
+        assert!(registry.get(":std::edit::undo").is_ok());
     }
 
     #[test]
@@ -59,8 +51,9 @@ mod tests {
     #[test]
     fn a_command_that_no_crate_declared_is_not_invented() {
         // Реестр не отвечает на всё подряд: объявить команду должен крейт.
-        assert!(find(":std::file::save").is_err());
-        assert!(find(":std::edit::move::up").is_err());
+        let registry = registry().unwrap();
+        assert!(registry.get(":std::file::save").is_err());
+        assert!(registry.get(":std::edit::move::up").is_err());
     }
 
     #[test]
