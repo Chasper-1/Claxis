@@ -1,14 +1,12 @@
 //! Ручки крейта `claxis-buffer`.
 //!
-//! Один файл на крейт. Здесь только то, что крейт отдаёт наружу: типы и
-//! функции. Реализация лежит в самом крейте, а связь с ручками других
-//! крейтов делает маршрутизатор `crate::router`.
+//! Один файл на крейт. Здесь только то, что крейт отдаёт наружу: документ,
+//! его правки, история, снятая в байты, и каталог сообщений об ошибках.
 
-pub use claxis_buffer::En;
-pub use claxis_buffer::defaults::buffer::HISTORY_DEPTH;
-pub use claxis_buffer::history;
+pub use claxis_buffer::commands::COMMANDS;
+pub use claxis_buffer::defaults;
 pub use claxis_buffer::messages;
 pub use claxis_buffer::{
-    Buffer, DEFAULT_DEPTH, En as MessagesEn, Error, History, MAX_DEPTH, Messages, NullSink,
-    ORIGINAL_ID, ParseError, Record, RecordId, Segment, SnapshotSink, substitute,
+    DEFAULT_DEPTH, Document, En, Error, History, MIN_DEPTH, Memory, Messages, NullSink, ParseError,
+    Record, Result, SnapshotSink, substitute,
 };

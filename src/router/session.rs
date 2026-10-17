@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::api::disk::{KEEP, PERSIST, SnapshotStore, StorePaths};
-use crate::api::rope::defaults::buffer::HISTORY_DEPTH;
-use crate::api::rope::{
+use crate::api::buffer::defaults::buffer::HISTORY_DEPTH;
+use crate::api::buffer::{
     Document as Rope, Error as RopeError, History, MIN_DEPTH, Record as RopeRecord, SnapshotSink,
 };
+use crate::api::disk::{KEEP, PERSIST, SnapshotStore, StorePaths};
 use crate::messages::Messages;
 use crate::router::lines::LineMap;
 use crate::router::stats::{self, Stats};
@@ -24,7 +24,7 @@ use crate::router::stats::{self, Stats};
 #[derive(Debug)]
 pub enum SessionError {
     /// Документ не создан: глубина истории недопустима.
-    Buffer(crate::api::rope::Error),
+    Buffer(crate::api::buffer::Error),
     /// Хранилище не открылось.
     Store { path: String, reason: String },
     /// Файл документа не прочитан.
@@ -1269,7 +1269,7 @@ mod tests {
     fn buffer_and_store_do_not_know_each_other() {
         // Стык сделан в роутере: крейты не зависят друг от друга.
         // Проверяем, что документ работает и без приёмника вообще.
-        let mut doc = crate::api::rope::Document::new("начало".as_bytes());
+        let mut doc = crate::api::buffer::Document::new("начало".as_bytes());
         for _ in 0..9000 {
             doc.insert(doc.len(), b"x").unwrap();
         }
@@ -1415,7 +1415,7 @@ mod tests {
         let session = Session::open_at(tmp.dir.clone(), crate::api::disk::KEEP).unwrap();
         assert_eq!(
             session.history_depth(),
-            crate::api::rope::defaults::buffer::HISTORY_DEPTH.value
+            crate::api::buffer::defaults::buffer::HISTORY_DEPTH.value
         );
         assert_eq!(session.persist(), crate::api::disk::PERSIST);
     }
@@ -1573,7 +1573,7 @@ mod tests {
         assert!(snapshot.history.len() > 5, "в блобе есть версия");
 
         // И разбирается тем же кодом, без потерь.
-        let restored = crate::api::rope::History::decode(&snapshot.history)
+        let restored = crate::api::buffer::History::decode(&snapshot.history)
             .expect("блоб из базы — наш")
             .restore()
             .expect("документ собирается");

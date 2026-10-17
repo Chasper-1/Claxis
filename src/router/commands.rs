@@ -10,8 +10,8 @@
 //! Список крейтов дописывается здесь, а не внутри `claxis-commands`: там чужих
 //! команд нет и знать о них нечего.
 
+use crate::api::buffer::COMMANDS;
 use crate::api::commands::{Error, Registry};
-use crate::api::rope::COMMANDS;
 
 /// Объявления крейтов: список имён из каждого `commands.rs`.
 const DECLARED: &[(&str, &[&str])] = &[("std", COMMANDS)];

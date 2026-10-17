@@ -1,12 +1,11 @@
 //! Ручки крейта `claxis-rope`.
 //!
-//! Один файл на крейт. Здесь только то, что крейт отдаёт наружу: документ,
-//! его правки, история, снятая в байты, и каталог сообщений об ошибках.
+//! Один файл на крейт. Здесь только то, что крейт отдаёт наружу: дерево,
+//! листья, пул узлов.
 
-pub use claxis_rope::commands::COMMANDS;
-pub use claxis_rope::defaults;
-pub use claxis_rope::messages;
-pub use claxis_rope::{
-    DEFAULT_DEPTH, Document, En, Error, History, MIN_DEPTH, Memory, Messages, NullSink, ParseError,
-    Record, Result, SnapshotSink, substitute,
-};
+pub use claxis_rope::chunk::chunk_size;
+pub use claxis_rope::leaf::Leaf;
+pub use claxis_rope::node::{Branch, Node};
+pub use claxis_rope::pool::Pool;
+pub use claxis_rope::tree::Tree;
+pub use claxis_rope::{Document, Error};

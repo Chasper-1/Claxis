@@ -13,7 +13,7 @@ pub trait Messages {
     /// Файл документа не прочитан.
     fn read_file_failed(&self, path: &str, reason: &str) -> String;
     /// Ошибка буфера: делегирует в каталог буфера.
-    fn buffer_error(&self, error: &crate::api::rope::Error) -> String;
+    fn buffer_error(&self, error: &crate::api::buffer::Error) -> String;
     /// Ошибка команды: делегирует в каталог команд.
     fn commands_error(&self, error: &crate::api::commands::Error) -> String;
     /// Каталог конфига недоступен: `{path}`, `{reason}`.
@@ -65,8 +65,8 @@ impl Messages for En {
         )
     }
 
-    fn buffer_error(&self, error: &crate::api::rope::Error) -> String {
-        error.message(&crate::api::rope::En)
+    fn buffer_error(&self, error: &crate::api::buffer::Error) -> String {
+        error.message(&crate::api::buffer::En)
     }
 
     fn commands_error(&self, error: &crate::api::commands::Error) -> String {
@@ -143,7 +143,7 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ),
         (
             "buffer_error",
-            m.buffer_error(&crate::api::rope::Error::TruncatedHistory),
+            m.buffer_error(&crate::api::buffer::Error::TruncatedHistory),
         ),
         (
             "commands_error",
