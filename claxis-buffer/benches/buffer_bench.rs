@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use claxis_rope::Document;
+use claxis_buffer::Document;
 
 /// Число **вставок**, а не листьев: лист появляется там, где вставка режет
 /// существующий диапазон, и их всегда больше, чем вставок.
@@ -202,9 +202,9 @@ fn fmt(d: std::time::Duration) -> String {
 fn main() {
     println!(
         "глубина истории: {} записей (снапшот по исчерпании)",
-        claxis_rope::DEFAULT_DEPTH
+        claxis_buffer::DEFAULT_DEPTH
     );
-    println!("размер узла: {} байт", claxis_rope::Node::size());
+    println!("размер узла: {} байт", claxis_buffer::Node::size());
     println!();
     bench_insert();
     println!();
