@@ -1330,6 +1330,26 @@ mod tests {
     }
 
     #[test]
+    fn typing_at_the_end_keeps_one_leaf() {
+        // Набор в конец файла — обычный случай. Вставленное примыкает в буфере
+        // к предыдущему и смыкается с ним, поэтому дерево остаётся в одном
+        // листе. Без склейки на нажатие оставался бы лист, и дерево росло бы
+        // вместе с набором.
+        let mut doc = Document::new(vec![b'a'; 1000]);
+        for _ in 0..500 {
+            doc.insert(doc.len(), b"x").unwrap();
+        }
+        let text = doc.read();
+        assert_eq!(text.len(), 1500);
+        assert!(text.ends_with(&vec![b'x'; 500]));
+        assert_eq!(
+            doc.leaves().len(),
+            1,
+            "набор в конец должен держать один лист"
+        );
+    }
+
+    #[test]
     fn undoing_everything_puts_the_leaves_back_together() {
         // Отмена вставки вырезает вставленное, и оставшиеся куски листа
         // снова смыкаются в буфере. Дерево после полного отката обязано

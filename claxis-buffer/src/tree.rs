@@ -5,11 +5,6 @@
 
 use crate::node::{FREE, Leaf, NIL, Node};
 
-/// Старший бит байта вида: узел-лист.
-const LEAF_BIT: u8 = 0x80;
-/// Младшие биты байта вида: высота ветки.
-const HEIGHT_MASK: u8 = 0x7F;
-
 /// Глубина, дальше которой обход считается зацикленным.
 const MAX_DEPTH: u32 = 128;
 
@@ -38,14 +33,11 @@ pub struct TreeStats {
 /// Свободные узлы хранятся в самих освобождённых узлах: поле `a` держит
 /// индекс следующего. Отдельного вектора нет, и в горячем пути аллокаций нет.
 ///
-/// Вид узла — лист или ветка и её высота — лежит в `node_flags`, рядом с
-/// узлом: в двенадцати байтах узла на признак места нет, а отдать под него
-/// биты индекса нельзя.
+/// Вид узла — лист или ветка и её высота — упакован в сам узел: спуск читает
+/// один массив `nodes`, а не второй рядом.
 #[derive(Debug)]
 pub struct Tree {
     nodes: Vec<Node>,
-    /// Вид узла: старший бит — лист, младшие семь — высота ветки.
-    node_flags: Vec<u8>,
     /// Корень.
     pub root: u32,
     /// Длина документа.
@@ -64,7 +56,6 @@ impl Tree {
     pub fn new() -> Self {
         Self {
             nodes: vec![FREE],
-            node_flags: vec![0],
             root: NIL,
             len: 0,
             leaves: 0,
@@ -85,7 +76,7 @@ impl Tree {
     /// Лист ли узел.
     #[inline]
     fn is_leaf(&self, id: u32) -> bool {
-        self.node_flags[id as usize] & LEAF_BIT != 0
+        self.nodes[id as usize].is_leaf()
     }
 
     /// Высота узла: у листа — единица, у ветки — из байта вида.
@@ -93,10 +84,8 @@ impl Tree {
     fn node_height(&self, id: u32) -> u32 {
         if id == NIL {
             0
-        } else if self.is_leaf(id) {
-            1
         } else {
-            (self.node_flags[id as usize] & HEIGHT_MASK) as u32
+            self.nodes[id as usize].height()
         }
     }
 
@@ -153,16 +142,13 @@ impl Tree {
     fn make_branch(&mut self, left: u32, right: u32) -> u32 {
         let len = self.node_text_len(left) + self.node_text_len(right);
         let height = 1 + self.node_height(left).max(self.node_height(right));
-        let id = self.alloc_node(Node::branch(left, right, len));
-        self.store_height(id, height);
-        id
+        self.alloc_node(Node::branch(left, right, len, height))
     }
 
     /// Выделить лист.
     #[inline]
     pub fn alloc_leaf(&mut self, start: u32, len: u32) -> u32 {
         let id = self.alloc_node(Node::leaf(start, len));
-        self.node_flags[id as usize] = LEAF_BIT;
         self.leaves += 1;
         id
     }
@@ -182,19 +168,10 @@ impl Tree {
         } else {
             let id = self.nodes.len() as u32;
             self.nodes.push(FREE);
-            self.node_flags.push(0);
             id
         };
         self.nodes[id as usize] = node;
-        self.node_flags[id as usize] = 0;
         id
-    }
-
-    /// Записать высоту ветки, не трогая метку листа.
-    #[inline]
-    fn store_height(&mut self, id: u32, height: u32) {
-        self.node_flags[id as usize] =
-            (self.node_flags[id as usize] & LEAF_BIT) | (height.min(HEIGHT_MASK as u32) as u8);
     }
 
     /// Вернуть узел в свободные.
@@ -203,7 +180,6 @@ impl Tree {
             self.leaves -= 1;
         }
         self.nodes[id as usize] = Node::new(self.free_head, 0, 0);
-        self.node_flags[id as usize] = 0;
         self.free_head = id;
     }
 
@@ -226,8 +202,6 @@ impl Tree {
     pub fn reset(&mut self) {
         self.nodes.clear();
         self.nodes.push(FREE);
-        self.node_flags.clear();
-        self.node_flags.push(0);
         self.root = NIL;
         self.len = 0;
         self.leaves = 0;
@@ -1191,7 +1165,7 @@ mod tests {
         let leaf = tree.alloc_leaf(0, 2);
         let branch = tree.make_branch(leaf, leaf);
         tree.root = branch;
-        tree.nodes[branch as usize] = Node::branch(branch, branch, 4);
+        tree.nodes[branch as usize] = Node::branch(branch, branch, 4, 1);
         assert!(!tree.debug_sound());
         assert_eq!(tree.debug_reachable_nodes(), None);
     }
