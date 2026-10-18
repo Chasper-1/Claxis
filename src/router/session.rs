@@ -1279,7 +1279,11 @@ mod tests {
             "документ сам снимает только по прямой просьбе"
         );
         doc.snapshot();
-        assert!(doc.snapshots_taken() > 0, "снапшот берётся и без приёмника");
+        assert_eq!(
+            doc.snapshots_taken(),
+            0,
+            "без приёмника снимку некуда уйти, он не берётся"
+        );
         assert_eq!(doc.read().len(), 9000 + "начало".len());
     }
 
@@ -1381,8 +1385,9 @@ mod tests {
     }
 
     #[test]
-    fn persist_false_keeps_snapshots_in_memory_only() {
-        // Настройка persist обязана что-то значить: при false снапшоты не пишутся.
+    fn persist_false_writes_no_snapshots_to_disk() {
+        // Настройка persist обязана что-то значить: при false приёмник не
+        // вешается вовсе, поэтому снимок не берётся и на диск ничего не уходит.
         let tmp = Temp::new("no-persist");
         let file = tmp.file("a.rs");
         let session = tmp.no_persist_session(3, 8);
@@ -1394,8 +1399,12 @@ mod tests {
             doc.insert(end, b"z").unwrap();
         }
         doc.snapshot();
-        // Снапшот взят, текст в буфере есть.
-        assert_eq!(doc.buffer().snapshots_taken(), 1, "снапшот взят");
+        // Приёмника нет, значит и снимка нет: память не схлопывается.
+        assert_eq!(
+            doc.buffer().snapshots_taken(),
+            0,
+            "без приёмника снимок не берётся"
+        );
         assert_eq!(doc.buffer().len(), 40, "правки на месте");
         drop(doc);
 

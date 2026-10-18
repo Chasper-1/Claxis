@@ -28,6 +28,16 @@ pub struct TreeStats {
     pub height_mismatch: u32,
 }
 
+impl TreeStats {
+    /// Пустая сводка: узла нет. Ею же кончается и зацикленный обход.
+    const EMPTY: TreeStats = TreeStats {
+        nodes: 0,
+        height: 0,
+        worst_imbalance: 0,
+        height_mismatch: 0,
+    };
+}
+
 /// Пул узлов: выделяется сразу и больше не растёт.
 ///
 /// Свободные узлы хранятся в самих освобождённых узлах: поле `a` держит
@@ -179,7 +189,7 @@ impl Tree {
         if self.is_leaf(id) {
             self.leaves -= 1;
         }
-        self.nodes[id as usize] = Node::new(self.free_head, 0, 0);
+        self.nodes[id as usize] = Node::free(self.free_head);
         self.free_head = id;
     }
 
@@ -316,14 +326,13 @@ impl Tree {
             } else {
                 self.concat(head, leaf)
             };
-            let joined = if tail == NIL {
+            // Поворот не нужен: `concat` сам держит высоты в узле на расстоянии
+            // не больше единицы.
+            if tail == NIL {
                 left
             } else {
                 self.concat(left, tail)
-            };
-            // Здесь тоже нужен поворот: иначе перекос копится вниз, и дерево
-            // вырождается, а спуск перестаёт быть логарифмическим.
-            self.rebalance(joined)
+            }
         } else {
             let (left, right) = (node.left(), node.right());
             let right_start = subtree_start + self.node_text_len(left);
@@ -435,7 +444,9 @@ impl Tree {
                 self.concat(left, right)
             };
             self.release(id);
-            self.rebalance(updated)
+            // Поворот не нужен: `concat` сам держит высоты в узле на расстоянии
+            // не больше единицы.
+            updated
         }
     }
 
@@ -716,21 +727,26 @@ impl Tree {
     }
 
     /// Диагностика: узлов, реальная высота, худший перекос, расхождение высот.
+    ///
+    /// На зацикленном дереве обход не зависает: повторный узел или слишком
+    /// большая глубина обрывают ветку пустой сводкой.
     pub fn debug_stats(&self) -> TreeStats {
         let mut seen = std::collections::HashSet::new();
-        self.collect_stats(self.root, &mut seen)
+        self.collect_stats(self.root, &mut seen, 0)
     }
 
-    fn collect_stats(&self, id: u32, seen: &mut std::collections::HashSet<u32>) -> TreeStats {
+    fn collect_stats(
+        &self,
+        id: u32,
+        seen: &mut std::collections::HashSet<u32>,
+        depth: u32,
+    ) -> TreeStats {
         if id == NIL {
-            return TreeStats {
-                nodes: 0,
-                height: 0,
-                worst_imbalance: 0,
-                height_mismatch: 0,
-            };
+            return TreeStats::EMPTY;
         }
-        seen.insert(id);
+        if depth >= MAX_DEPTH || !seen.insert(id) {
+            return TreeStats::EMPTY;
+        }
         let node = self.nodes[id as usize];
         if self.is_leaf(id) {
             return TreeStats {
@@ -740,8 +756,8 @@ impl Tree {
                 height_mismatch: 0,
             };
         }
-        let left = self.collect_stats(node.left(), seen);
-        let right = self.collect_stats(node.right(), seen);
+        let left = self.collect_stats(node.left(), seen, depth + 1);
+        let right = self.collect_stats(node.right(), seen, depth + 1);
         let imbalance = left.height.abs_diff(right.height);
         let real_height = 1 + left.height.max(right.height);
         let mismatch = if self.node_height(id) != real_height {

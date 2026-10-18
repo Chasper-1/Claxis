@@ -235,9 +235,10 @@ impl Document {
                 removed_len,
                 ..
             } => {
-                self.tree.cut(anchor, anchor + removed_len);
+                // Один проход вместо вырезания и вставки: тем же путём идёт
+                // разбор истории.
                 let leaf = self.tree.alloc_leaf(text_offset, head - anchor);
-                self.tree.insert_leaf(anchor, leaf);
+                self.tree.replace(anchor, removed_len, leaf);
             }
         }
         Ok(Some(child))
