@@ -12,7 +12,6 @@ dependencies = [
  "claxis-disk",
  "claxis-i18n",
  "claxis-input",
- "claxis-rope",
  "claxis-term",
  "claxis-text",
  "claxis-theme",
@@ -87,13 +86,6 @@ dependencies = [
 [[package]]
 name = "claxis-input"
 version = "0.2.3"
-
-[[package]]
-name = "claxis-rope"
-version = "0.3.0"
-dependencies = [
- "claxis-text",
-]
 
 [[package]]
 name = "claxis-term"
