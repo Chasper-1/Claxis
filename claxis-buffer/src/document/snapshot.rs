@@ -608,4 +608,75 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    fn the_tree_stays_sound_across_snapshots_and_undos() -> Result<()> {
+        // Снимок схлопывает дерево в один лист, а откат за границу памяти
+        // собирает текст заново из снимка. После каждого шага дерево обязано
+        // остаться связным и ровно покрыть текст: ошибка тут всплывает не
+        // сразу, а после серии снимков и переходов.
+        for seed in 0..6u64 {
+            let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
+            let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
+            let mut doc = Document::new(b"base").unwrap();
+            doc.set_sink(
+                std::path::PathBuf::from("/tmp/snap.txt"),
+                Box::new(Share(std::rc::Rc::clone(&ring))),
+            );
+            let mut text = b"base".to_vec();
+
+            for step in 0..300 {
+                match rng.below(10) {
+                    0..=2 if !text.is_empty() => {
+                        let pos = rng.below(text.len());
+                        let len = 1 + rng.below((text.len() - pos).min(20));
+                        doc.delete(pos as u32, len as u32)?;
+                        text.drain(pos..pos + len);
+                    }
+                    3..=6 => {
+                        let pos = rng.below(text.len() + 1);
+                        doc.insert(pos as u32, b"q")?;
+                        text.splice(pos..pos, b"q".iter().copied());
+                    }
+                    _ => doc.snapshot(),
+                }
+                assert_eq!(doc.read(), text, "seed {seed} step {step}: текст разошёлся");
+                let stats = doc.tree_debug_stats().expect("дерево не зациклено");
+                assert!(
+                    doc.tree_is_sound(),
+                    "seed {seed} step {step}: дерево не связно"
+                );
+                assert_eq!(stats.height_mismatch, 0, "seed {seed} step {step}: высота");
+                assert!(
+                    stats.worst_imbalance <= 1,
+                    "seed {seed} step {step}: перекос {}",
+                    stats.worst_imbalance
+                );
+                let total: u64 = doc.leaves().iter().map(|leaf| leaf.len as u64).sum();
+                assert_eq!(total, doc.len() as u64, "seed {seed} step {step}: листья");
+            }
+
+            // Откат до основания: текст обязан вернуться байт в байт, а дерево
+            // — оставаться связным на каждом шаге, в том числе за границами
+            // памяти.
+            while doc.undo()?.is_some() {
+                let stats = doc.tree_debug_stats().expect("дерево не зациклено");
+                assert!(
+                    doc.tree_is_sound(),
+                    "seed {seed}: дерево развалилось при откате"
+                );
+                assert_eq!(stats.height_mismatch, 0, "seed {seed}: высота при откате");
+                assert!(
+                    stats.worst_imbalance <= 1,
+                    "seed {seed}: перекос при откате"
+                );
+            }
+            assert_eq!(
+                doc.read(),
+                b"base",
+                "seed {seed}: откат не дошёл до основания"
+            );
+        }
+        Ok(())
+    }
 }

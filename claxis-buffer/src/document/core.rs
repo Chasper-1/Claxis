@@ -543,4 +543,219 @@ mod tests {
             })
         );
     }
+
+    /// Проверить устройство документа: текст, дерево и буфер разом.
+    ///
+    /// Это не сверка с эталоном, а проверка внутренней согласованности. Она
+    /// ловит то, чего не видит один лишь текст: дерево может разъехаться по
+    /// высоте или уронить лист за буфер и при этом ещё несколько шагов
+    /// читаться верно, прежде чем развалиться.
+    fn assert_sound(doc: &Document, text: &[u8], what: &str) {
+        assert_eq!(doc.read(), text, "{what}: текст разошёлся");
+        assert_eq!(doc.len() as usize, text.len(), "{what}: длина разошлась");
+
+        let stats = doc.tree_debug_stats().expect("дерево не зациклено");
+        assert!(doc.tree_is_sound(), "{what}: дерево не связно");
+        assert_eq!(stats.height_mismatch, 0, "{what}: высота в узле разошлась");
+        assert_eq!(
+            stats.height,
+            doc.height(),
+            "{what}: высота корня не сошлась"
+        );
+        assert!(
+            stats.worst_imbalance <= 1,
+            "{what}: перекос {}",
+            stats.worst_imbalance
+        );
+
+        let mut total = 0u64;
+        for leaf in doc.leaves() {
+            assert!(leaf.len > 0, "{what}: пустой лист {leaf:?}");
+            let end = leaf.start as u64 + leaf.len as u64;
+            assert!(
+                end <= doc.buffer_len() as u64,
+                "{what}: лист {leaf:?} вышел за буфер длиной {}",
+                doc.buffer_len()
+            );
+            total += leaf.len as u64;
+        }
+        assert_eq!(
+            total,
+            text.len() as u64,
+            "{what}: листья не покрывают текст"
+        );
+    }
+
+    #[test]
+    fn the_document_stays_sound_under_random_edits() {
+        // Сверка с эталоном ловит неверный текст, но не поломку устройства:
+        // дерево может разъехаться по высоте и всё ещё читаться верно. Здесь
+        // после каждой правки, отмены и повтора проверяется и текст, и дерево,
+        // и буфер.
+        for seed in 0..12u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
+            let mut doc = Document::new(b"base").unwrap();
+            let mut text = b"base".to_vec();
+            let mut history: Vec<Op> = Vec::new();
+            let mut cursor = 0usize;
+
+            for step in 0..800 {
+                let what = format!("seed {seed} step {step}");
+                match rng.below(11) {
+                    0..=3 if !text.is_empty() => {
+                        let pos = rng.below(text.len());
+                        let len = 1 + rng.below((text.len() - pos).min(24));
+                        let removed = text[pos..pos + len].to_vec();
+                        doc.delete(pos as u32, len as u32).unwrap();
+                        text.drain(pos..pos + len);
+                        history.truncate(cursor);
+                        history.push(Op::Delete { pos, removed });
+                        cursor = history.len();
+                    }
+                    4..=6 => {
+                        let pos = rng.below(text.len() + 1);
+                        let typed: Vec<u8> = (0..1 + rng.below(16))
+                            .map(|_| b'a' + rng.below(26) as u8)
+                            .collect();
+                        doc.insert(pos as u32, &typed).unwrap();
+                        text.splice(pos..pos, typed.iter().copied());
+                        history.truncate(cursor);
+                        history.push(Op::Insert { pos, text: typed });
+                        cursor = history.len();
+                    }
+                    7..=8 => {
+                        let pos = rng.below(text.len() + 1);
+                        let len = rng.below((text.len() - pos).min(24));
+                        let removed = text[pos..pos + len].to_vec();
+                        let typed: Vec<u8> = (0..1 + rng.below(12))
+                            .map(|_| b'a' + rng.below(26) as u8)
+                            .collect();
+                        doc.replace(pos as u32, len as u32, &typed).unwrap();
+                        text.splice(pos..pos + len, typed.iter().copied());
+                        history.truncate(cursor);
+                        history.push(Op::Replace {
+                            pos,
+                            removed,
+                            text: typed,
+                        });
+                        cursor = history.len();
+                    }
+                    9 if cursor > 0 => {
+                        cursor -= 1;
+                        doc.undo().unwrap().expect("отменять есть что");
+                        match &history[cursor] {
+                            Op::Insert { pos, text: t } => {
+                                text.drain(*pos..*pos + t.len());
+                            }
+                            Op::Delete { pos, removed } => {
+                                text.splice(*pos..*pos, removed.iter().copied());
+                            }
+                            Op::Replace {
+                                pos,
+                                removed,
+                                text: t,
+                            } => {
+                                text.drain(*pos..*pos + t.len());
+                                text.splice(*pos..*pos, removed.iter().copied());
+                            }
+                        }
+                    }
+                    _ if cursor < history.len() => {
+                        doc.redo().unwrap().expect("повтор доступен");
+                        match &history[cursor] {
+                            Op::Insert { pos, text: t } => {
+                                text.splice(*pos..*pos, t.iter().copied());
+                            }
+                            Op::Delete { pos, removed } => {
+                                text.drain(*pos..*pos + removed.len());
+                            }
+                            Op::Replace {
+                                pos,
+                                removed,
+                                text: t,
+                            } => {
+                                text.splice(*pos..*pos + removed.len(), t.iter().copied());
+                            }
+                        }
+                        cursor += 1;
+                    }
+                    _ => continue,
+                }
+                assert_sound(&doc, &text, &what);
+                assert_eq!(doc.path().len(), cursor, "{what}: история разошлась");
+            }
+        }
+    }
+
+    #[test]
+    fn random_edits_survive_a_history_round_trip() {
+        // Снапшот уходит байтами и приходит байтами же. После случайных правок
+        // восстановленный документ обязан читаться так же и отменяться
+        // синхронно с исходным — до самого основания.
+        for seed in 0..8u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xD1B54A32D192ED03) | 1);
+            let mut doc = Document::new(b"base").unwrap();
+            let mut text = b"base".to_vec();
+            for _ in 0..300 {
+                let roll = rng.below(10);
+                if roll < 3 && !text.is_empty() {
+                    let pos = rng.below(text.len());
+                    let len = 1 + rng.below((text.len() - pos).min(20));
+                    doc.delete(pos as u32, len as u32).unwrap();
+                    text.drain(pos..pos + len);
+                } else if roll < 7 {
+                    let pos = rng.below(text.len() + 1);
+                    let typed: Vec<u8> = (0..1 + rng.below(12))
+                        .map(|_| b'a' + rng.below(26) as u8)
+                        .collect();
+                    doc.insert(pos as u32, &typed).unwrap();
+                    text.splice(pos..pos, typed.iter().copied());
+                } else if !text.is_empty() {
+                    let pos = rng.below(text.len());
+                    let len = 1 + rng.below((text.len() - pos).min(20));
+                    let typed: Vec<u8> = (0..1 + rng.below(12))
+                        .map(|_| b'a' + rng.below(26) as u8)
+                        .collect();
+                    doc.replace(pos as u32, len as u32, &typed).unwrap();
+                    text.splice(pos..pos + len, typed.iter().copied());
+                }
+            }
+
+            let expected = doc.read();
+            assert_eq!(expected, text, "seed {seed}: эталон разошёлся с документом");
+
+            let stored = history::History::capture(&doc);
+            let mut back = history::History::decode(stored.as_bytes())
+                .expect("блоб разбирается")
+                .restore(DEFAULT_DEPTH)
+                .expect("документ собирается");
+            assert_eq!(
+                back.read(),
+                expected,
+                "seed {seed}: текст не пережил снапшот"
+            );
+            assert_sound(&back, &expected, &format!("seed {seed} из снапшота"));
+
+            // Отменяем оба в ногу: история одна, значит и текст на каждом шаге
+            // один.
+            loop {
+                let left = doc.undo().unwrap();
+                let right = back.undo().unwrap();
+                assert_eq!(
+                    left.is_some(),
+                    right.is_some(),
+                    "seed {seed}: истории разной длины"
+                );
+                if left.is_none() {
+                    break;
+                }
+                assert_eq!(doc.read(), back.read(), "seed {seed}: отмена разошлась");
+            }
+            assert_eq!(
+                doc.read(),
+                b"base",
+                "seed {seed}: отмена не дошла до основания"
+            );
+        }
+    }
 }

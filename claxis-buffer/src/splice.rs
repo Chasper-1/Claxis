@@ -367,3 +367,97 @@ impl Tree {
         id
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Tree;
+
+    /// Генератор чисел: детерминированный, чтобы падение воспроизводилось.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u32) -> u32 {
+            if n == 0 {
+                return 0;
+            }
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as u32
+        }
+    }
+
+    /// Проверить устройство дерева после перестройки.
+    ///
+    /// Высоты, перекос, полнота и покрытие текста листьями: эти поломки не
+    /// видны по одному чтению, а потом всплывают медленным спуском.
+    fn assert_sound(tree: &Tree, what: &str) {
+        let stats = tree.debug_stats().expect("дерево не зациклено");
+        assert!(tree.debug_sound(), "{what}: дерево не связно");
+        assert_eq!(stats.height_mismatch, 0, "{what}: высота в узле разошлась");
+        assert_eq!(
+            stats.height,
+            tree.height(),
+            "{what}: высота корня не сошлась"
+        );
+        assert!(
+            stats.worst_imbalance <= 1,
+            "{what}: перекос {}",
+            stats.worst_imbalance
+        );
+
+        let leaves = tree.leaves_in_order();
+        let total: u64 = leaves.iter().map(|leaf| leaf.len as u64).sum();
+        assert_eq!(total, tree.len as u64, "{what}: листья не покрывают текст");
+        if leaves.is_empty() {
+            assert_eq!(stats.nodes, 0, "{what}: пустое дерево с узлами");
+        } else {
+            assert_eq!(
+                stats.nodes,
+                leaves.len() * 2 - 1,
+                "{what}: дерево не полное"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tree_stays_sound_under_random_splices() {
+        // Прямая нагрузка на сборку: вставка, замена и вырезание вперемешку с
+        // произвольными диапазонами. Куски берутся из растущего буфера, чтобы
+        // смежные листья не сливались сами собой и балансировке было что
+        // делать. После каждой операции дерево обязано остаться связным,
+        // сбалансированным и ровно покрыть текст.
+        for seed in 0..16u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x2545F4914F6CDD1D) | 1);
+            let mut tree = Tree::new();
+            let mut watermark = 0u32;
+            for step in 0..600 {
+                let what = format!("seed {seed} step {step}");
+                let len = tree.len;
+                match rng.below(10) {
+                    0..=3 if len > 0 => {
+                        let start = rng.below(len);
+                        let end = start + 1 + rng.below(len - start);
+                        tree.cut(start, end);
+                    }
+                    4..=6 => {
+                        let pos = rng.below(len + 1);
+                        let take = 1 + rng.below(8);
+                        let leaf = tree.alloc_leaf(watermark, take);
+                        watermark += take;
+                        tree.insert_leaf(pos, leaf);
+                    }
+                    _ => {
+                        let pos = rng.below(len + 1);
+                        let removed = rng.below((len - pos).min(12));
+                        let take = 1 + rng.below(8);
+                        let leaf = tree.alloc_leaf(watermark, take);
+                        watermark += take;
+                        tree.replace(pos, removed, leaf);
+                    }
+                }
+                assert_sound(&tree, &what);
+            }
+        }
+    }
+}

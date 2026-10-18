@@ -424,6 +424,49 @@ mod tests {
     }
 
     #[test]
+    fn a_replace_removed_range_outside_the_buffer_is_refused() {
+        // У записи замены два диапазона: вставленное и вырезанное. Проверять
+        // надо оба: вырезанный кусок тоже читается из буфера при отмене.
+        let mut doc = d("abcdef");
+        doc.replace(1, 2, b"XY").unwrap();
+        let mut bytes = History::capture(&doc).as_bytes().to_vec();
+        let last = bytes.len() - RECORD_SIZE;
+        assert_eq!(bytes[last], REPLACE, "ожидалась запись замены");
+        bytes[last + 13..last + 17].copy_from_slice(&9_000u32.to_le_bytes());
+        let removed_len = u32::from_le_bytes([
+            bytes[last + 17],
+            bytes[last + 18],
+            bytes[last + 19],
+            bytes[last + 20],
+        ]);
+        assert_eq!(
+            History::decode(&bytes).unwrap_err(),
+            Error::HistoryOutOfBounds {
+                offset: 9_000,
+                len: removed_len
+            }
+        );
+    }
+
+    #[test]
+    fn base_is_the_original_file_after_edits() {
+        // Смысл основания — то, чем файл был, когда бралась история. Сверяя его
+        // с файлом на диске, редактор замечает правку, сделанную снаружи. После
+        // правок основание обязано остаться прежним, а не стать текущим текстом.
+        let mut doc = d("original");
+        for i in 0..10u32 {
+            doc.insert(i % (doc.len() + 1), b"x").unwrap();
+        }
+        assert_ne!(doc.read(), b"original", "правки должны были изменить текст");
+        let history = History::capture(&doc);
+        assert_eq!(
+            history.base().unwrap(),
+            b"original",
+            "основание — исходный файл, а не текущий текст"
+        );
+    }
+
+    #[test]
     fn a_captured_history_survives_a_round_trip() {
         // Обратная сторона проверок: хорошая история разбирается и
         // восстанавливается.
