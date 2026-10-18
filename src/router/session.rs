@@ -1272,7 +1272,7 @@ mod tests {
     fn buffer_and_store_do_not_know_each_other() {
         // Стык сделан в роутере: крейты не зависят друг от друга.
         // Проверяем, что документ работает и без приёмника вообще.
-        let mut doc = crate::api::buffer::Document::new("начало".as_bytes());
+        let mut doc = crate::api::buffer::Document::new("начало".as_bytes()).unwrap();
         for _ in 0..9000 {
             doc.insert(doc.len(), b"x").unwrap();
         }

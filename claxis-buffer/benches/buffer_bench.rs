@@ -14,7 +14,7 @@ const ROUNDS: u32 = 20_000;
 
 /// Тот же документ, что и у буфера: 500 КБ основания и рассеянные вставки.
 fn document(n: u32) -> Document {
-    let mut doc = Document::new(vec![b'a'; 500_000]);
+    let mut doc = Document::new(vec![b'a'; 500_000]).expect("valid document");
     for i in 0..n {
         doc.insert((i * 37) % (doc.len() + 1), b"xx").unwrap();
     }

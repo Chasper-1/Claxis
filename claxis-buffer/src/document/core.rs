@@ -12,6 +12,18 @@ use crate::tree::Tree;
 /// нельзя: глубина настраивается и потолка не имеет.
 const VERSION_RESERVE: usize = 8 * 1024;
 
+/// Длина текста, влезающая в 32-битное смещение буфера.
+///
+/// Проверка стоит до `as u32`: иначе длина обрезалась бы молча, и хвост
+/// документа исчез бы вместе с историей о нём. Вынесена отдельно, чтобы
+/// переполнение проверялось без настоящей четырёхгигабайтной аллокации.
+fn checked_len(bytes: usize) -> Result<u32> {
+    if bytes > u32::MAX as usize {
+        return Err(Error::BufferTooLarge { len: bytes as u64 });
+    }
+    Ok(bytes as u32)
+}
+
 /// Документ: текст, история и снапшоты.
 pub struct Document {
     /// Байты под деревом: исходный файл в начале, дальше вставки и вырезанное.
@@ -43,17 +55,12 @@ pub struct Document {
 impl Document {
     /// Документ с текстом и глубиной истории по умолчанию.
     ///
-    /// Без паники и без `Result`: глубина по умолчанию задана самим крейтом и
-    /// проверять тут нечего. Проверка остаётся у [`Document::with_depth`], где
-    /// глубину задаёт пользователь.
-    pub fn new(bytes: impl AsRef<[u8]>) -> Self {
-        let bytes = bytes.as_ref().to_vec();
-        debug_assert!(
-            bytes.len() <= u32::MAX as usize,
-            "document text exceeds the 32-bit length limit"
-        );
-        let len = bytes.len() as u32;
-        Self::assemble(bytes, len, DEFAULT_DEPTH)
+    /// Глубина по умолчанию задана самим крейтом, проверять её нечего. А вот
+    /// длину текста проверить надо: смещения в буфере 32-битные, и текст
+    /// длиннее [`u32::MAX`] байт не влезает. Тихая обрезка до `u32` потеряла
+    /// бы хвост документа, поэтому переполнение — ошибка.
+    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self> {
+        Self::with_depth(bytes, DEFAULT_DEPTH)
     }
 
     /// Документ с заданной глубиной истории.
@@ -62,11 +69,7 @@ impl Document {
             return Err(Error::InvalidHistoryDepth { depth });
         }
         let bytes = bytes.as_ref().to_vec();
-        debug_assert!(
-            bytes.len() <= u32::MAX as usize,
-            "document text exceeds the 32-bit length limit"
-        );
-        let len = bytes.len() as u32;
+        let len = checked_len(bytes.len())?;
         Ok(Self::assemble(bytes, len, depth))
     }
 
@@ -356,7 +359,7 @@ pub(super) mod support {
     }
 
     pub fn d(text: &str) -> Document {
-        Document::new(text.as_bytes())
+        Document::new(text.as_bytes()).expect("valid document")
     }
 
     /// Генератор чисел: детерминированный, чтобы падение воспроизводилось.
@@ -493,7 +496,7 @@ mod tests {
     fn an_empty_document_takes_everything() {
         // Пустой документ — не особый случай, но именно на нём чаще всего
         // вылезают ошибки границ.
-        let mut doc = Document::new(b"");
+        let mut doc = Document::new(b"").unwrap();
         assert!(doc.is_empty());
         assert_eq!(doc.len(), 0);
         assert_eq!(doc.read(), Vec::<u8>::new());
@@ -525,5 +528,19 @@ mod tests {
 
         doc.insert(0, "снова".as_bytes()).unwrap();
         assert_eq!(doc.read(), "снова".as_bytes());
+    }
+
+    #[test]
+    fn text_longer_than_a_u32_is_rejected() {
+        // Смещения буфера 32-битные: текст длиннее `u32::MAX` байт не влезает,
+        // и обрезать его молча нельзя. Проверяется без настоящей аллокации —
+        // через ту же функцию, что стоит в `with_depth`.
+        assert_eq!(checked_len(u32::MAX as usize), Ok(u32::MAX));
+        assert_eq!(
+            checked_len(u32::MAX as usize + 1),
+            Err(Error::BufferTooLarge {
+                len: u32::MAX as u64 + 1
+            })
+        );
     }
 }

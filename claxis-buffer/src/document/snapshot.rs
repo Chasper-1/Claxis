@@ -132,7 +132,7 @@ mod tests {
         // снимка пусто, но откат идёт дальше по кольцу — и не должен кончаться
         // на границе.
         let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
-        let mut doc = Document::new(b"abc");
+        let mut doc = Document::new(b"abc").unwrap();
         doc.set_sink(
             std::path::PathBuf::from("/tmp/d.txt"),
             Box::new(Share(std::rc::Rc::clone(&ring))),
@@ -158,7 +158,7 @@ mod tests {
         // После перехода через границу отказ должен продолжать работать
         // в том же сеансе: границ сколько угодно, и каждая не конец света.
         let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
-        let mut doc = Document::new(b"");
+        let mut doc = Document::new(b"").unwrap();
         doc.set_sink(
             std::path::PathBuf::from("/tmp/d.txt"),
             Box::new(Share(std::rc::Rc::clone(&ring))),
@@ -255,7 +255,7 @@ mod tests {
         // к предыдущему и смыкается с ним, поэтому дерево остаётся в одном
         // листе. Без склейки на нажатие оставался бы лист, и дерево росло бы
         // вместе с набором.
-        let mut doc = Document::new(vec![b'a'; 1000]);
+        let mut doc = Document::new(vec![b'a'; 1000]).unwrap();
         for _ in 0..500 {
             doc.insert(doc.len(), b"x").unwrap();
         }
@@ -369,7 +369,7 @@ mod tests {
     fn compacting_cuts_the_history_on_purpose() {
         // Схлопывание — отдельная операция после сохранения файла. Вот тут
         // история обрезается, и это осознанно.
-        let mut doc = Document::new(b"abc");
+        let mut doc = Document::new(b"abc").unwrap();
         doc.insert(3, b"XY").unwrap();
         assert_eq!(doc.path().len(), 1);
 
@@ -389,7 +389,7 @@ mod tests {
     fn a_snapshot_leaves_undo_working_after_it() {
         // Главное про память: отмена после снимка живая. Дальше по границу
         // уходит приёмник, а не обрыв цепочки.
-        let mut doc = Document::new(b"abc");
+        let mut doc = Document::new(b"abc").unwrap();
         doc.set_sink(
             std::path::PathBuf::from("/tmp/d.txt"),
             Box::new(Attached::default()),
@@ -407,7 +407,7 @@ mod tests {
     fn the_newest_snapshot_replaces_the_previous_one_in_memory() {
         // В памяти снимок один: новый вытесняет старый, но старый остаётся в
         // кольце. Откат за границу идёт по ним в порядке убывания.
-        let mut doc = Document::new(b"abc");
+        let mut doc = Document::new(b"abc").unwrap();
         doc.set_sink(
             std::path::PathBuf::from("/tmp/d.txt"),
             Box::new(Attached::default()),
@@ -428,7 +428,7 @@ mod tests {
         // медленным спуском по документу.
         // Текст латиницей: позиции в эталоне байтовые, и резать строку посреди
         // многобайтового символа нельзя — тест проверяет дерево, а не UTF-8.
-        let mut doc = Document::new("start\n".as_bytes());
+        let mut doc = Document::new("start\n".as_bytes()).unwrap();
         let mut rng = Rng(0x5DEECE66D);
         let mut reference = String::from("start\n");
         // Последняя правка была заменой: что вставили и что там было.
@@ -499,7 +499,7 @@ mod tests {
     fn tree_stays_balanced_under_churn() -> Result<()> {
         // Баланс держится при любом порядке правок: иначе спуск перестаёт быть
         // логарифмическим.
-        let mut doc = Document::new(b"a");
+        let mut doc = Document::new(b"a").unwrap();
         let mut rng = Rng(99);
         for _ in 0..2000 {
             let len = doc.len();
@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn memory_does_not_run_away() {
-        let mut doc = Document::new(b"");
+        let mut doc = Document::new(b"").unwrap();
         for i in 0..8000u32 {
             doc.insert(i % (doc.len() + 1), b"xyz").unwrap();
         }
@@ -559,7 +559,7 @@ mod tests {
             m.tree_bytes() + m.text_capacity + m.versions * m.version_size,
         );
         assert_eq!(doc.read().len(), 24_000);
-        assert_eq!(Document::new(b"").history_depth(), DEFAULT_DEPTH);
+        assert_eq!(Document::new(b"").unwrap().history_depth(), DEFAULT_DEPTH);
     }
 
     #[test]
@@ -568,7 +568,7 @@ mod tests {
         // документ должен совпасть и текстом, и историей.
         for seed in 0..4u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
-            let mut doc = Document::new("начало".as_bytes());
+            let mut doc = Document::new("начало".as_bytes()).unwrap();
             for _ in 0..200 {
                 let len = doc.len();
                 let pos = rng.below(len as usize + 1) as u32;

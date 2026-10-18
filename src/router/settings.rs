@@ -267,6 +267,14 @@ mod tests {
         .parse::<u32>()
         .unwrap();
         assert_eq!(settings.history_depth, depth);
+        // Схема конфига и умолчание буфера — два разных источника одного
+        // значения. Разойтись они не должны: иначе подключённый буфер и
+        // сгенерированный конфиг говорили бы разное.
+        assert_eq!(
+            crate::api::buffer::defaults::buffer::HISTORY_DEPTH.value,
+            depth,
+            "умолчание буфера и умолчание схемы конфига обязаны совпадать"
+        );
         assert_eq!(settings.snapshots_keep, 3);
         assert!(settings.snapshots_persist);
         assert_eq!(settings.language, "en");

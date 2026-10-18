@@ -562,7 +562,7 @@ mod tests {
         // повторов: любое расхождение означает битый документ.
         for seed in 0..8u64 {
             let mut rng = Rng(seed.wrapping_mul(0x2545F4914F6CDD1D).wrapping_add(7));
-            let mut doc = Document::new(b"seed");
+            let mut doc = Document::new(b"seed").unwrap();
             let mut text = String::from("seed");
             let mut steps: Vec<Op> = Vec::new();
             let mut cursor = 0usize;
@@ -673,7 +673,7 @@ mod tests {
         // следующая правка отбрасывает redo-ветку. Обрезка резала буфер по
         // отброшенным записям и оставляла лист читать участок, которого уже
         // нет.
-        let mut doc = Document::new(b"");
+        let mut doc = Document::new(b"").unwrap();
         doc.replace(0, 0, b"xy\n").unwrap();
         doc.replace(3, 0, b"xy\n").unwrap();
         doc.delete(1, 4).unwrap();
@@ -832,7 +832,7 @@ mod tests {
             let base: String = (0..base_len).map(|i| (b'a' + i as u8) as char).collect();
             for pos in 0..=base_len {
                 for len in 0..=(base_len - pos) {
-                    let mut doc = Document::new(base.as_bytes());
+                    let mut doc = Document::new(base.as_bytes()).unwrap();
                     doc.replace(pos as u32, len as u32, b"XYZ").unwrap();
                     let mut want = base.clone();
                     want.replace_range(pos..pos + len, "XYZ");

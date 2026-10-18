@@ -274,6 +274,15 @@ impl Header {
         }
         let file_len = read_u32(5).ok_or(crate::Error::TruncatedHistory)? as usize;
         let buf_len = read_u32(9).ok_or(crate::Error::TruncatedHistory)? as usize;
+        // Основание документа — первые `file_len` байт буфера. Если их больше,
+        // чем весь буфер, блоб противоречив: `base()` вернул бы кусок из
+        // области записей, а восстановление приняло бы его за текст файла.
+        if file_len > buf_len {
+            return Err(crate::Error::HistoryOutOfBounds {
+                offset: 0,
+                len: file_len as u32,
+            });
+        }
         let buffer_at: usize = 13;
         let records_at = buffer_at
             .checked_add(buf_len)
@@ -303,7 +312,7 @@ mod tests {
     use crate::document::Document;
 
     fn d(text: &str) -> Document {
-        Document::new(text.as_bytes())
+        Document::new(text.as_bytes()).expect("valid document")
     }
 
     #[test]
@@ -391,6 +400,27 @@ mod tests {
                 len: 1
             }
         );
+    }
+
+    #[test]
+    fn a_base_longer_than_the_buffer_is_refused() {
+        // Поле длины файла приходит из блоба. Если оно больше всего буфера,
+        // `base()` вернул бы кусок области записей как основание документа,
+        // а восстановление приняло бы его за текст файла. Такой блоб
+        // противоречив и должен быть отвергнут при разборе заголовка.
+        let mut doc = d("abc");
+        doc.insert(3, b"XY").unwrap();
+        let mut bytes = History::capture(&doc).as_bytes().to_vec();
+        let buf_len = u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+        let file_len = buf_len + 100;
+        bytes[5..9].copy_from_slice(&file_len.to_le_bytes());
+        let expected = Error::HistoryOutOfBounds {
+            offset: 0,
+            len: file_len,
+        };
+        assert_eq!(History::decode(&bytes).unwrap_err(), expected);
+        let history = History { bytes };
+        assert_eq!(history.base().unwrap_err(), expected);
     }
 
     #[test]
