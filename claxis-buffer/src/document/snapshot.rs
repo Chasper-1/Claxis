@@ -34,15 +34,18 @@ impl Document {
         };
         self.snapshots += 1;
         sink.accept(&file, &document, history.as_bytes());
-        self.compact();
+        // Готовый текст снимка идёт в схлопывание: второй раз документ не
+        // собирается.
+        self.compact_with(document);
     }
 
     /// Схлопнуть документ в одну базу и обрезать историю в памяти.
     ///
     /// Память не должна расти вместе с правками, поэтому после снимка
-    /// история обрезается, а то, что было до неё, лежит в снимке.
-    fn compact(&mut self) {
-        let document = self.read();
+    /// история обрезается, а то, что было до неё, лежит в снимке. Текст уже
+    /// собран вызывающим — тот, кто снимал снимок, читал документ и для
+    /// приёмника.
+    fn compact_with(&mut self, document: Vec<u8>) {
         self.bytes = document;
         self.file_len = self.bytes.len() as u32;
         self.tree.collapse_to(0, self.file_len);
@@ -81,9 +84,11 @@ impl Document {
 
     /// Статистика памяти.
     pub fn memory(&self) -> Memory {
+        // Свободный список обходится один раз: и для `nodes`, и как `free`.
+        let free = self.tree.free_len();
         Memory {
-            nodes: self.tree.node_count(),
-            free: self.tree.free_len(),
+            nodes: self.tree.node_count_with(free),
+            free,
             capacity: self.tree.capacity(),
             leaves: self.tree.leaves,
             node_size: Node::size(),
@@ -105,7 +110,7 @@ impl Document {
     }
 
     /// Диагностика дерева: узлов, высота, худший перекос, расхождение высот.
-    pub fn tree_debug_stats(&self) -> crate::tree::TreeStats {
+    pub fn tree_debug_stats(&self) -> Option<crate::tree::TreeStats> {
         self.tree.debug_stats()
     }
 
@@ -172,6 +177,29 @@ mod tests {
     }
 
     #[test]
+    fn crossing_the_boundary_keeps_the_depth_and_the_counters() {
+        // Снимок — это состояние текста, а не новая сессия. Глубина истории и
+        // счётчики снимков принадлежат документу и обязаны пережить переход
+        // через границу памяти, иначе настройка теряется, а счётчики врут.
+        let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
+        let mut doc = Document::with_depth(b"abc", 5).unwrap();
+        doc.set_sink(
+            std::path::PathBuf::from("/tmp/d.txt"),
+            Box::new(Share(std::rc::Rc::clone(&ring))),
+        );
+        for _ in 0..3 {
+            doc.insert(doc.len(), b"x").unwrap();
+            doc.snapshot();
+        }
+        assert_eq!(doc.snapshots_taken(), 3);
+        assert_eq!(doc.path().len(), 0, "в памяти пусто");
+
+        doc.undo().unwrap().expect("откат за границу памяти");
+        assert_eq!(doc.history_depth(), 5, "глубина истории пережила снимок");
+        assert_eq!(doc.snapshots_taken(), 3, "счётчик снимков не сброшен");
+    }
+
+    #[test]
     fn the_leaf_counter_tells_the_truth() -> Result<()> {
         // Счётчик листьев живёт в дереве, а на него смотрят диагностика и
         // выделение памяти. Разъехаться он может незаметно: листья появляются и
@@ -217,7 +245,7 @@ mod tests {
         assert_eq!(
             doc.leaves().len(),
             1002,
-            "на нажатие должен оставаться один лист"
+            "на нажатие должен добавляться один лист, а не два"
         );
     }
 
@@ -310,7 +338,7 @@ mod tests {
         };
         assert_eq!(text, b"bcXY");
 
-        let mut back = history.restore().expect("снапшот разбирается");
+        let mut back = history.restore(DEFAULT_DEPTH).expect("снапшот разбирается");
         assert_eq!(back.read(), text);
         back.undo().unwrap().expect("история восстановлена");
         assert_eq!(back.read(), b"abcXY");
@@ -345,7 +373,8 @@ mod tests {
         doc.insert(3, b"XY").unwrap();
         assert_eq!(doc.path().len(), 1);
 
-        doc.compact();
+        let document = doc.read();
+        doc.compact_with(document);
         assert_eq!(doc.compacts_taken(), 1);
         assert_eq!(doc.path().len(), 0, "после схлопывания история пуста");
         assert_eq!(doc.read(), b"abcXY", "текст при этом цел");
@@ -453,7 +482,7 @@ mod tests {
             assert_eq!(doc.read(), reference.as_bytes());
         }
 
-        let stats = doc.tree_debug_stats();
+        let stats = doc.tree_debug_stats().expect("дерево не зациклено");
         assert_eq!(
             stats.height_mismatch, 0,
             "высота в узле разошлась с настоящей"
@@ -483,7 +512,7 @@ mod tests {
                 doc.insert(pos, b"xy")?;
             }
         }
-        let stats = doc.tree_debug_stats();
+        let stats = doc.tree_debug_stats().expect("дерево не зациклено");
         let leaves = doc.leaves().len();
         if leaves > 0 {
             // Сплошное дерево из n листьев всегда ровно 2n − 1 узлов.
@@ -556,7 +585,7 @@ mod tests {
             }
             let text = doc.read();
             let captured = history::History::capture(&doc);
-            let mut back = captured.restore()?;
+            let mut back = captured.restore(DEFAULT_DEPTH)?;
             assert_eq!(back.read(), text, "seed {seed}: текст разошёлся");
             assert_eq!(
                 back.path().len(),

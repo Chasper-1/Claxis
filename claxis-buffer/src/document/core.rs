@@ -41,6 +41,10 @@ impl Document {
     /// глубину задаёт пользователь.
     pub fn new(bytes: impl AsRef<[u8]>) -> Self {
         let bytes = bytes.as_ref().to_vec();
+        debug_assert!(
+            bytes.len() <= u32::MAX as usize,
+            "document text exceeds the 32-bit length limit"
+        );
         let len = bytes.len() as u32;
         Self::assemble(bytes, len, DEFAULT_DEPTH)
     }
@@ -51,6 +55,10 @@ impl Document {
             return Err(Error::InvalidHistoryDepth { depth });
         }
         let bytes = bytes.as_ref().to_vec();
+        debug_assert!(
+            bytes.len() <= u32::MAX as usize,
+            "document text exceeds the 32-bit length limit"
+        );
         let len = bytes.len() as u32;
         Ok(Self::assemble(bytes, len, depth))
     }
@@ -60,9 +68,17 @@ impl Document {
     /// Основание — первые `file_len` байт, остальное хвост: так записи
     /// получают верные смещения, а документ остаётся ровно файлом.
     pub fn from_buffer(bytes: Vec<u8>, file_len: usize) -> Self {
+        Self::from_buffer_with_depth(bytes, file_len, DEFAULT_DEPTH)
+    }
+
+    /// Документ из готового буфера с заданной глубиной истории.
+    ///
+    /// Нужен восстановлению: история не хранит глубину, и без неё документ
+    /// после разбора снимка терял бы настройку и снимал снимки не тогда.
+    pub(crate) fn from_buffer_with_depth(bytes: Vec<u8>, file_len: usize, depth: u32) -> Self {
         let file_len = file_len.min(bytes.len());
         let file_len = file_len as u32;
-        Self::assemble(bytes, file_len, DEFAULT_DEPTH)
+        Self::assemble(bytes, file_len, depth)
     }
 
     fn assemble(bytes: Vec<u8>, file_len: u32, depth: u32) -> Self {
@@ -432,7 +448,7 @@ mod tests {
         assert_eq!(doc.leaves().len(), 0, "листьев не осталось");
 
         // Дерево пустое, но обязано остаться связным.
-        let stats = doc.tree_debug_stats();
+        let stats = doc.tree_debug_stats().expect("дерево не зациклено");
         assert_eq!(stats.nodes, 0);
         assert_eq!(stats.height, 0);
         assert_eq!(stats.worst_imbalance, 0);

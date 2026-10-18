@@ -3,7 +3,7 @@
 //! Дерево сбалансировано по высоте. Спуск к позиции идёт за O(log n) по длинам
 //! поддеревьев, которые кэшируются в ветке.
 
-use crate::node::{FREE, Leaf, NIL, Node};
+use crate::node::{FREE, Leaf, MAX_NODES, NIL, Node};
 
 /// Глубина, дальше которой обход считается зацикленным.
 const MAX_DEPTH: u32 = 128;
@@ -29,7 +29,7 @@ pub struct TreeStats {
 }
 
 impl TreeStats {
-    /// Пустая сводка: узла нет. Ею же кончается и зацикленный обход.
+    /// Пустая сводка: узла нет.
     const EMPTY: TreeStats = TreeStats {
         nodes: 0,
         height: 0,
@@ -56,6 +56,13 @@ pub struct Tree {
     pub leaves: usize,
     /// Голова списка свободных.
     free_head: u32,
+    /// Самое позднее место буфера среди когда-либо выделенных листьев.
+    ///
+    /// Обновляется при выделении листа и не уменьшается до [`Tree::reset`]:
+    /// это верхняя граница, а не точный максимум по живым листьям. Так её и
+    /// спрашивает обрезка буфера — обрезать меньше безопасно, а обходить всё
+    /// дерево на каждой правке ради байта-двух нет.
+    leaf_watermark: u32,
 }
 
 impl Tree {
@@ -70,6 +77,7 @@ impl Tree {
             len: 0,
             leaves: 0,
             free_head: NIL,
+            leaf_watermark: 0,
         }
     }
 
@@ -118,9 +126,17 @@ impl Tree {
 
     /// Занято узлов.
     pub fn node_count(&self) -> usize {
+        self.node_count_with(self.free_len())
+    }
+
+    /// Занято узлов, если число свободных уже известно.
+    ///
+    /// `free_len` обходит свободный список, а вызывающему он может быть нужен
+    /// сам. Тогда обход делается один раз, а не два.
+    pub fn node_count_with(&self, free: usize) -> usize {
         // Выделено минус один (слот 0 зарезервирован) минус свободные.
         let allocated = self.nodes.len().saturating_sub(1);
-        allocated.saturating_sub(self.free_len())
+        allocated.saturating_sub(free)
     }
 
     /// Свободно узлов.
@@ -137,6 +153,20 @@ impl Tree {
     /// Ёмкость пула.
     pub fn capacity(&self) -> usize {
         self.nodes.capacity()
+    }
+
+    /// Занято слотов пула, вместе с зарезервированным под `NIL`.
+    pub fn slot_len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Помещается ли в индекс ещё `extra` слотов.
+    ///
+    /// Индекс узла — двадцать четыре бита, и упереться в него пул может молча:
+    /// новый узел получил бы обрезанный номер и указывал бы не туда. Поэтому
+    /// запас спрашивают заранее — до правки, а не после.
+    pub fn has_room_for_nodes(&self, extra: usize) -> bool {
+        self.nodes.len().saturating_add(extra) <= MAX_NODES
     }
 
     /// Высота дерева — для проверки баланса.
@@ -160,6 +190,10 @@ impl Tree {
     pub fn alloc_leaf(&mut self, start: u32, len: u32) -> u32 {
         let id = self.alloc_node(Node::leaf(start, len));
         self.leaves += 1;
+        let end = start.saturating_add(len);
+        if end > self.leaf_watermark {
+            self.leaf_watermark = end;
+        }
         id
     }
 
@@ -216,6 +250,7 @@ impl Tree {
         self.len = 0;
         self.leaves = 0;
         self.free_head = NIL;
+        self.leaf_watermark = 0;
     }
 
     /// Схлопнуть дерево в один лист, не перевыделяя пул.
@@ -650,27 +685,16 @@ impl Tree {
         leaves
     }
 
-    /// Самое позднее место буфера, куда заглядывает хоть один лист.
+    /// Граница буфера, до которой стоит его хранить: за ней ни один лист уже
+    /// не читает.
     ///
-    /// За хвостом этого места буфер не читает ни один лист, и обрезать его
-    /// можно по этому месту. Считается обходом дерева, без выделения памяти.
+    /// Верхняя граница, а не точный максимум: она не меньше конца любого
+    /// живого листа, но может помнить и раньше освобождённый дальний лист.
+    /// Обрезать по ней безопасно, а стоит она O(1) — обход дерева на каждой
+    /// правке не нужен.
+    #[inline]
     pub fn leaf_end(&self) -> u32 {
-        let mut end = 0;
-        self.max_leaf_end(self.root, &mut end);
-        end
-    }
-
-    fn max_leaf_end(&self, id: u32, end: &mut u32) {
-        if id == NIL {
-            return;
-        }
-        let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
-            *end = (*end).max(node.start().saturating_add(node.leaf_len()));
-        } else {
-            self.max_leaf_end(node.left(), end);
-            self.max_leaf_end(node.right(), end);
-        }
+        self.leaf_watermark
     }
 
     fn collect_leaves(&self, id: u32, leaves: &mut Vec<Leaf>) {
@@ -728,9 +752,11 @@ impl Tree {
 
     /// Диагностика: узлов, реальная высота, худший перекос, расхождение высот.
     ///
-    /// На зацикленном дереве обход не зависает: повторный узел или слишком
-    /// большая глубина обрывают ветку пустой сводкой.
-    pub fn debug_stats(&self) -> TreeStats {
+    /// Обход не зависает на зацикленном дереве — на повторном узле или слишком
+    /// большой глубине он обрывается. И раз обрыв — это не «пусто», а «дерево
+    /// не такое, каким должно быть», сводки в этом случае нет вовсе: `None`
+    /// честнее пустой сводки, по которой вышло бы, что всё в порядке.
+    pub fn debug_stats(&self) -> Option<TreeStats> {
         let mut seen = std::collections::HashSet::new();
         self.collect_stats(self.root, &mut seen, 0)
     }
@@ -740,24 +766,24 @@ impl Tree {
         id: u32,
         seen: &mut std::collections::HashSet<u32>,
         depth: u32,
-    ) -> TreeStats {
+    ) -> Option<TreeStats> {
         if id == NIL {
-            return TreeStats::EMPTY;
+            return Some(TreeStats::EMPTY);
         }
         if depth >= MAX_DEPTH || !seen.insert(id) {
-            return TreeStats::EMPTY;
+            return None;
         }
         let node = self.nodes[id as usize];
         if self.is_leaf(id) {
-            return TreeStats {
+            return Some(TreeStats {
                 nodes: 1,
                 height: 1,
                 worst_imbalance: 0,
                 height_mismatch: 0,
-            };
+            });
         }
-        let left = self.collect_stats(node.left(), seen, depth + 1);
-        let right = self.collect_stats(node.right(), seen, depth + 1);
+        let left = self.collect_stats(node.left(), seen, depth + 1)?;
+        let right = self.collect_stats(node.right(), seen, depth + 1)?;
         let imbalance = left.height.abs_diff(right.height);
         let real_height = 1 + left.height.max(right.height);
         let mismatch = if self.node_height(id) != real_height {
@@ -765,7 +791,7 @@ impl Tree {
         } else {
             0
         };
-        TreeStats {
+        Some(TreeStats {
             nodes: left.nodes + right.nodes + 1,
             height: real_height,
             worst_imbalance: imbalance
@@ -774,7 +800,7 @@ impl Tree {
             height_mismatch: mismatch
                 .max(left.height_mismatch)
                 .max(right.height_mismatch),
-        }
+        })
     }
 }
 
@@ -903,6 +929,18 @@ mod tests {
         assert_eq!(tree.leaves, 0);
         assert_eq!(tree.node_count(), 0);
         assert_eq!(tree.free_len(), 0);
+    }
+
+    #[test]
+    fn the_node_index_has_a_ceiling() {
+        // Индекс узла 24-битный: слотов помещается ровно `MAX_NODES`. Слот 0
+        // занят под `NIL`, поэтому пул из одного только пустого дерева уже
+        // съел одно место.
+        let tree = Tree::new();
+        assert_eq!(tree.slot_len(), 1);
+        assert!(tree.has_room_for_nodes(MAX_NODES - 1), "ровно до потолка");
+        assert!(!tree.has_room_for_nodes(MAX_NODES), "на узел больше — нет");
+        assert!(!Tree::new().has_room_for_nodes(usize::MAX));
     }
 
     #[test]
@@ -1152,7 +1190,7 @@ mod tests {
             let leaf = tree.alloc_leaf(i * 4, 2);
             tree.insert_leaf(tree.len, leaf);
         }
-        let stats = tree.debug_stats();
+        let stats = tree.debug_stats().expect("дерево не зациклено");
         assert_eq!(stats.height, tree.height());
         assert!(
             stats.worst_imbalance <= 1,
@@ -1166,7 +1204,7 @@ mod tests {
 
     #[test]
     fn debug_stats_on_an_empty_tree() {
-        let stats = Tree::new().debug_stats();
+        let stats = Tree::new().debug_stats().expect("дерево не зациклено");
         assert_eq!(stats.nodes, 0);
         assert_eq!(stats.height, 0);
         assert_eq!(stats.worst_imbalance, 0);
@@ -1184,6 +1222,7 @@ mod tests {
         tree.nodes[branch as usize] = Node::branch(branch, branch, 4, 1);
         assert!(!tree.debug_sound());
         assert_eq!(tree.debug_reachable_nodes(), None);
+        assert_eq!(tree.debug_stats(), None, "зацикленное дерево — без сводки");
     }
 
     #[test]

@@ -8,6 +8,16 @@ pub enum Error {
         /// Сколько байт просили положить.
         len: u64,
     },
+    /// Пул узлов заполнен: индекс узла 24-битный, и новый узел получил бы
+    /// обрезанный номер.
+    ///
+    /// Правки дробят текст на листья, и упереться в потолок пула можно раньше,
+    /// чем в потолок буфера. Узел с обрезанным индексом указал бы не туда
+    /// молча, поэтому правка отвергается, не начавшись.
+    NodePoolFull {
+        /// Сколько слотов пула занято сейчас.
+        nodes: usize,
+    },
     /// Глубина истории вне диапазона `min..`.
     ///
     /// Потолка нет: история растёт вместе с правками и память добирается по
@@ -74,6 +84,9 @@ impl Error {
                 doc_len,
             } => messages.out_of_bounds(*anchor, anchor.saturating_add(*len), *doc_len),
             Error::BufferTooLarge { len } => messages.buffer_too_large(*len),
+            Error::NodePoolFull { nodes } => {
+                messages.node_pool_full(*nodes, crate::node::MAX_NODES)
+            }
             Error::InvalidHistoryDepth { depth } => messages.invalid_history_depth(*depth, 1),
             Error::NotOurHistory => messages.not_our_history(),
             Error::UnknownHistoryVersion { version } => {

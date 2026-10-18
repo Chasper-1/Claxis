@@ -742,7 +742,10 @@ impl Session {
                 match history.base() {
                     // Файл тот же, на котором снят снапшот: применяем.
                     Ok(base) if base == text.as_slice() => {
-                        if let Ok(restored) = history.restore() {
+                        // Глубина берётся у уже открытого буфера: в снимке её
+                        // нет, а восстановленный документ должен снимать
+                        // снимки по настройке, а не по умолчанию.
+                        if let Ok(restored) = history.restore(buffer.history_depth()) {
                             buffer = restored;
                         }
                     }
@@ -1584,7 +1587,7 @@ mod tests {
         // И разбирается тем же кодом, без потерь.
         let restored = crate::api::buffer::History::decode(&snapshot.history)
             .expect("блоб из базы — наш")
-            .restore()
+            .restore(crate::api::buffer::DEFAULT_DEPTH)
             .expect("документ собирается");
         assert_eq!(restored.read(), b"abcXY\n");
     }

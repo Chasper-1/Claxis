@@ -3,6 +3,14 @@ use super::error::{Error, Result};
 use super::record::{Record, Version, record_end};
 use crate::node::NIL;
 
+/// Запас узлов, который держится про запас до потолка пула.
+///
+/// Одна правка добавляет узлов не больше, чем высота дерева: балансировка
+/// держит её логарифмической, а [`crate::tree`] считает зацикленной глубину
+/// сверх 128. Запас в разы больше этой границы, так что проверка перед правкой
+/// ловит потолок заранее, а сама правка в него не упирается.
+const NODE_HEADROOM: usize = 4096;
+
 impl Document {
     fn check(&self, anchor: u32, len: u32) -> Result<()> {
         if anchor as u64 + len as u64 > self.tree.len as u64 {
@@ -10,6 +18,19 @@ impl Document {
                 anchor,
                 len,
                 doc_len: self.tree.len,
+            });
+        }
+        Ok(())
+    }
+
+    /// Есть ли в пуле узлов запас на правку.
+    ///
+    /// Зовётся до побочных действий: правка, которой не хватило узлов, должна
+    /// закончиться ошибкой, ничего не тронув.
+    fn ensure_node_room(&self) -> Result<()> {
+        if !self.tree.has_room_for_nodes(NODE_HEADROOM) {
+            return Err(Error::NodePoolFull {
+                nodes: self.tree.slot_len(),
             });
         }
         Ok(())
@@ -23,6 +44,10 @@ impl Document {
         if data.is_empty() {
             return Ok(());
         }
+        // Место проверяется до `discard_redo`: не удавшаяся правка не должна
+        // стоить потерянной redo-ветки. `append` потом уже не упадёт.
+        self.ensure_buffer_room(data.len())?;
+        self.ensure_node_room()?;
         self.discard_redo();
         let text_offset = self.append(data)?;
         let len = data.len() as u32;
@@ -41,6 +66,10 @@ impl Document {
         if len == 0 {
             return Ok(());
         }
+        // Вырезанный кусок равен `len`, и он копируется в хвост: место под
+        // копию проверяется до отбрасывания redo-ветки.
+        self.ensure_buffer_room(len as usize)?;
+        self.ensure_node_room()?;
         self.discard_redo();
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а
         // второго буфера быть не должно.
@@ -64,6 +93,10 @@ impl Document {
         if len == 0 && data.is_empty() {
             return Ok(());
         }
+        // В хвост уезжают и вырезанное, и вставленное: место под оба куска
+        // проверяется до отбрасывания redo-ветки.
+        self.ensure_buffer_room(len as usize + data.len())?;
+        self.ensure_node_room()?;
         self.discard_redo();
 
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а второго
@@ -91,18 +124,22 @@ impl Document {
     /// Смещения в буфере 32-битные, поэтому за четыре гигабайта положить
     /// нечего: попытка — это ошибка, а не тихая обрезка до нуля.
     fn append(&mut self, data: &[u8]) -> Result<u32> {
-        let offset = self.bytes.len();
-        let end = offset
-            .checked_add(data.len())
-            .ok_or(Error::BufferTooLarge {
-                len: offset as u64 + data.len() as u64,
-            })?;
-        if end > u32::MAX as usize {
-            return Err(Error::BufferTooLarge { len: end as u64 });
-        }
-        let offset = offset as u32;
+        self.ensure_buffer_room(data.len())?;
+        let offset = self.bytes.len() as u32;
         self.bytes.extend_from_slice(data);
         Ok(offset)
+    }
+
+    /// Поместится ли в буфер ещё `extra` байт.
+    ///
+    /// Отдельная проверка, чтобы её можно было сделать до побочных действий:
+    /// `append` падает с той же ошибкой, но уже после того, как правка началась.
+    fn ensure_buffer_room(&self, extra: usize) -> Result<()> {
+        let end = self.bytes.len() as u64 + extra as u64;
+        if end > u32::MAX as u64 {
+            return Err(Error::BufferTooLarge { len: end });
+        }
+        Ok(())
     }
 
     /// Отменить одну правку обратной операцией.
@@ -112,23 +149,26 @@ impl Document {
     /// него. В памяти лежит всего один снимок, поэтому переход за границу
     /// читает диск — но он происходит один раз на снимок, а не на правку.
     pub fn undo(&mut self) -> Result<Option<u32>> {
-        // Вершина 0 — корень, до первой правки. Отменять нечего, а её
-        // `parent` тоже ноль, поэтому смотрим на саму вершину.
-        if self.current == NIL
-            && let Some(step) = self.step_over_the_boundary()?
-        {
-            return Ok(Some(step));
+        self.ensure_node_room()?;
+        // Границ может быть сколько угодно подряд, и каждая со своим пустым
+        // хвостом истории. Цикл, а не рекурсия: иначе глубина стека равнялась
+        // бы числу снимков.
+        while self.current == NIL {
+            if !self.step_over_the_boundary_once()? {
+                return Ok(None);
+            }
         }
         let id = self.current;
-        if id == NIL {
-            return Ok(None);
-        }
         let parent = self.versions[id as usize].parent;
         let record = self.versions[id as usize].record;
-        self.current = parent;
+        // Всё, что может упасть, проверяется до сдвига вершины: не удавшаяся
+        // отмена не должна оставить историю на другой вершине.
         match record {
             // Отмена вставки: вырезать вставленное.
-            Record::Insert { anchor, head, .. } => self.tree.cut(anchor, head),
+            Record::Insert { anchor, head, .. } => {
+                self.current = parent;
+                self.tree.cut(anchor, head);
+            }
             // Отмена удаления: вернуть вырезанное.
             Record::Delete {
                 anchor,
@@ -136,6 +176,8 @@ impl Document {
                 text_offset,
             } => {
                 let len = head - anchor;
+                self.check_restore(text_offset, len)?;
+                self.current = parent;
                 self.restore(anchor, text_offset, len)?;
             }
             // Отмена замены: вырезать вставленное и вернуть вырезанное.
@@ -146,37 +188,44 @@ impl Document {
                 removed_len,
                 ..
             } => {
-                self.tree.cut(anchor, head);
-                if removed_len == 0 {
-                    return Ok(Some(id));
+                if removed_len > 0 {
+                    self.check_restore(removed_offset, removed_len)?;
                 }
-                self.restore(anchor, removed_offset, removed_len)?;
+                self.current = parent;
+                self.tree.cut(anchor, head);
+                if removed_len > 0 {
+                    self.restore(anchor, removed_offset, removed_len)?;
+                }
             }
         }
         Ok(Some(id))
     }
 
-    /// Перейти за границу памяти: взять снимок старее и отменить в нём одну
-    /// правку.
+    /// Перейти за границу памяти один раз: подтянуть снимок старее.
     ///
-    /// Снимок приходит целиком — с текстом и с историей, — поэтому документ
-    /// просто восстанавливается целиком. Дальше откат идёт по его истории, а он
-    /// в приёмнике остаётся: следующая граница не читает диск заново.
-    fn step_over_the_boundary(&mut self) -> Result<Option<u32>> {
+    /// `false` — снимков больше нет. Отмену сама не делает: её выполняет цикл
+    /// [`Document::undo`], чтобы не уходить в рекурсию на глубину снимков.
+    fn step_over_the_boundary_once(&mut self) -> Result<bool> {
         let Some(file) = self.file.clone() else {
-            return Ok(None);
+            return Ok(false);
         };
         let Some(sink) = self.sink.as_mut() else {
-            return Ok(None);
+            return Ok(false);
         };
         let Some(history) = sink.older(&file) else {
-            return Ok(None);
+            return Ok(false);
         };
+        let depth = self.depth;
         let snapshot = crate::history::History::decode(&history)
-            .and_then(|h| h.restore())
+            .and_then(|h| h.restore(depth))
             .map_err(|reason| Error::OlderSnapshotBroken {
                 reason: Box::new(reason),
             })?;
+        // Счётчики принадлежат документу, а не снимку: снимок — это состояние
+        // текста, а не новая сессия. Сбросить их значило бы соврать так же, как
+        // врал счётчик самих снимков.
+        let snapshots = self.snapshots;
+        let compacts = self.compacts;
         let sink = self.sink.take();
         let file = self.file.clone();
         let crossings = self.crossings;
@@ -186,7 +235,21 @@ impl Document {
         self.sink = sink;
         self.file = file;
         self.crossings = crossings + 1;
-        self.undo()
+        self.snapshots = snapshots;
+        self.compacts = compacts;
+        Ok(true)
+    }
+
+    /// Проверить, что кусок `from..from+len` есть в буфере и что копия
+    /// поместится в него. Ничего не меняет, поэтому зовётся до сдвига истории.
+    fn check_restore(&self, from: u32, len: u32) -> Result<()> {
+        let end = from
+            .checked_add(len)
+            .ok_or(Error::HistoryOutOfBounds { offset: from, len })?;
+        if end as usize > self.bytes.len() {
+            return Err(Error::HistoryOutOfBounds { offset: from, len });
+        }
+        self.ensure_buffer_room(len as usize)
     }
 
     /// Положить копию куска в хвост буфера и вставить её на место.
@@ -216,8 +279,28 @@ impl Document {
         if child == NIL {
             return Ok(None);
         }
-        self.current = child;
+        self.ensure_node_room()?;
         let record = self.versions[child as usize].record;
+        // Запись проверяется до сдвига вершины: битая запись не должна
+        // оставить историю на новой вершине при нетронутом дереве.
+        let doc_len = self.tree.len;
+        let fits = match record {
+            Record::Insert { anchor, head, .. } => anchor <= head && anchor <= doc_len,
+            Record::Delete { anchor, head, .. } => anchor <= head && head <= doc_len,
+            Record::Replace {
+                anchor,
+                removed_len,
+                ..
+            } => anchor as u64 + removed_len as u64 <= doc_len as u64,
+        };
+        if !fits {
+            return Err(Error::OutOfBounds {
+                anchor: record.anchor(),
+                len: record.len(),
+                doc_len,
+            });
+        }
+        self.current = child;
         match record {
             Record::Insert {
                 anchor,
@@ -336,9 +419,8 @@ impl Document {
     /// копии, которые положила отмена.
     ///
     /// Записи ветки берутся готовым числом у вершины, а не обходом: иначе
-    /// граница обрезки стоила бы столько же, сколько вся история. Листья
-    /// смотрятся обходом дерева — он идёт только при отброшенной ветке, то
-    /// есть не на каждое нажатие, а на замену ветки на другую.
+    /// граница обрезки стоила бы столько же, сколько вся история. Листья тоже
+    /// отдают свой конец сразу: его держит сам пул, а не обход дерева.
     fn live_end(&self) -> u32 {
         self.file_len
             .max(self.versions[self.current as usize].live)
@@ -701,7 +783,9 @@ mod tests {
         let cut = "исходный".len() as u32;
         doc.replace(0, cut, "новый".as_bytes()).unwrap();
         let history = history::History::capture(&doc);
-        let mut back = history.restore().expect("снапшот разбирается");
+        let mut back = history
+            .restore(crate::DEFAULT_DEPTH)
+            .expect("снапшот разбирается");
         assert_eq!(back.read(), "новый текст".as_bytes());
         back.undo().unwrap().expect("история живая");
         assert_eq!(back.read(), "исходный текст".as_bytes());

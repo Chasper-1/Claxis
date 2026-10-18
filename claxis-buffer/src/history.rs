@@ -159,7 +159,11 @@ impl History {
     ///
     /// Текст документа берётся из истории: он и есть состояние. Отдельный
     /// `text` не нужен — он записан рядом, тем же файлом.
-    pub fn restore(&self) -> Result<Document> {
+    ///
+    /// Глубину истории задаёт вызывающий: в снимке её нет, а восстановленный
+    /// документ должен продолжать работу с той же настройкой, а не с
+    /// умолчанием.
+    pub fn restore(&self, depth: u32) -> Result<Document> {
         let header = Header::parse(&self.bytes)?;
         let bytes = self.bytes.as_slice();
         let file_len = header.file_len;
@@ -170,7 +174,7 @@ impl History {
         let mut offset = header.records_at;
         let count = header.count;
 
-        let mut doc = Document::from_buffer(buffer.to_vec(), file_len);
+        let mut doc = Document::from_buffer_with_depth(buffer.to_vec(), file_len, depth);
         for _ in 0..count {
             let chunk = bytes
                 .get(offset..offset + RECORD)
@@ -396,9 +400,14 @@ mod tests {
         let history = History::capture(&doc);
         let mut restored = History::decode(history.as_bytes())
             .unwrap()
-            .restore()
+            .restore(7)
             .unwrap();
         assert_eq!(restored.read(), doc.read());
+        assert_eq!(
+            restored.history_depth(),
+            7,
+            "восстановление обязано вернуть заданную глубину истории"
+        );
         restored.undo().unwrap().expect("отменять есть что");
         assert_eq!(restored.read(), b"ZcXY");
     }
@@ -421,7 +430,7 @@ mod tests {
 
         let back = History::decode(&stored)
             .expect("блоб из базы разбирается")
-            .restore()
+            .restore(crate::DEFAULT_DEPTH)
             .expect("документ собирается");
         assert_eq!(back.read(), text);
         assert_eq!(back.path().len(), doc.path().len());
@@ -448,7 +457,9 @@ mod tests {
             at + 4,
             "кроме заголовка, буфера и нулевого счётчика ничего нет"
         );
-        let mut back = history.restore().expect("пустая история разбирается");
+        let mut back = history
+            .restore(crate::DEFAULT_DEPTH)
+            .expect("пустая история разбирается");
         assert_eq!(back.read(), doc.read());
         assert!(back.path().is_empty());
         assert!(back.undo().unwrap().is_none(), "отменять нечего");

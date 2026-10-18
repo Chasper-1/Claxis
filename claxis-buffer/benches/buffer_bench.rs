@@ -32,7 +32,7 @@ fn bench_insert() {
         let leaves = doc.leaves().len();
         // Высота — на документе, до замеров: циклы правок с широким удалением
         // снимают снапшот, и дерево схлопывается, а это не свойство rope.
-        let height = doc.tree_debug_stats().height;
+        let height = doc.tree_debug_stats().expect("дерево не зациклено").height;
         let mid = doc.len() / 2;
 
         let snaps_before = doc.snapshots_taken();

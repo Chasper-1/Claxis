@@ -14,7 +14,7 @@
 ///
 /// Места под значения: `{anchor}`, `{end}`, `{doc_len}`, `{len}`, `{depth}`,
 /// `{min}`, `{version}`, `{expected}`, `{kind}`, `{from}`, `{to}`, `{reason}`,
-/// `{got}`, `{tail}`.
+/// `{got}`, `{tail}`, `{nodes}`, `{limit}`.
 pub trait Messages {
     /// Вставка или удаление вышли за границы документа.
     fn out_of_bounds(&self, anchor: u32, end: u32, doc_len: u32) -> String;
@@ -24,6 +24,11 @@ pub trait Messages {
     ///
     /// `{len}` — сколько байт просили положить.
     fn buffer_too_large(&self, len: u64) -> String;
+
+    /// Пул узлов дерева заполнен.
+    ///
+    /// `{nodes}` — сколько слотов занято, `{limit}` — сколько их всего.
+    fn node_pool_full(&self, nodes: usize, limit: usize) -> String;
 
     /// Глубина истории вне допустимого диапазона.
     ///
@@ -138,6 +143,16 @@ impl Messages for En {
         )
     }
 
+    fn node_pool_full(&self, nodes: usize, limit: usize) -> String {
+        substitute(
+            "node pool is full: {nodes} of {limit} slots; the node index is 24-bit",
+            &[
+                ("nodes", group_digits(nodes as u64)),
+                ("limit", group_digits(limit as u64)),
+            ],
+        )
+    }
+
     fn invalid_history_depth(&self, depth: u32, min: u32) -> String {
         substitute(
             "invalid history depth {depth}: must be at least {min} records",
@@ -219,6 +234,10 @@ pub fn samples() -> Vec<(&'static str, String)> {
     vec![
         ("out_of_bounds", m.out_of_bounds(1_000, 2_000, 1_500)),
         ("buffer_too_large", m.buffer_too_large(4_294_967_296)),
+        (
+            "node_pool_full",
+            m.node_pool_full(crate::node::MAX_NODES, crate::node::MAX_NODES),
+        ),
         ("invalid_history_depth", m.invalid_history_depth(0, 1)),
         ("not_our_history", m.not_our_history()),
         (
