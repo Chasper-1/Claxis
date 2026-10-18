@@ -97,12 +97,6 @@ impl Tree {
         tree
     }
 
-    /// Лист ли узел.
-    #[inline]
-    fn is_leaf(&self, id: u32) -> bool {
-        self.nodes[id as usize].is_leaf()
-    }
-
     /// Высота узла: у листа — единица, у ветки — из байта вида.
     #[inline]
     fn node_height(&self, id: u32) -> u32 {
@@ -117,7 +111,12 @@ impl Tree {
     #[inline]
     pub fn node_text_len(&self, id: u32) -> u32 {
         // Обращение к пулу одно: вид узла лежит в нём самом, а не рядом.
-        let node = self.nodes[id as usize];
+        self.text_len_of(&self.nodes[id as usize])
+    }
+
+    /// Длина текста по уже прочитанному узлу — чтобы не читать пул второй раз.
+    #[inline]
+    fn text_len_of(&self, node: &Node) -> u32 {
         if node.is_leaf() {
             node.leaf_len()
         } else {
@@ -307,11 +306,18 @@ impl Tree {
         if right == NIL {
             return left;
         }
-        if self.adjacent_leaves(left, right) {
+        // Оба узла читаются один раз: вид, высота, границы и дети берутся из
+        // одного обращения к пулу, а не из трёх.
+        let left_node = self.nodes[left as usize];
+        let right_node = self.nodes[right as usize];
+        if left_node.is_leaf()
+            && right_node.is_leaf()
+            && right_node.start() == left_node.start().saturating_add(left_node.leaf_len())
+        {
             return self.merge_adjacent_leaves(left, right);
         }
-        if self.node_height(left) > self.node_height(right) + 1 {
-            let left_node = self.nodes[left as usize];
+        let (left_height, right_height) = (left_node.height(), right_node.height());
+        if left_height > right_height + 1 {
             let middle = self.concat(left_node.right(), right);
             let joined = self.make_branch(left_node.left(), middle);
             self.release(left);
@@ -319,8 +325,7 @@ impl Tree {
             // на два: классический join обязан повернуть на каждом уровне, а
             // не только на верхнем. Без этого перекос копится в глубине.
             self.rebalance(joined)
-        } else if self.node_height(right) > self.node_height(left) + 1 {
-            let right_node = self.nodes[right as usize];
+        } else if right_height > left_height + 1 {
             let middle = self.concat(left, right_node.left());
             let joined = self.make_branch(middle, right_node.right());
             self.release(right);
@@ -328,17 +333,6 @@ impl Tree {
         } else {
             self.make_branch(left, right)
         }
-    }
-
-    /// Идут ли два листа в буфере вплотную друг к другу.
-    fn adjacent_leaves(&self, left: u32, right: u32) -> bool {
-        let left_node = self.nodes[left as usize];
-        let right_node = self.nodes[right as usize];
-        // Вид берётся из уже прочитанных узлов: отдельные `is_leaf` читали бы
-        // пул ещё раз.
-        left_node.is_leaf()
-            && right_node.is_leaf()
-            && right_node.start() == left_node.start().saturating_add(left_node.leaf_len())
     }
 
     /// Склеить два смежных листа в один.
@@ -372,7 +366,7 @@ impl Tree {
             return leaf;
         }
         let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             let offset = pos - subtree_start;
             if offset == 0 {
                 return self.concat(leaf, id);
@@ -417,8 +411,11 @@ impl Tree {
     /// Один проход вместо двух: вырезать, потом вставить. Дерево перестраивается
     /// по пути один раз, повороты считаются один раз, а не на каждый проход.
     pub fn replace(&mut self, pos: u32, removed: u32, leaf: u32) {
+        // Длина листа читается один раз: она нужна и на проверку «пустой», и
+        // на прирост длины документа.
+        let gained = self.node_text_len(leaf);
         // Пустой лист ничего не вставляет: только вырезается диапазон.
-        if self.node_text_len(leaf) == 0 {
+        if gained == 0 {
             self.release(leaf);
             if removed > 0 {
                 self.cut(pos, pos + removed);
@@ -432,7 +429,6 @@ impl Tree {
             self.insert_leaf(pos, leaf);
             return;
         }
-        let gained = self.node_text_len(leaf);
         if self.root == NIL {
             self.root = leaf;
             self.len += gained;
@@ -455,12 +451,13 @@ impl Tree {
         if id == NIL {
             return leaf;
         }
-        let subtree_end = subtree_start + self.node_text_len(id);
+        // Узел читается один раз: из него и длина поддерева, и вид, и дети.
+        let node = self.nodes[id as usize];
+        let subtree_end = subtree_start + self.text_len_of(&node);
         if end <= subtree_start || start >= subtree_end {
             return id;
         }
-        let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             let buffer_start = node.start();
             let len = node.leaf_len();
             let head_len = start.saturating_sub(subtree_start);
@@ -524,12 +521,13 @@ impl Tree {
         if id == NIL {
             return NIL;
         }
-        let subtree_end = subtree_start + self.node_text_len(id);
+        // Узел читается один раз: из него и длина поддерева, и вид, и дети.
+        let node = self.nodes[id as usize];
+        let subtree_end = subtree_start + self.text_len_of(&node);
         if end <= subtree_start || start >= subtree_end {
             return id;
         }
-        let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             let hole_start = start.saturating_sub(subtree_start);
             let hole_end = (end - subtree_start).min(node.leaf_len());
             if hole_start >= hole_end {
@@ -601,14 +599,15 @@ impl Tree {
                 return id;
             }
             let (left_left, left_right) = (left_node.left(), left_node.right());
+            // `left_right` читается один раз: и на проверку «лист ли», и на
+            // высоту, и на детей.
+            let left_right_node = self.nodes[left_right as usize];
             // `(left_left, left_right, right)`: правый поворот даёт `left_left`
             // и `(left_right, right)`. Если перевесил правый ребёнок
             // `left_right`, сперва выправляется он, иначе перекос останется,
             // только переедет на уровень выше.
-            if !self.is_leaf(left_right)
-                && self.node_height(left_right) > self.node_height(left_left)
+            if !left_right_node.is_leaf() && left_right_node.height() > self.node_height(left_left)
             {
-                let left_right_node = self.nodes[left_right as usize];
                 let new_left = self.make_branch(left_left, left_right_node.left());
                 let new_right = self.make_branch(left_right_node.right(), right);
                 self.release(left_right);
@@ -627,10 +626,10 @@ impl Tree {
                 return id;
             }
             let (right_left, right_right) = (right_node.left(), right_node.right());
-            if !self.is_leaf(right_left)
-                && self.node_height(right_left) > self.node_height(right_right)
+            let right_left_node = self.nodes[right_left as usize];
+            if !right_left_node.is_leaf()
+                && right_left_node.height() > self.node_height(right_right)
             {
-                let right_left_node = self.nodes[right_left as usize];
                 let new_left = self.make_branch(left, right_left_node.left());
                 let new_right = self.make_branch(right_left_node.right(), right_right);
                 self.release(right_left);
@@ -658,7 +657,7 @@ impl Tree {
             return;
         }
         let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             sink.range(node.start(), node.leaf_len());
         } else {
             self.read_subtree_into(node.left(), sink);
@@ -685,12 +684,13 @@ impl Tree {
         if id == NIL {
             return;
         }
-        let subtree_end = subtree_start + self.node_text_len(id);
+        // Узел читается один раз: из него и длина поддерева, и вид, и дети.
+        let node = self.nodes[id as usize];
+        let subtree_end = subtree_start + self.text_len_of(&node);
         if end <= subtree_start || start >= subtree_end {
             return;
         }
-        let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             let from = start.saturating_sub(subtree_start);
             let to = (end - subtree_start).min(node.leaf_len());
             if from < to {
@@ -699,7 +699,7 @@ impl Tree {
             return;
         }
         let (left, right) = (node.left(), node.right());
-        let right_start = subtree_start + self.node_text_len(left);
+        let right_start = subtree_start + self.text_len_of(&self.nodes[left as usize]);
         self.read_range_within(left, subtree_start, start, end, sink);
         self.read_range_within(right, right_start, start, end, sink);
     }
@@ -728,7 +728,7 @@ impl Tree {
             return;
         }
         let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             leaves.push(Leaf {
                 start: node.start(),
                 len: node.leaf_len(),
