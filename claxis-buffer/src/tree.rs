@@ -940,6 +940,56 @@ mod tests {
     }
 
     #[test]
+    fn free_count_matches_the_free_list() {
+        // Счётчик свободных держится на месте ради O(1) `free_len`: он обязан
+        // совпадать с настоящим списком в любой момент.
+        fn walked(tree: &Tree) -> usize {
+            let mut count = 0;
+            let mut cursor = tree.free_head;
+            while cursor != NIL {
+                count += 1;
+                cursor = tree.nodes[cursor as usize].free_next();
+            }
+            count
+        }
+
+        let mut tree = Tree::new();
+        let a = tree.alloc_leaf(0, 2);
+        let b = tree.alloc_leaf(2, 2);
+        assert_eq!(tree.free_len(), 0);
+        assert_eq!(tree.free_len(), walked(&tree));
+
+        tree.release(a);
+        tree.release(b);
+        assert_eq!(tree.free_len(), 2);
+        assert_eq!(tree.free_len(), walked(&tree), "после освобождения");
+
+        let _c = tree.alloc_leaf(4, 2);
+        assert_eq!(tree.free_len(), 1);
+        assert_eq!(tree.free_len(), walked(&tree), "после переиспользования");
+
+        let _d = tree.alloc_leaf(6, 2);
+        assert_eq!(tree.free_len(), 0);
+        assert_eq!(tree.free_len(), walked(&tree));
+        assert_eq!(tree.node_count(), 2);
+        assert_eq!(tree.node_count_with(tree.free_len()), tree.node_count());
+    }
+
+    #[test]
+    fn debug_stats_agrees_with_the_reachable_count() {
+        // Отметки обхода живут в векторе по слотам пула: счёт занятых узлов и
+        // число достижимых обязаны сойтись.
+        let mut tree = Tree::new();
+        for i in 0..64u32 {
+            let leaf = tree.alloc_leaf(i * 3, 2);
+            tree.insert_leaf(tree.len, leaf);
+        }
+        let stats = tree.debug_stats().expect("дерево не зациклено");
+        assert_eq!(Some(stats.nodes), tree.debug_reachable_nodes());
+        assert_eq!(stats.nodes, tree.leaves * 2 - 1);
+    }
+
+    #[test]
     fn reset_clears_the_pool() {
         let mut tree = pieced_tree(&[(0, 3), (3, 3)]);
         tree.reset();

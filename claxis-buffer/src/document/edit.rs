@@ -550,6 +550,9 @@ mod tests {
         let mut doc = d("abc");
         assert!(doc.delete(2, 5).is_err());
         assert!(doc.insert(99, b"x").is_err());
+        // `anchor + len` за числом документа — тоже ошибка, а не переполнение.
+        assert!(doc.delete(u32::MAX, 3).is_err());
+        assert!(doc.replace(u32::MAX, 1, b"x").is_err());
         assert_eq!(doc.read(), b"abc");
     }
 

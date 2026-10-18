@@ -177,3 +177,97 @@ pub(super) struct Version {
     /// вершины он известен сразу.
     pub(super) live: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn len_counts_the_records_own_text() {
+        let insert = Record::Insert {
+            anchor: 3,
+            head: 8,
+            text_offset: 100,
+        };
+        assert_eq!(insert.len(), 5);
+        assert!(!insert.is_empty());
+
+        let delete = Record::Delete {
+            anchor: 3,
+            head: 8,
+            text_offset: 100,
+        };
+        assert_eq!(delete.len(), 5);
+
+        // У замены длина — только вставленное, вырезанное считается отдельно.
+        let replace = Record::Replace {
+            anchor: 3,
+            head: 5,
+            text_offset: 100,
+            removed_offset: 200,
+            removed_len: 9,
+        };
+        assert_eq!(replace.len(), 2);
+        assert!(!replace.is_empty());
+
+        // Замена без вставки: своего текста нет, но вырезанное есть.
+        let cut = Record::Replace {
+            anchor: 3,
+            head: 3,
+            text_offset: 0,
+            removed_offset: 0,
+            removed_len: 4,
+        };
+        assert_eq!(cut.len(), 0);
+        assert!(cut.is_empty());
+        assert_eq!(cut.removed(), Some((0, 4)));
+    }
+
+    #[test]
+    fn len_is_safe_on_a_backwards_range() {
+        // Испорченная запись не должна переполнять вычитание.
+        let broken = Record::Delete {
+            anchor: 8,
+            head: 3,
+            text_offset: 0,
+        };
+        assert_eq!(broken.len(), 5);
+    }
+
+    #[test]
+    fn record_end_reaches_the_farther_text() {
+        let insert = Record::Insert {
+            anchor: 0,
+            head: 4,
+            text_offset: 10,
+        };
+        assert_eq!(record_end(&insert), 14);
+
+        let delete = Record::Delete {
+            anchor: 0,
+            head: 4,
+            text_offset: 10,
+        };
+        assert_eq!(record_end(&delete), 14);
+
+        // Вырезанный текст может лежать дальше вставленного: берётся дальний.
+        let replace = Record::Replace {
+            anchor: 0,
+            head: 2,
+            text_offset: 10,
+            removed_offset: 50,
+            removed_len: 3,
+        };
+        assert_eq!(record_end(&replace), 53);
+
+        // Когда вырезанный ближе вставленного, конец задаёт вставленный текст.
+        let near = Record::Replace {
+            anchor: 0,
+            head: 2,
+            text_offset: 10,
+            removed_offset: 12,
+            removed_len: 3,
+        };
+        assert_eq!(record_end(&near), 15);
+    }
+}
