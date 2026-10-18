@@ -49,7 +49,8 @@ const DEAD: Node = Node {
 pub struct Node {
     /// Ветка: высота над индексом левого ребёнка. Лист: `LEAF | start`.
     a: u32,
-    /// Ветка: индекс правого ребёнка. Лист: длина диапазона.
+    /// Ветка: индекс правого ребёнка, тоже двадцать четыре бита. Лист: длина
+    /// диапазона.
     b: u32,
     /// Ветка: длина поддерева. Лист: старший бит смещения в буфере.
     c: u32,
@@ -119,7 +120,10 @@ impl Node {
     pub const fn branch(left: u32, right: u32, len: u32, height: u32) -> Self {
         Self {
             a: ((height & HEIGHT_MASK) << HEIGHT_SHIFT) | (left & INDEX_MASK),
-            b: right,
+            // Индекс правого ребёнка обрезается так же, как левого: оба живут в
+            // одном двадцатичетырёхбитном потолке узлов, и симметрия не даёт
+            // одному ребёнку разойтись с другим.
+            b: right & INDEX_MASK,
             c: len,
         }
     }
@@ -268,12 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn the_left_index_keeps_twenty_four_bits() {
+    fn the_child_indexes_keep_twenty_four_bits() {
         // Индекс левого ребёнка делит поле с высотой и меткой листа, поэтому
-        // больше двадцати четырёх бит он не занимает.
-        let branch = Node::branch(u32::MAX, u32::MAX - 1, u32::MAX, 127);
+        // больше двадцати четырёх бит он не занимает. Правый режется так же:
+        // оба ребёнка живут в одном потолке узлов, и симметрия не даёт одному
+        // разойтись с другим.
+        let branch = Node::branch(u32::MAX, u32::MAX, u32::MAX, 127);
         assert_eq!(branch.left(), INDEX_MASK);
-        assert_eq!(branch.right(), u32::MAX - 1);
+        assert_eq!(branch.right(), INDEX_MASK);
         assert_eq!(branch.subtree_len(), u32::MAX);
         assert_eq!(branch.height(), 127);
         assert!(!branch.is_leaf(), "высота не задела метку листа");
