@@ -162,6 +162,11 @@ struct Version {
 pub enum Error {
     /// Диапазон вышел за пределы документа.
     OutOfBounds { anchor: u32, len: u32, doc_len: u32 },
+    /// Текст не влезает в общий буфер: его смещения 32-битные.
+    BufferTooLarge {
+        /// Сколько байт просили положить.
+        len: u64,
+    },
     /// Глубина истории вне диапазона `min..`.
     ///
     /// Потолка нет: история растёт вместе с правками и память добирается по
@@ -207,8 +212,10 @@ pub enum Error {
     /// Откат на этом заканчивается: продолжать нечего, а молча остановиться
     /// значит выглядеть так, будто отменять больше нечего.
     OlderSnapshotBroken {
-        /// Что с блобом.
-        reason: String,
+        /// Что именно не разобралось в блобе. Причина едет целиком, а не
+        /// готовой английской строкой: текст собирает каталог, и вложенная
+        /// ошибка обязана переводиться так же, как внешняя.
+        reason: Box<Error>,
     },
 }
 
@@ -225,9 +232,12 @@ impl Error {
                 len,
                 doc_len,
             } => messages.out_of_bounds(*anchor, anchor.saturating_add(*len), *doc_len),
+            Error::BufferTooLarge { len } => messages.buffer_too_large(*len),
             Error::InvalidHistoryDepth { depth } => messages.invalid_history_depth(*depth, 1),
             Error::NotOurHistory => messages.not_our_history(),
-            Error::UnknownHistoryVersion { version } => messages.unknown_history_version(*version),
+            Error::UnknownHistoryVersion { version } => {
+                messages.unknown_history_version(*version, crate::history::VERSION)
+            }
             Error::TruncatedHistory => messages.truncated_history(),
             Error::UnknownRecordKind { kind } => messages.unknown_record_kind(*kind),
             Error::HistoryOutOfBounds { offset, len } => {
@@ -236,7 +246,9 @@ impl Error {
             Error::InvalidRecordRange { anchor, head } => {
                 messages.invalid_record_range(*anchor, *head)
             }
-            Error::OlderSnapshotBroken { reason } => messages.older_snapshot_broken(reason),
+            Error::OlderSnapshotBroken { reason } => {
+                messages.older_snapshot_broken(&reason.message(messages))
+            }
         }
     }
 
@@ -311,18 +323,7 @@ pub trait SnapshotSink: std::fmt::Debug {
     /// его в памяти вместо прежнего — так следующая граница не читает диск.
     ///
     /// `None`, когда идти дальше некуда: снимков больше нет.
-    fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
-        let _ = path;
-        None
-    }
-}
-
-/// Приёмник, который ничего не делает.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NullSink;
-
-impl SnapshotSink for NullSink {
-    fn accept(&mut self, _path: &std::path::Path, _text: &[u8], _history: &[u8]) {}
+    fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>>;
 }
 
 /// Документ: текст, история и снапшоты.
@@ -340,7 +341,7 @@ pub struct Document {
     current: u32,
     /// Глубина истории.
     depth: u32,
-    sink: Box<dyn SnapshotSink>,
+    sink: Option<Box<dyn SnapshotSink>>,
     file: Option<PathBuf>,
     snapshots: u64,
     /// Сколько раз документ схлопывался в базу после сохранения.
@@ -357,7 +358,7 @@ impl Document {
     /// Документ с текстом и глубиной истории по умолчанию.
     ///
     /// Без паники и без `Result`: глубина по умолчанию задана самим крейтом и
-    /// проверять тут нечего. Провка остаётся у [`Document::with_depth`], где
+    /// проверять тут нечего. Проверка остаётся у [`Document::with_depth`], где
     /// глубину задаёт пользователь.
     pub fn new(bytes: impl AsRef<[u8]>) -> Self {
         let bytes = bytes.as_ref().to_vec();
@@ -403,7 +404,7 @@ impl Document {
             free: Vec::new(),
             current: 0,
             depth,
-            sink: Box::new(NullSink),
+            sink: None,
             file: None,
             snapshots: 0,
             compacts: 0,
@@ -429,7 +430,7 @@ impl Document {
     /// Привязать снапшоты к файлу и приёмнику.
     pub fn set_sink(&mut self, file: impl Into<PathBuf>, sink: Box<dyn SnapshotSink>) {
         self.file = Some(file.into());
-        self.sink = sink;
+        self.sink = Some(sink);
     }
 
     /// Глубина истории.
@@ -467,7 +468,7 @@ impl Document {
             return Ok(());
         }
         self.discard_redo();
-        let text_offset = self.append(data);
+        let text_offset = self.append(data)?;
         let len = data.len() as u32;
         let record = Record::Insert {
             anchor,
@@ -488,7 +489,7 @@ impl Document {
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а
         // второго буфера быть не должно.
         let removed = self.slice(anchor, anchor + len);
-        let text_offset = self.append(&removed);
+        let text_offset = self.append(&removed)?;
         let record = Record::Delete {
             anchor,
             head: anchor + len,
@@ -512,8 +513,8 @@ impl Document {
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а второго
         // буфера быть не должно.
         let removed = self.slice(anchor, anchor + len);
-        let removed_offset = self.append(&removed);
-        let text_offset = self.append(data);
+        let removed_offset = self.append(&removed)?;
+        let text_offset = self.append(data)?;
 
         let record = Record::Replace {
             anchor,
@@ -522,7 +523,7 @@ impl Document {
             removed_offset,
             removed_len: len,
         };
-        self.apply_replace(record);
+        self.apply(record);
         Ok(())
     }
 
@@ -530,10 +531,22 @@ impl Document {
     ///
     /// Буфер только растёт и переезжать не любит: запись правки хранит
     /// смещение, и оно обязано пережить всё, что случится с деревом.
-    fn append(&mut self, data: &[u8]) -> u32 {
-        let offset = self.bytes.len() as u32;
+    ///
+    /// Смещения в буфере 32-битные, поэтому за четыре гигабайта положить
+    /// нечего: попытка — это ошибка, а не тихая обрезка до нуля.
+    fn append(&mut self, data: &[u8]) -> Result<u32> {
+        let offset = self.bytes.len();
+        let end = offset
+            .checked_add(data.len())
+            .ok_or(Error::BufferTooLarge {
+                len: offset as u64 + data.len() as u64,
+            })?;
+        if end > u32::MAX as usize {
+            return Err(Error::BufferTooLarge { len: end as u64 });
+        }
+        let offset = offset as u32;
         self.bytes.extend_from_slice(data);
-        offset
+        Ok(offset)
     }
 
     /// Отменить одну правку обратной операцией.
@@ -597,13 +610,18 @@ impl Document {
         let Some(file) = self.file.clone() else {
             return Ok(None);
         };
-        let Some(history) = self.sink.older(&file) else {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(None);
+        };
+        let Some(history) = sink.older(&file) else {
             return Ok(None);
         };
         let snapshot = crate::history::History::decode(&history)
             .and_then(|h| h.restore())
-            .map_err(|e| Error::OlderSnapshotBroken { reason: e.text() })?;
-        let sink = std::mem::replace(&mut self.sink, Box::new(NullSink));
+            .map_err(|reason| Error::OlderSnapshotBroken {
+                reason: Box::new(reason),
+            })?;
+        let sink = self.sink.take();
         let file = self.file.clone();
         let crossings = self.crossings;
         *self = snapshot;
@@ -630,8 +648,8 @@ impl Document {
             .get(from as usize..end as usize)
             .ok_or(Error::HistoryOutOfBounds { offset: from, len })?
             .to_vec();
-        let start = self.append(&restored);
-        let leaf = self.tree.alloc(Node::leaf(start, len));
+        let start = self.append(&restored)?;
+        let leaf = self.tree.alloc_leaf(start, len);
         self.tree.insert_leaf(anchor, leaf);
         Ok(())
     }
@@ -650,7 +668,7 @@ impl Document {
                 head,
                 text_offset,
             } => {
-                let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
+                let leaf = self.tree.alloc_leaf(text_offset, head - anchor);
                 self.tree.insert_leaf(anchor, leaf);
             }
             Record::Delete { anchor, head, .. } => self.tree.cut(anchor, head),
@@ -662,7 +680,7 @@ impl Document {
                 ..
             } => {
                 self.tree.cut(anchor, anchor + removed_len);
-                let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
+                let leaf = self.tree.alloc_leaf(text_offset, head - anchor);
                 self.tree.insert_leaf(anchor, leaf);
             }
         }
@@ -680,7 +698,7 @@ impl Document {
                 head,
                 text_offset,
             } => {
-                let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
+                let leaf = self.tree.alloc_leaf(text_offset, head - anchor);
                 self.tree.insert_leaf(anchor, leaf);
             }
             Record::Delete { anchor, head, .. } => self.tree.cut(anchor, head),
@@ -693,31 +711,10 @@ impl Document {
             } => {
                 // Вырезание и вставка одним проходом: так дерево перестраивается
                 // один раз, а не два. Разбор истории идёт тем же путём.
-                let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
+                let leaf = self.tree.alloc_leaf(text_offset, head - anchor);
                 self.tree.replace(anchor, removed_len, leaf);
             }
         }
-        self.push(record);
-    }
-
-    /// Применить замену изнутри: дерево трогается здесь, история — в записи.
-    ///
-    /// Отдельный метод не для красоты: `apply` разбирает записи, пришедшие из
-    /// базы, где у замены вырезанное лежит по своему смещению. Здесь же
-    /// вырезанное уже в буфере, и путь другой — одним проходом.
-    fn apply_replace(&mut self, record: Record) {
-        let Record::Replace {
-            anchor,
-            head,
-            text_offset,
-            removed_len,
-            ..
-        } = record
-        else {
-            return;
-        };
-        let leaf = self.tree.alloc(Node::leaf(text_offset, head - anchor));
-        self.tree.replace(anchor, removed_len, leaf);
         self.push(record);
     }
 
@@ -928,7 +925,10 @@ impl Document {
             // возможностью отменить.
             return;
         };
-        self.sink.accept(&file, &document, history.as_bytes());
+        let Some(sink) = self.sink.as_mut() else {
+            return;
+        };
+        sink.accept(&file, &document, history.as_bytes());
         self.compact();
     }
 
@@ -999,14 +999,14 @@ impl Document {
         self.tree.leaves_in_order()
     }
 
-    /// Проверка дерева: узлов, высота, зацикливание.
-    /// Диагностика дерева: узлов, реальная высота, худший перекос.
-    pub fn tree_debug_stats(&self) -> (usize, u32, u32, u32) {
+    /// Диагностика дерева: узлов, высота, худший перекос, расхождение высот.
+    pub fn tree_debug_stats(&self) -> crate::tree::TreeStats {
         self.tree.debug_stats()
     }
 
-    pub fn debug_walk(&self) -> (usize, usize, Option<u32>) {
-        self.tree.debug_walk()
+    /// Дерево обходится целиком и без повторов узлов.
+    pub fn tree_is_sound(&self) -> bool {
+        self.tree.debug_sound()
     }
 }
 
@@ -1035,7 +1035,7 @@ mod tests {
     /// Так же устроено кольцо на диске, только без второй копии под рукой.
     #[derive(Debug, Default)]
     struct Ring {
-        written: Vec<(Vec<u8>, Vec<u8>)>,
+        written: Vec<(std::path::PathBuf, Vec<u8>, Vec<u8>)>,
         served: usize,
     }
 
@@ -1049,17 +1049,40 @@ mod tests {
             self.0
                 .borrow_mut()
                 .written
-                .push((text.to_vec(), history.to_vec()));
-            let _ = path;
+                .push((path.to_path_buf(), text.to_vec(), history.to_vec()));
         }
 
-        fn older(&mut self, _path: &std::path::Path) -> Option<Vec<u8>> {
+        fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
             let ring = &mut *self.0.borrow_mut();
             // Снимки лежат по убыванию: последний, предпоследний, и так
-            // далее. В базе они остаются — отсюда просто читаются.
+            // далее. В базе они остаются — отсюда просто читаются. Отдаётся
+            // только снимок того же файла: чужому документу он не история.
             let at = ring.written.len().checked_sub(ring.served + 1)?;
             ring.served += 1;
-            ring.written.get(at).map(|(_, history)| history.clone())
+            let (file, _, history) = ring.written.get(at)?;
+            (file == path).then(|| history.clone())
+        }
+    }
+
+    /// Приёмник для тестов, которым нужен только привязанный файл: снимок
+    /// принимается и запоминается, но кольца нет — старее снимков не бывает.
+    #[derive(Debug, Default)]
+    struct Attached {
+        accepted: Vec<(std::path::PathBuf, Vec<u8>, Vec<u8>)>,
+    }
+
+    impl SnapshotSink for Attached {
+        fn accept(&mut self, path: &std::path::Path, text: &[u8], history: &[u8]) {
+            self.accepted
+                .push((path.to_path_buf(), text.to_vec(), history.to_vec()));
+        }
+
+        fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
+            self.accepted
+                .iter()
+                .rev()
+                .find(|(file, _, _)| file == path)
+                .map(|(_, _, history)| history.clone())
         }
     }
 
@@ -1258,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn the_leaf_counter_tells_the_truth() {
+    fn the_leaf_counter_tells_the_truth() -> Result<()> {
         // Счётчик листьев живёт в дереве, а на него смотрят диагностика и
         // выделение памяти. Разъехаться он может незаметно: листья появляются и
         // исчезают в полудюжине мест, и забыть уменьшить счётчик в одном из
@@ -1270,16 +1293,19 @@ mod tests {
             let len = doc.len();
             let pos = rng.below(len.max(1) as usize) as u32;
             if len > 4 && rng.below(3) == 0 {
-                let _ = doc.delete(pos.min(len - 2), 1 + rng.below(4) as u32);
-            } else if rng.below(5) == 0 {
-                let _ = doc.replace(pos.min(len.saturating_sub(2)), 2, b"q");
+                let start = pos.min(len - 2);
+                let take = 1 + rng.below(4) as u32;
+                doc.delete(start, take.min(len - start))?;
+            } else if len >= 2 && rng.below(5) == 0 {
+                doc.replace(pos.min(len - 2), 2, b"q")?;
             } else {
-                doc.insert(pos, b"xy").unwrap();
+                doc.insert(pos, b"xy")?;
             }
             let counted = doc.memory().leaves;
             let real = doc.leaves().len();
             assert_eq!(counted, real, "счётчик листьев разошёлся с деревом");
         }
+        Ok(())
     }
 
     #[test]
@@ -1375,7 +1401,10 @@ mod tests {
         // документ верный, а отменять нечего.
         let (text, history) = {
             let mut doc = d("abc");
-            doc.set_sink(std::path::PathBuf::from("/tmp/d.txt"), Box::new(NullSink));
+            doc.set_sink(
+                std::path::PathBuf::from("/tmp/d.txt"),
+                Box::new(Attached::default()),
+            );
             doc.insert(3, b"XY").unwrap();
             doc.delete(0, 1).unwrap();
             // История снимается до снапшота: снимок её уводит, это его смысл.
@@ -1399,7 +1428,10 @@ mod tests {
         // а в памяти остаётся ровно один снимок. Откат доходит до него без
         // диска, дальше — приёмник отдаёт следующий из базы.
         let mut doc = Document::with_depth(b"abc", 4).unwrap();
-        doc.set_sink(std::path::PathBuf::from("/tmp/d.txt"), Box::new(NullSink));
+        doc.set_sink(
+            std::path::PathBuf::from("/tmp/d.txt"),
+            Box::new(Attached::default()),
+        );
         for i in 0..100 {
             doc.insert(i as u32, b"x").unwrap();
         }
@@ -1435,7 +1467,10 @@ mod tests {
         // Главное про память: отмена после снимка живая. Дальше по границу
         // уходит приёмник, а не обрыв цепочки.
         let mut doc = Document::new(b"abc");
-        doc.set_sink(std::path::PathBuf::from("/tmp/d.txt"), Box::new(NullSink));
+        doc.set_sink(
+            std::path::PathBuf::from("/tmp/d.txt"),
+            Box::new(Attached::default()),
+        );
         doc.insert(3, b"XY").unwrap();
         doc.snapshot();
 
@@ -1450,7 +1485,10 @@ mod tests {
         // В памяти снимок один: новый вытесняет старый, но старый остаётся в
         // кольце. Откат за границу идёт по ним в порядке убывания.
         let mut doc = Document::new(b"abc");
-        doc.set_sink(std::path::PathBuf::from("/tmp/d.txt"), Box::new(NullSink));
+        doc.set_sink(
+            std::path::PathBuf::from("/tmp/d.txt"),
+            Box::new(Attached::default()),
+        );
         for _ in 0..5 {
             doc.insert(doc.len(), b"x").unwrap();
             doc.snapshot();
@@ -1662,45 +1700,61 @@ mod tests {
             assert_eq!(doc.read(), reference.as_bytes());
         }
 
-        let (_, height, skew, mismatch) = doc.tree_debug_stats();
-        assert_eq!(mismatch, 0, "высота в узле разошлась с настоящей");
-        assert!(skew <= 1, "перекос {skew} после замен и отмен");
-        assert_eq!(height, doc.height(), "высота в корне не совпадает");
+        let stats = doc.tree_debug_stats();
+        assert_eq!(
+            stats.height_mismatch, 0,
+            "высота в узле разошлась с настоящей"
+        );
+        assert!(
+            stats.worst_imbalance <= 1,
+            "перекос {} после замен и отмен",
+            stats.worst_imbalance
+        );
+        assert_eq!(stats.height, doc.height(), "высота в корне не совпадает");
     }
 
     #[test]
-    fn tree_stays_balanced_under_churn() {
+    fn tree_stays_balanced_under_churn() -> Result<()> {
         // Баланс держится при любом порядке правок: иначе спуск перестаёт быть
         // логарифмическим.
         let mut doc = Document::new(b"a");
         let mut rng = Rng(99);
         for _ in 0..2000 {
-            let pos = rng.below(doc.len() as usize + 1) as u32;
-            if rng.below(2) == 0 && !doc.read().is_empty() {
-                let len = rng.below(doc.len() as usize) + 1;
-                let _ = doc.delete(pos.min(doc.len() - 1), len as u32);
+            let len = doc.len();
+            let pos = rng.below(len as usize + 1) as u32;
+            if rng.below(2) == 0 && len >= 1 {
+                let start = pos.min(len - 1);
+                let take = 1 + rng.below(len as usize) as u32;
+                doc.delete(start, take.min(len - start))?;
             } else {
-                doc.insert(pos, b"xy").unwrap();
+                doc.insert(pos, b"xy")?;
             }
         }
-        let (nodes, height, worst_skew, height_mismatch) = doc.tree_debug_stats();
+        let stats = doc.tree_debug_stats();
         let leaves = doc.leaves().len();
         if leaves > 0 {
             // Сплошное дерево из n листьев всегда ровно 2n − 1 узлов.
-            assert_eq!(nodes, leaves * 2 - 1, "дерево не сплошное");
+            assert_eq!(stats.nodes, leaves * 2 - 1, "дерево не сплошное");
         }
         assert_eq!(
-            height_mismatch, 0,
+            stats.height_mismatch, 0,
             "высота в узле разошлась с настоящей: баланс считается не по тому"
         );
-        assert!(worst_skew <= 1, "перекос {worst_skew} при {nodes} узлах");
-        assert_eq!(height, doc.height(), "высота в корне не совпадает");
+        assert!(
+            stats.worst_imbalance <= 1,
+            "перекос {} при {} узлах",
+            stats.worst_imbalance,
+            stats.nodes
+        );
+        assert_eq!(stats.height, doc.height(), "высота в корне не совпадает");
         // Высота AVL: не больше примерно 1.44 от log2(листьев) плюс запас.
+        let height = stats.height;
         let bound = (leaves.max(2) as f64).log2() * 1.5 + 2.0;
         assert!(
             height as f64 <= bound,
             "высота {height} при {leaves} листьях превышает {bound:.1}"
         );
+        Ok(())
     }
 
     #[test]
@@ -1747,30 +1801,29 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_survives_a_random_history() {
+    fn a_snapshot_survives_a_random_history() -> Result<()> {
         // Снапшот снимается в произвольный момент под нагрузкой: восстановленный
         // документ должен совпасть и текстом, и историей.
         for seed in 0..4u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
             let mut doc = Document::new("начало".as_bytes());
             for _ in 0..200 {
-                let len = doc.len() as usize;
-                let pos = rng.below(len + 1) as u32;
-                if rng.below(2) == 0 {
-                    let _ = doc.delete(
-                        pos.min(doc.len().saturating_sub(1)),
-                        1 + rng.below(20) as u32,
-                    );
+                let len = doc.len();
+                let pos = rng.below(len as usize + 1) as u32;
+                if rng.below(2) == 0 && len >= 1 {
+                    let start = pos.min(len - 1);
+                    let take = 1 + rng.below(20) as u32;
+                    doc.delete(start, take.min(len - start))?;
                 } else {
-                    doc.insert(pos, b"qq").unwrap();
+                    doc.insert(pos, b"qq")?;
                 }
                 if rng.below(7) == 0 {
-                    let _ = doc.undo().unwrap();
+                    assert!(doc.undo()?.is_some(), "seed {seed}: undo без истории");
                 }
             }
             let text = doc.read();
             let captured = history::History::capture(&doc);
-            let mut back = captured.restore().expect("снапшот разбирается");
+            let mut back = captured.restore()?;
             assert_eq!(back.read(), text, "seed {seed}: текст разошёлся");
             assert_eq!(
                 back.path().len(),
@@ -1780,7 +1833,10 @@ mod tests {
 
             // Отмена в восстановленном документе идёт по той же ветке.
             for _ in 0..doc.path().len() {
-                back.undo().unwrap().expect("история восстановлена");
+                assert!(
+                    back.undo()?.is_some(),
+                    "seed {seed}: история кончилась раньше времени"
+                );
             }
             assert_eq!(
                 back.read(),
@@ -1788,6 +1844,7 @@ mod tests {
                 "seed {seed}: откат до начала не сошёлся"
             );
         }
+        Ok(())
     }
 
     #[test]
@@ -1840,11 +1897,11 @@ mod tests {
         assert_eq!(doc.leaves().len(), 0, "листьев не осталось");
 
         // Дерево пустое, но обязано остаться связным.
-        let (nodes, height, skew, mismatch) = doc.tree_debug_stats();
-        assert_eq!(nodes, 0);
-        assert_eq!(height, 0);
-        assert_eq!(skew, 0);
-        assert_eq!(mismatch, 0);
+        let stats = doc.tree_debug_stats();
+        assert_eq!(stats.nodes, 0);
+        assert_eq!(stats.height, 0);
+        assert_eq!(stats.worst_imbalance, 0);
+        assert_eq!(stats.height_mismatch, 0);
 
         doc.insert(0, "снова".as_bytes()).unwrap();
         assert_eq!(doc.read(), "снова".as_bytes());

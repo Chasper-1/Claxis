@@ -7,6 +7,6 @@ pub use claxis_buffer::commands::COMMANDS;
 pub use claxis_buffer::defaults;
 pub use claxis_buffer::messages;
 pub use claxis_buffer::{
-    DEFAULT_DEPTH, Document, En, Error, History, MIN_DEPTH, Memory, Messages, NullSink, ParseError,
-    Record, Result, SnapshotSink, substitute,
+    DEFAULT_DEPTH, Document, En, Error, History, MIN_DEPTH, Memory, Messages, ParseError, Record,
+    Result, SnapshotSink, substitute,
 };

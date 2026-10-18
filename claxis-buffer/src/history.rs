@@ -197,6 +197,32 @@ impl History {
                 },
             };
             offset += RECORD;
+            // Смещения записей — позиции в документе, а не в буфере. Битую
+            // запись дерево приняло бы молча: вставка за концом читала бы
+            // чужой кусок, а удаление ушло бы за границу. Проверяем их до
+            // того, как тронуть дерево.
+            let doc_len = doc.len();
+            let anchor = record.anchor();
+            if anchor > doc_len {
+                return Err(crate::Error::OutOfBounds {
+                    anchor,
+                    len: 0,
+                    doc_len,
+                });
+            }
+            let head = record.head();
+            let span = match record {
+                Record::Insert { .. } => 0,
+                Record::Delete { .. } => head - anchor,
+                Record::Replace { removed_len, .. } => removed_len,
+            };
+            if anchor as u64 + span as u64 > doc_len as u64 {
+                return Err(crate::Error::OutOfBounds {
+                    anchor,
+                    len: span,
+                    doc_len,
+                });
+            }
             doc.apply(record);
         }
         Ok(doc)

@@ -12,11 +12,18 @@
 
 /// Каталог сообщений об ошибках rope.
 ///
-/// Места под значения: `{anchor}`, `{end}`, `{doc_len}`, `{depth}`, `{min}`,
-/// `{version}`, `{kind}`, `{got}`, `{expected}`, `{tail}`.
+/// Места под значения: `{anchor}`, `{end}`, `{doc_len}`, `{len}`, `{depth}`,
+/// `{min}`, `{version}`, `{expected}`, `{kind}`, `{from}`, `{to}`, `{reason}`,
+/// `{got}`, `{tail}`.
 pub trait Messages {
     /// Вставка или удаление вышли за границы документа.
     fn out_of_bounds(&self, anchor: u32, end: u32, doc_len: u32) -> String;
+
+    /// Текст не влезает в общий буфер: смещения в нём 32-битные, и за
+    /// четыре гигабайта положить нечего.
+    ///
+    /// `{len}` — сколько байт просили положить.
+    fn buffer_too_large(&self, len: u64) -> String;
 
     /// Глубина истории вне допустимого диапазона.
     ///
@@ -29,8 +36,8 @@ pub trait Messages {
 
     /// Версия истории не та, что ждёт крейт.
     ///
-    /// `{version}` — что пришло.
-    fn unknown_history_version(&self, version: u8) -> String;
+    /// `{version}` — что пришло, `{expected}` — какую версию понимает крейт.
+    fn unknown_history_version(&self, version: u8, expected: u8) -> String;
 
     /// История оборвана: данных меньше, чем записано в заголовке.
     fn truncated_history(&self) -> String;
@@ -124,6 +131,13 @@ impl Messages for En {
         )
     }
 
+    fn buffer_too_large(&self, len: u64) -> String {
+        substitute(
+            "text of {len} bytes does not fit the buffer: offsets are 32-bit",
+            &[("len", group_digits(len))],
+        )
+    }
+
     fn invalid_history_depth(&self, depth: u32, min: u32) -> String {
         substitute(
             "invalid history depth {depth}: must be at least {min} records",
@@ -138,10 +152,13 @@ impl Messages for En {
         substitute("not a rope history blob", &[])
     }
 
-    fn unknown_history_version(&self, version: u8) -> String {
+    fn unknown_history_version(&self, version: u8, expected: u8) -> String {
         substitute(
-            "unknown rope history version {version}: expected version 1",
-            &[("version", version.to_string())],
+            "unknown rope history version {version}: expected version {expected}",
+            &[
+                ("version", version.to_string()),
+                ("expected", expected.to_string()),
+            ],
         )
     }
 
@@ -201,9 +218,13 @@ pub fn samples() -> Vec<(&'static str, String)> {
     let m = En;
     vec![
         ("out_of_bounds", m.out_of_bounds(1_000, 2_000, 1_500)),
+        ("buffer_too_large", m.buffer_too_large(4_294_967_296)),
         ("invalid_history_depth", m.invalid_history_depth(0, 1)),
         ("not_our_history", m.not_our_history()),
-        ("unknown_history_version", m.unknown_history_version(7)),
+        (
+            "unknown_history_version",
+            m.unknown_history_version(7, crate::history::VERSION),
+        ),
         ("truncated_history", m.truncated_history()),
         ("unknown_record_kind", m.unknown_record_kind(9)),
         ("history_out_of_bounds", m.history_out_of_bounds(100, 150)),

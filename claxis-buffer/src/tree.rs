@@ -5,19 +5,47 @@
 
 use crate::node::{FREE, Leaf, NIL, Node};
 
+/// Старший бит байта вида: узел-лист.
+const LEAF_BIT: u8 = 0x80;
+/// Младшие биты байта вида: высота ветки.
+const HEIGHT_MASK: u8 = 0x7F;
+
+/// Глубина, дальше которой обход считается зацикленным.
+const MAX_DEPTH: u32 = 128;
+
 /// Приёмник куска текста при обходе.
 pub trait Sink {
     /// Диапазон буфера: откуда и сколько.
     fn range(&mut self, start: u32, len: u32);
 }
 
+/// Сводка проверки дерева.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TreeStats {
+    /// Сколько узлов в дереве.
+    pub nodes: usize,
+    /// Реальная высота, посчитанная обходом.
+    pub height: u32,
+    /// Худший перекос между высотами детей в любом узле.
+    pub worst_imbalance: u32,
+    /// Ноль, если все высоты в узлах сходятся с настоящими; иначе — метка
+    /// расхождения.
+    pub height_mismatch: u32,
+}
+
 /// Пул узлов: выделяется сразу и больше не растёт.
 ///
 /// Свободные узлы хранятся в самих освобождённых узлах: поле `a` держит
-/// индекс следующего. Отдельного векла нет, и в горячем пути аллокаций нет.
+/// индекс следующего. Отдельного вектора нет, и в горячем пути аллокаций нет.
+///
+/// Вид узла — лист или ветка и её высота — лежит в `node_flags`, рядом с
+/// узлом: в двенадцати байтах узла на признак места нет, а отдать под него
+/// биты индекса нельзя.
 #[derive(Debug)]
 pub struct Tree {
     nodes: Vec<Node>,
+    /// Вид узла: старший бит — лист, младшие семь — высота ветки.
+    node_flags: Vec<u8>,
     /// Корень.
     pub root: u32,
     /// Длина документа.
@@ -26,8 +54,6 @@ pub struct Tree {
     pub leaves: usize,
     /// Голова списка свободных.
     free_head: u32,
-    /// Следующий невыделенный слот.
-    next_unused: u32,
 }
 
 impl Tree {
@@ -38,11 +64,11 @@ impl Tree {
     pub fn new() -> Self {
         Self {
             nodes: vec![FREE],
+            node_flags: vec![0],
             root: NIL,
             len: 0,
             leaves: 0,
             free_head: NIL,
-            next_unused: 1,
         }
     }
 
@@ -50,25 +76,44 @@ impl Tree {
     pub fn with_leaf(start: u32, len: u32) -> Self {
         let mut tree = Self::new();
         if len > 0 {
-            tree.root = tree.alloc(Node::leaf(start, len));
+            tree.root = tree.alloc_leaf(start, len);
             tree.len = len;
         }
         tree
     }
 
-    /// Длина узла: у листа — его длина, у ветки — длина поддерева.
+    /// Лист ли узел.
     #[inline]
-    pub fn node_len(&self, id: u32) -> u32 {
-        let node = self.nodes[id as usize];
-        if node.is_leaf() {
-            node.leaf_len()
+    fn is_leaf(&self, id: u32) -> bool {
+        self.node_flags[id as usize] & LEAF_BIT != 0
+    }
+
+    /// Высота узла: у листа — единица, у ветки — из байта вида.
+    #[inline]
+    fn node_height(&self, id: u32) -> u32 {
+        if id == NIL {
+            0
+        } else if self.is_leaf(id) {
+            1
         } else {
-            node.len()
+            (self.node_flags[id as usize] & HEIGHT_MASK) as u32
         }
     }
 
+    /// Длина текста узла: у листа — его длина, у ветки — длина поддерева.
     #[inline]
-    pub fn node(&self, id: u32) -> Node {
+    pub fn node_text_len(&self, id: u32) -> u32 {
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
+            node.leaf_len()
+        } else {
+            node.subtree_len()
+        }
+    }
+
+    /// Узел по номеру.
+    #[inline]
+    pub fn node_at(&self, id: u32) -> Node {
         self.nodes[id as usize]
     }
 
@@ -81,13 +126,13 @@ impl Tree {
 
     /// Свободно узлов.
     pub fn free_len(&self) -> usize {
-        let mut n = 0;
+        let mut free = 0;
         let mut cursor = self.free_head;
         while cursor != NIL {
-            n += 1;
+            free += 1;
             cursor = self.nodes[cursor as usize].free_next();
         }
-        n
+        free
     }
 
     /// Ёмкость пула.
@@ -100,60 +145,65 @@ impl Tree {
         if self.root == NIL {
             0
         } else {
-            self.height_of(self.root)
-        }
-    }
-
-    /// Высота узла — из самого узла, без обхода.
-    fn height_of(&self, id: u32) -> u32 {
-        if id == NIL {
-            0
-        } else {
-            self.nodes[id as usize].height()
+            self.node_height(self.root)
         }
     }
 
     /// Новая ветка над двумя поддеревьями: длина и высота считаются сами.
-    fn branch(&mut self, l: u32, r: u32) -> u32 {
-        let len = self.node_len(l) + self.node_len(r);
-        let height = 1 + self.height_of(l).max(self.height_of(r));
-        self.alloc(Node::branch(l, r, len, height))
+    fn make_branch(&mut self, left: u32, right: u32) -> u32 {
+        let len = self.node_text_len(left) + self.node_text_len(right);
+        let height = 1 + self.node_height(left).max(self.node_height(right));
+        let id = self.alloc_node(Node::branch(left, right, len));
+        self.store_height(id, height);
+        id
     }
 
-    /// Взять свободный узел или выделить новый.
+    /// Выделить лист.
+    #[inline]
+    pub fn alloc_leaf(&mut self, start: u32, len: u32) -> u32 {
+        let id = self.alloc_node(Node::leaf(start, len));
+        self.node_flags[id as usize] = LEAF_BIT;
+        self.leaves += 1;
+        id
+    }
+
+    /// Взять свободный узел или выделить новый. Вид узла выставляет вызывающий.
     ///
     /// Счётчик листьев живёт здесь и в [`Tree::release`] и больше нигде: узел
     /// появляется и исчезает только через эти две функции, а счётчик,
     /// который надо помнить в каждом месте отдельно, разъезжается — уже
     /// разъезжался.
     #[inline]
-    pub fn alloc(&mut self, node: Node) -> u32 {
-        let leaf = node.is_leaf();
+    fn alloc_node(&mut self, node: Node) -> u32 {
         let id = if self.free_head != NIL {
             let id = self.free_head;
             self.free_head = self.nodes[id as usize].free_next();
             id
         } else {
-            let id = self.next_unused;
-            while self.nodes.len() as u32 <= id {
-                self.nodes.push(FREE);
-                self.next_unused += 1;
-            }
+            let id = self.nodes.len() as u32;
+            self.nodes.push(FREE);
+            self.node_flags.push(0);
             id
         };
         self.nodes[id as usize] = node;
-        if leaf {
-            self.leaves += 1;
-        }
+        self.node_flags[id as usize] = 0;
         id
+    }
+
+    /// Записать высоту ветки, не трогая метку листа.
+    #[inline]
+    fn store_height(&mut self, id: u32, height: u32) {
+        self.node_flags[id as usize] =
+            (self.node_flags[id as usize] & LEAF_BIT) | (height.min(HEIGHT_MASK as u32) as u8);
     }
 
     /// Вернуть узел в свободные.
     pub fn release(&mut self, id: u32) {
-        if self.nodes[id as usize].is_leaf() {
+        if self.is_leaf(id) {
             self.leaves -= 1;
         }
-        self.nodes[id as usize] = Node::new(self.free_head & !(1 << 31), 0, 0);
+        self.nodes[id as usize] = Node::new(self.free_head, 0, 0);
+        self.node_flags[id as usize] = 0;
         self.free_head = id;
     }
 
@@ -164,10 +214,10 @@ impl Tree {
             return;
         }
         let node = self.nodes[id as usize];
-        if !node.is_leaf() {
-            let (l, r) = (node.left(), node.right());
-            self.release_tree(l);
-            self.release_tree(r);
+        if !self.is_leaf(id) {
+            let (left, right) = (node.left(), node.right());
+            self.release_tree(left);
+            self.release_tree(right);
         }
         self.release(id);
     }
@@ -176,18 +226,19 @@ impl Tree {
     pub fn reset(&mut self) {
         self.nodes.clear();
         self.nodes.push(FREE);
+        self.node_flags.clear();
+        self.node_flags.push(0);
         self.root = NIL;
         self.len = 0;
         self.leaves = 0;
         self.free_head = NIL;
-        self.next_unused = 1;
     }
 
     /// Схлопнуть дерево в один лист, не перевыделяя пул.
     pub fn collapse_to(&mut self, start: u32, len: u32) {
         self.reset();
         if len > 0 {
-            self.root = self.alloc(Node::leaf(start, len));
+            self.root = self.alloc_leaf(start, len);
             self.len = len;
         }
     }
@@ -213,67 +264,79 @@ impl Tree {
         if right == NIL {
             return left;
         }
-        if self.joinable(left, right) {
-            return self.join(left, right);
+        if self.adjacent_leaves(left, right) {
+            return self.merge_adjacent_leaves(left, right);
         }
-        if self.height_of(left) > self.height_of(right) + 1 {
-            let node = self.nodes[left as usize];
-            let mid = self.concat(node.right(), right);
-            let branch = self.branch(node.left(), mid);
+        if self.node_height(left) > self.node_height(right) + 1 {
+            let left_node = self.nodes[left as usize];
+            let middle = self.concat(left_node.right(), right);
+            let joined = self.make_branch(left_node.left(), middle);
             self.release(left);
-            branch
-        } else if self.height_of(right) > self.height_of(left) + 1 {
-            let node = self.nodes[right as usize];
-            let mid = self.concat(left, node.left());
-            let branch = self.branch(mid, node.right());
+            // Свежий узел после спуска по правому ребёнку может разъехаться
+            // на два: классический join обязан повернуть на каждом уровне, а
+            // не только на верхнем. Без этого перекос копится в глубине.
+            self.rebalance(joined)
+        } else if self.node_height(right) > self.node_height(left) + 1 {
+            let right_node = self.nodes[right as usize];
+            let middle = self.concat(left, right_node.left());
+            let joined = self.make_branch(middle, right_node.right());
             self.release(right);
-            branch
+            self.rebalance(joined)
         } else {
-            self.branch(left, right)
+            self.make_branch(left, right)
         }
     }
 
     /// Идут ли два листа в буфере вплотную друг к другу.
-    fn joinable(&self, left: u32, right: u32) -> bool {
-        let l = self.nodes[left as usize];
-        let r = self.nodes[right as usize];
-        l.is_leaf() && r.is_leaf() && r.start() == l.start().saturating_add(l.leaf_len())
+    fn adjacent_leaves(&self, left: u32, right: u32) -> bool {
+        let left_node = self.nodes[left as usize];
+        let right_node = self.nodes[right as usize];
+        self.is_leaf(left)
+            && self.is_leaf(right)
+            && right_node.start() == left_node.start().saturating_add(left_node.leaf_len())
     }
 
     /// Склеить два смежных листа в один.
     ///
     /// Левый узел переписывается на месте: он уже принадлежит дереву, а
     /// новый узел только ради удлинения диапазона взял бы слот из пула.
-    fn join(&mut self, left: u32, right: u32) -> u32 {
-        let l = self.nodes[left as usize];
-        let len = l.leaf_len() + self.nodes[right as usize].leaf_len();
-        self.nodes[left as usize] = Node::leaf(l.start(), len);
+    fn merge_adjacent_leaves(&mut self, left: u32, right: u32) -> u32 {
+        let left_node = self.nodes[left as usize];
+        let len = left_node.leaf_len() + self.nodes[right as usize].leaf_len();
+        self.nodes[left as usize] = Node::leaf(left_node.start(), len);
         self.release(right);
         left
     }
 
     /// Вставить лист `leaf` на позицию `pos` документа.
+    ///
+    /// Пустой лист — не лист: он бы не нёс текста, но занял бы место в дереве
+    /// и разошёлся бы со счётчиком листьев. Такой просто возвращается в пул.
     pub fn insert_leaf(&mut self, pos: u32, leaf: u32) {
-        let len = self.node_len(leaf);
-        self.root = self.insert_rec(self.root, 0, pos, leaf);
+        let len = self.node_text_len(leaf);
+        if len == 0 {
+            self.release(leaf);
+            return;
+        }
+        self.root = self.insert_at(self.root, 0, pos, leaf);
         self.len += len;
     }
 
-    fn insert_rec(&mut self, idx: u32, base: u32, pos: u32, leaf: u32) -> u32 {
-        if idx == NIL {
+    fn insert_at(&mut self, id: u32, subtree_start: u32, pos: u32, leaf: u32) -> u32 {
+        if id == NIL {
             return leaf;
         }
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
-            let off = pos - base;
-            if off == 0 {
-                return self.concat(leaf, idx);
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
+            let offset = pos - subtree_start;
+            if offset == 0 {
+                return self.concat(leaf, id);
             }
-            if off == node.leaf_len() {
-                return self.concat(idx, leaf);
+            if offset == node.leaf_len() {
+                return self.concat(id, leaf);
             }
             // Лист разрезается на отступе: голова и хвост, лист встаёт между.
-            let (head, tail) = self.halve(idx, off, off);
+            let (head, tail) = self.split_leaf_around_hole(id, offset, offset);
             let left = if head == NIL {
                 leaf
             } else {
@@ -288,20 +351,20 @@ impl Tree {
             // вырождается, а спуск перестаёт быть логарифмическим.
             self.rebalance(joined)
         } else {
-            let (l, r) = (node.left(), node.right());
-            let right_base = base + self.node_len(l);
+            let (left, right) = (node.left(), node.right());
+            let right_start = subtree_start + self.node_text_len(left);
             // Ровно на границе идём вправо: точка вставки — начало правого
             // поддерева. Иначе вставка в конец всегда уходила бы влево и
             // дерево вырождалось бы в список.
-            let new = if pos < right_base {
-                let l = self.insert_rec(l, base, pos, leaf);
-                self.branch(l, r)
+            let updated = if pos < right_start {
+                let left = self.insert_at(left, subtree_start, pos, leaf);
+                self.make_branch(left, right)
             } else {
-                let r = self.insert_rec(r, right_base, pos, leaf);
-                self.branch(l, r)
+                let right = self.insert_at(right, right_start, pos, leaf);
+                self.make_branch(left, right)
             };
-            self.release(idx);
-            self.rebalance(new)
+            self.release(id);
+            self.rebalance(updated)
         }
     }
 
@@ -310,6 +373,14 @@ impl Tree {
     /// Один проход вместо двух: вырезать, потом вставить. Дерево перестраивается
     /// по пути один раз, повороты считаются один раз, а не на каждый проход.
     pub fn replace(&mut self, pos: u32, removed: u32, leaf: u32) {
+        // Пустой лист ничего не вставляет: только вырезается диапазон.
+        if self.node_text_len(leaf) == 0 {
+            self.release(leaf);
+            if removed > 0 {
+                self.cut(pos, pos + removed);
+            }
+            return;
+        }
         // Ничего не вырезается — это обычная вставка, и она уже умеет ходить
         // по краям дерева. Своя дорожка здесь ломалась на вставке в самое
         // начало: диапазон пустой, а узел считался не пересекающимся.
@@ -317,44 +388,51 @@ impl Tree {
             self.insert_leaf(pos, leaf);
             return;
         }
-        let gained = self.node_len(leaf);
+        let gained = self.node_text_len(leaf);
         if self.root == NIL {
             self.root = leaf;
             self.len += gained;
             return;
         }
-        self.root = self.replace_rec(self.root, 0, pos, pos + removed, leaf);
+        self.root = self.replace_within(self.root, 0, pos, pos + removed, leaf);
         self.len = self.len - removed + gained;
     }
 
     /// Замена внутри поддерева. `leaf` ставится ровно один раз — в том
     /// поддереве, где начинается вырезаемый диапазон.
-    fn replace_rec(&mut self, idx: u32, base: u32, start: u32, end: u32, leaf: u32) -> u32 {
-        if idx == NIL {
+    fn replace_within(
+        &mut self,
+        id: u32,
+        subtree_start: u32,
+        start: u32,
+        end: u32,
+        leaf: u32,
+    ) -> u32 {
+        if id == NIL {
             return leaf;
         }
-        let node_end = base + self.node_len(idx);
-        if end <= base || start >= node_end {
-            return idx;
+        let subtree_end = subtree_start + self.node_text_len(id);
+        if end <= subtree_start || start >= subtree_end {
+            return id;
         }
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
-            let start_in_buffer = node.start();
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
+            let buffer_start = node.start();
             let len = node.leaf_len();
-            let head_len = start.saturating_sub(base);
-            let tail_at = (end - base).min(len);
-            let tail_len = len - tail_at;
+            let head_len = start.saturating_sub(subtree_start);
+            let tail_start = (end - subtree_start).min(len);
+            let tail_len = len - tail_start;
             let head = if head_len > 0 {
-                self.alloc(Node::leaf(start_in_buffer, head_len))
+                self.alloc_leaf(buffer_start, head_len)
             } else {
                 NIL
             };
             let tail = if tail_len > 0 {
-                self.alloc(Node::leaf(start_in_buffer + tail_at, tail_len))
+                self.alloc_leaf(buffer_start + tail_start, tail_len)
             } else {
                 NIL
             };
-            self.release(idx);
+            self.release(id);
             let left = if head == NIL {
                 leaf
             } else {
@@ -366,24 +444,24 @@ impl Tree {
                 self.concat(left, tail)
             }
         } else {
-            let (l, r) = (node.left(), node.right());
-            let right_base = base + self.node_len(l);
+            let (left, right) = (node.left(), node.right());
+            let right_start = subtree_start + self.node_text_len(left);
             // Новый кусок ставится туда, где начинается диапазон. Если он
             // начинается в правом поддереве, левое только вырезается.
-            let new = if start < right_base {
-                let l = self.replace_rec(l, base, start, end, leaf);
-                let r = self.cut_rec(r, right_base, start, end);
-                // Через concat, а не через branch: вырезанное поддерево может
-                // схлопнуться в пустоту, а ветка с пустым ребёнком — это уже
-                // не дерево.
-                self.concat(l, r)
+            let updated = if start < right_start {
+                let left = self.replace_within(left, subtree_start, start, end, leaf);
+                let right = self.cut_within(right, right_start, start, end);
+                // Через concat, а не через make_branch: вырезанное поддерево
+                // может схлопнуться в пустоту, а ветка с пустым ребёнком — это
+                // уже не дерево.
+                self.concat(left, right)
             } else {
-                let l = self.cut_rec(l, base, start, end);
-                let r = self.replace_rec(r, right_base, start, end, leaf);
-                self.concat(l, r)
+                let left = self.cut_within(left, subtree_start, start, end);
+                let right = self.replace_within(right, right_start, start, end, leaf);
+                self.concat(left, right)
             };
-            self.release(idx);
-            self.rebalance(new)
+            self.release(id);
+            self.rebalance(updated)
         }
     }
 
@@ -392,29 +470,29 @@ impl Tree {
         if start >= end || self.root == NIL {
             return;
         }
-        self.root = self.cut_rec(self.root, 0, start, end);
+        self.root = self.cut_within(self.root, 0, start, end);
         self.len -= end - start;
     }
 
-    fn cut_rec(&mut self, idx: u32, base: u32, start: u32, end: u32) -> u32 {
-        if idx == NIL {
+    fn cut_within(&mut self, id: u32, subtree_start: u32, start: u32, end: u32) -> u32 {
+        if id == NIL {
             return NIL;
         }
-        let node_end = base + self.node_len(idx);
-        if end <= base || start >= node_end {
-            return idx;
+        let subtree_end = subtree_start + self.node_text_len(id);
+        if end <= subtree_start || start >= subtree_end {
+            return id;
         }
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
-            let from = start.saturating_sub(base);
-            let to = (end - base).min(node.leaf_len());
-            if from >= to {
-                return idx;
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
+            let hole_start = start.saturating_sub(subtree_start);
+            let hole_end = (end - subtree_start).min(node.leaf_len());
+            if hole_start >= hole_end {
+                return id;
             }
             // Из листа остаются голова и хвост, среднее вырезается. Хвост
-            // начинается с `to`, а не с `from`: иначе вырезанное осталось бы
-            // висеть в хвосте листа.
-            let (head, tail) = self.halve(idx, from, to);
+            // начинается с `hole_end`, а не с `hole_start`: иначе вырезанное
+            // осталось бы висеть в хвосте листа.
+            let (head, tail) = self.split_leaf_around_hole(id, hole_start, hole_end);
             if head == NIL {
                 tail
             } else if tail == NIL {
@@ -423,31 +501,32 @@ impl Tree {
                 self.concat(head, tail)
             }
         } else {
-            let (l, r) = (node.left(), node.right());
-            let right_base = base + self.node_len(l);
-            let nl = self.cut_rec(l, base, start, end);
-            let nr = self.cut_rec(r, right_base, start, end);
-            self.release(idx);
-            self.concat(nl, nr)
+            let (left, right) = (node.left(), node.right());
+            let right_start = subtree_start + self.node_text_len(left);
+            let new_left = self.cut_within(left, subtree_start, start, end);
+            let new_right = self.cut_within(right, right_start, start, end);
+            self.release(id);
+            self.concat(new_left, new_right)
         }
     }
 
-    /// Разрезать лист `id`: оставить `from..len` и `to..len`, среднее выкинуть.
+    /// Разрезать лист `id` на голову `0..hole_start` и хвост `hole_end..len`,
+    /// выкинув кусок между ними.
     ///
     /// Один узел превращается в два, поэтому листьев становится на один больше;
-    /// исходный слот уходит в свободные. Счётчик листьев поправляют `alloc`
-    /// и `release`, здесь он не трогается.
-    fn halve(&mut self, id: u32, from: u32, to: u32) -> (u32, u32) {
+    /// исходный слот уходит в свободные. Счётчик листьев поправляют
+    /// [`Tree::alloc_leaf`] и [`Tree::release`], здесь он не трогается.
+    fn split_leaf_around_hole(&mut self, id: u32, hole_start: u32, hole_end: u32) -> (u32, u32) {
         let node = self.nodes[id as usize];
-        let start_in_buffer = node.start();
+        let buffer_start = node.start();
         let len = node.leaf_len();
-        let head = if from > 0 {
-            self.alloc(Node::leaf(start_in_buffer, from))
+        let head = if hole_start > 0 {
+            self.alloc_leaf(buffer_start, hole_start)
         } else {
             NIL
         };
-        let tail = if to < len {
-            self.alloc(Node::leaf(start_in_buffer + to, len - to))
+        let tail = if hole_end < len {
+            self.alloc_leaf(buffer_start + hole_end, len - hole_end)
         } else {
             NIL
         };
@@ -455,85 +534,89 @@ impl Tree {
         (head, tail)
     }
 
-    /// Пересобрать узел с балансировкой по высоте.
     /// Выправить узел, если он разъехался по высоте больше чем на единицу.
     ///
     /// Поворотов два вида: простой, когда тяжёлая сторона тяжелее и сама, и
     /// двойной, когда тяжёлый ребёнок тяжелее с другой стороны — тогда сперва
     /// выправляется он, и только потом сам узел.
-    fn rebalance(&mut self, idx: u32) -> u32 {
-        if idx == NIL {
+    fn rebalance(&mut self, id: u32) -> u32 {
+        if id == NIL {
             return NIL;
         }
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
-            return idx;
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
+            return id;
         }
-        let (l, r) = (node.left(), node.right());
-        let (hl, hr) = (self.height_of(l), self.height_of(r));
-        if hl > hr + 1 {
-            let ln = self.nodes[l as usize];
-            if ln.is_leaf() {
-                return idx;
+        let (left, right) = (node.left(), node.right());
+        let (left_height, right_height) = (self.node_height(left), self.node_height(right));
+        if left_height > right_height + 1 {
+            let left_node = self.nodes[left as usize];
+            if self.is_leaf(left) {
+                return id;
             }
-            let (ll, lr) = (ln.left(), ln.right());
-            // `(ll, lr, r)`: правый поворот даёт `ll` и `(lr, r)`. Если
-            // перевесил правый ребёнок `lr`, сперва выправляется он, иначе
-            // перекос останется, только переедет на уровень выше.
-            if !self.nodes[lr as usize].is_leaf() && self.height_of(lr) > self.height_of(ll) {
-                let lrn = self.nodes[lr as usize];
-                let new_l = self.branch(ll, lrn.left());
-                let new_r = self.branch(lrn.right(), r);
-                self.release(lr);
-                self.release(l);
-                self.release(idx);
-                return self.branch(new_l, new_r);
+            let (left_left, left_right) = (left_node.left(), left_node.right());
+            // `(left_left, left_right, right)`: правый поворот даёт `left_left`
+            // и `(left_right, right)`. Если перевесил правый ребёнок
+            // `left_right`, сперва выправляется он, иначе перекос останется,
+            // только переедет на уровень выше.
+            if !self.is_leaf(left_right)
+                && self.node_height(left_right) > self.node_height(left_left)
+            {
+                let left_right_node = self.nodes[left_right as usize];
+                let new_left = self.make_branch(left_left, left_right_node.left());
+                let new_right = self.make_branch(left_right_node.right(), right);
+                self.release(left_right);
+                self.release(left);
+                self.release(id);
+                return self.make_branch(new_left, new_right);
             }
-            let new_r = self.branch(lr, r);
-            self.release(l);
-            self.release(idx);
-            return self.branch(ll, new_r);
+            let new_right = self.make_branch(left_right, right);
+            self.release(left);
+            self.release(id);
+            return self.make_branch(left_left, new_right);
         }
-        if hr > hl + 1 {
-            let rn = self.nodes[r as usize];
-            if rn.is_leaf() {
-                return idx;
+        if right_height > left_height + 1 {
+            let right_node = self.nodes[right as usize];
+            if self.is_leaf(right) {
+                return id;
             }
-            let (rl, rr) = (rn.left(), rn.right());
-            if !self.nodes[rl as usize].is_leaf() && self.height_of(rl) > self.height_of(rr) {
-                let rln = self.nodes[rl as usize];
-                let new_l = self.branch(l, rln.left());
-                let new_r = self.branch(rln.right(), rr);
-                self.release(rl);
-                self.release(r);
-                self.release(idx);
-                return self.branch(new_l, new_r);
+            let (right_left, right_right) = (right_node.left(), right_node.right());
+            if !self.is_leaf(right_left)
+                && self.node_height(right_left) > self.node_height(right_right)
+            {
+                let right_left_node = self.nodes[right_left as usize];
+                let new_left = self.make_branch(left, right_left_node.left());
+                let new_right = self.make_branch(right_left_node.right(), right_right);
+                self.release(right_left);
+                self.release(right);
+                self.release(id);
+                return self.make_branch(new_left, new_right);
             }
-            let new_l = self.branch(l, rl);
-            self.release(r);
-            self.release(idx);
-            return self.branch(new_l, rr);
+            let new_left = self.make_branch(left, right_left);
+            self.release(right);
+            self.release(id);
+            return self.make_branch(new_left, right_right);
         }
-        idx
+        id
     }
 
     // ── чтение ────────────────────────────────────────────────────────────
 
     /// Отдать весь документ.
     pub fn read_into<S: Sink>(&self, sink: &mut S) {
-        self.walk(self.root, sink);
+        self.read_subtree_into(self.root, sink);
     }
 
-    fn walk<S: Sink>(&self, idx: u32, sink: &mut S) {
-        if idx == NIL {
+    fn read_subtree_into<S: Sink>(&self, id: u32, sink: &mut S) {
+        if id == NIL {
             return;
         }
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
             sink.range(node.start(), node.leaf_len());
         } else {
-            self.walk(node.left(), sink);
-            self.walk(node.right(), sink);
+            self.read_subtree_into(node.left(), sink);
+            self.read_subtree_into(node.right(), sink);
         }
     }
 
@@ -542,37 +625,44 @@ impl Tree {
         if start >= end {
             return;
         }
-        self.range_rec(self.root, 0, start, end, sink);
+        self.read_range_within(self.root, 0, start, end, sink);
     }
 
-    fn range_rec<S: Sink>(&self, idx: u32, base: u32, start: u32, end: u32, sink: &mut S) {
-        if idx == NIL {
+    fn read_range_within<S: Sink>(
+        &self,
+        id: u32,
+        subtree_start: u32,
+        start: u32,
+        end: u32,
+        sink: &mut S,
+    ) {
+        if id == NIL {
             return;
         }
-        let node_end = base + self.node_len(idx);
-        if end <= base || start >= node_end {
+        let subtree_end = subtree_start + self.node_text_len(id);
+        if end <= subtree_start || start >= subtree_end {
             return;
         }
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
-            let from = start.saturating_sub(base);
-            let to = (end - base).min(node.leaf_len());
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
+            let from = start.saturating_sub(subtree_start);
+            let to = (end - subtree_start).min(node.leaf_len());
             if from < to {
                 sink.range(node.start() + from, to - from);
             }
             return;
         }
-        let (l, r) = (node.left(), node.right());
-        let right_base = base + self.node_len(l);
-        self.range_rec(l, base, start, end, sink);
-        self.range_rec(r, right_base, start, end, sink);
+        let (left, right) = (node.left(), node.right());
+        let right_start = subtree_start + self.node_text_len(left);
+        self.read_range_within(left, subtree_start, start, end, sink);
+        self.read_range_within(right, right_start, start, end, sink);
     }
 
     /// Все листья по порядку документа — для проверок и статистики.
     pub fn leaves_in_order(&self) -> Vec<Leaf> {
-        let mut out = Vec::with_capacity(self.leaves);
-        self.collect(self.root, &mut out);
-        out
+        let mut leaves = Vec::with_capacity(self.leaves);
+        self.collect_leaves(self.root, &mut leaves);
+        leaves
     }
 
     /// Самое позднее место буфера, куда заглядывает хоть один лист.
@@ -581,122 +671,538 @@ impl Tree {
     /// можно по этому месту. Считается обходом дерева, без выделения памяти.
     pub fn leaf_end(&self) -> u32 {
         let mut end = 0;
-        self.max_end(self.root, &mut end);
+        self.max_leaf_end(self.root, &mut end);
         end
     }
 
-    fn max_end(&self, idx: u32, end: &mut u32) {
-        if idx == NIL {
+    fn max_leaf_end(&self, id: u32, end: &mut u32) {
+        if id == NIL {
             return;
         }
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
             *end = (*end).max(node.start().saturating_add(node.leaf_len()));
         } else {
-            self.max_end(node.left(), end);
-            self.max_end(node.right(), end);
+            self.max_leaf_end(node.left(), end);
+            self.max_leaf_end(node.right(), end);
         }
     }
 
-    fn collect(&self, idx: u32, out: &mut Vec<Leaf>) {
-        if idx == NIL {
+    fn collect_leaves(&self, id: u32, leaves: &mut Vec<Leaf>) {
+        if id == NIL {
             return;
         }
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
-            out.push(Leaf {
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
+            leaves.push(Leaf {
                 start: node.start(),
                 len: node.leaf_len(),
             });
         } else {
-            self.collect(node.left(), out);
-            self.collect(node.right(), out);
+            self.collect_leaves(node.left(), leaves);
+            self.collect_leaves(node.right(), leaves);
         }
     }
 
-    /// Проверка связности дерева: зацикленности быть не должно.
-    ///
-    /// Зацикливание — это поломка, а не повод падать: диагностика обязана
-    /// показать, что именно сломалось. Поэтому дерево, которое себя не
-    /// обходит, даёт `false`, а тест на это смотрит.
-    pub fn debug_walk(&self) -> (usize, usize, Option<u32>) {
+    // ── диагностика ───────────────────────────────────────────────────────
+
+    /// Сколько узлов достижимо обходом, или `None`, если обход зациклился.
+    pub fn debug_reachable_nodes(&self) -> Option<usize> {
         let mut seen = std::collections::HashSet::new();
-        match self.check(self.root, &mut seen, 0) {
-            Some(nodes) => (nodes, self.height() as usize, None),
-            None => (0, 0, Some(0)),
-        }
+        self.count_nodes(self.root, &mut seen, 0)
     }
 
     /// Дерево обходится целиком и без повторов узлов.
     ///
-    /// `None` — дерево зациклено или слишком глубокое.
+    /// `false` — дерево зациклено или слишком глубокое.
     pub fn debug_sound(&self) -> bool {
-        let mut seen = std::collections::HashSet::new();
-        self.check(self.root, &mut seen, 0).is_some()
+        self.debug_reachable_nodes().is_some()
     }
 
-    /// Глубина, дальше которой обход считается зацикленным.
-    const MAX_DEPTH: u32 = 128;
-
-    fn check(
+    fn count_nodes(
         &self,
-        idx: u32,
+        id: u32,
         seen: &mut std::collections::HashSet<u32>,
         depth: u32,
     ) -> Option<usize> {
-        if idx == NIL {
+        if id == NIL {
             return Some(0);
         }
-        if depth >= Self::MAX_DEPTH || !seen.insert(idx) {
+        if depth >= MAX_DEPTH || !seen.insert(id) {
             return None;
         }
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
             Some(1)
         } else {
-            let left = self.check(node.left(), seen, depth + 1)?;
-            let right = self.check(node.right(), seen, depth + 1)?;
+            let left = self.count_nodes(node.left(), seen, depth + 1)?;
+            let right = self.count_nodes(node.right(), seen, depth + 1)?;
             Some(left + right + 1)
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn check2(
-        &self,
-        idx: u32,
-        seen: &mut std::collections::HashSet<u32>,
-    ) -> (usize, u32, u32, u32) {
-        if idx == NIL {
-            return (0, 0, 0, 0);
-        }
-        seen.insert(idx);
-        let node = self.nodes[idx as usize];
-        if node.is_leaf() {
-            return (1, 1, 0, 0);
-        }
-        let (ln, lh, _li, lm) = self.check2(node.left(), seen);
-        let (rn, rh, ri, rm) = self.check2(node.right(), seen);
-        let imb = lh.abs_diff(rh);
-        let real = 1 + lh.max(rh);
-        let stored = node.height();
-        let mismatch = if stored != real { u32::MAX } else { 0 };
-        (
-            ln + rn + 1,
-            real,
-            imb.max(ri).max(ri),
-            mismatch.max(lm).max(rm),
-        )
+    /// Диагностика: узлов, реальная высота, худший перекос, расхождение высот.
+    pub fn debug_stats(&self) -> TreeStats {
+        let mut seen = std::collections::HashSet::new();
+        self.collect_stats(self.root, &mut seen)
     }
 
-    /// Диагностика: узлов, реальная высота, худший перекос, расхождение высот.
-    pub fn debug_stats(&self) -> (usize, u32, u32, u32) {
-        let mut seen = std::collections::HashSet::new();
-        self.check2(self.root, &mut seen)
+    fn collect_stats(&self, id: u32, seen: &mut std::collections::HashSet<u32>) -> TreeStats {
+        if id == NIL {
+            return TreeStats {
+                nodes: 0,
+                height: 0,
+                worst_imbalance: 0,
+                height_mismatch: 0,
+            };
+        }
+        seen.insert(id);
+        let node = self.nodes[id as usize];
+        if self.is_leaf(id) {
+            return TreeStats {
+                nodes: 1,
+                height: 1,
+                worst_imbalance: 0,
+                height_mismatch: 0,
+            };
+        }
+        let left = self.collect_stats(node.left(), seen);
+        let right = self.collect_stats(node.right(), seen);
+        let imbalance = left.height.abs_diff(right.height);
+        let real_height = 1 + left.height.max(right.height);
+        let mismatch = if self.node_height(id) != real_height {
+            u32::MAX
+        } else {
+            0
+        };
+        TreeStats {
+            nodes: left.nodes + right.nodes + 1,
+            height: real_height,
+            worst_imbalance: imbalance
+                .max(left.worst_imbalance)
+                .max(right.worst_imbalance),
+            height_mismatch: mismatch
+                .max(left.height_mismatch)
+                .max(right.height_mismatch),
+        }
     }
 }
 
 impl Default for Tree {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Приёмник кусков: складывает их в буфер и запоминает диапазоны.
+    struct RangeReader<'a> {
+        buffer: &'a [u8],
+        text: Vec<u8>,
+        ranges: Vec<(u32, u32)>,
+    }
+
+    impl<'a> RangeReader<'a> {
+        fn new(buffer: &'a [u8]) -> Self {
+            Self {
+                buffer,
+                text: Vec::new(),
+                ranges: Vec::new(),
+            }
+        }
+    }
+
+    impl Sink for RangeReader<'_> {
+        fn range(&mut self, start: u32, len: u32) {
+            self.ranges.push((start, len));
+            let from = start as usize;
+            self.text
+                .extend_from_slice(&self.buffer[from..from + len as usize]);
+        }
+    }
+
+    /// Буфер, где байт с номером `i` — это `b'a' + i % 26`.
+    fn sample_buffer(len: usize) -> Vec<u8> {
+        (0..len).map(|i| b'a' + (i % 26) as u8).collect()
+    }
+
+    fn pieced_tree(pieces: &[(u32, u32)]) -> Tree {
+        let mut tree = Tree::new();
+        for &(start, len) in pieces {
+            let leaf = tree.alloc_leaf(start, len);
+            tree.insert_leaf(tree.len, leaf);
+        }
+        tree
+    }
+
+    #[test]
+    fn new_tree_is_empty() {
+        let tree = Tree::new();
+        assert_eq!(tree.root, NIL);
+        assert_eq!(tree.len, 0);
+        assert_eq!(tree.leaves, 0);
+        assert_eq!(tree.height(), 0);
+        assert_eq!(tree.node_count(), 0);
+        assert_eq!(tree.free_len(), 0);
+        assert!(tree.capacity() >= 1);
+        assert!(tree.debug_sound());
+        assert_eq!(tree.debug_reachable_nodes(), Some(0));
+    }
+
+    #[test]
+    fn default_tree_is_empty() {
+        let tree = Tree::default();
+        assert_eq!(tree.root, NIL);
+        assert_eq!(tree.len, 0);
+    }
+
+    #[test]
+    fn with_leaf_of_zero_keeps_the_tree_empty() {
+        let tree = Tree::with_leaf(0, 0);
+        assert_eq!(tree.root, NIL);
+        assert_eq!(tree.len, 0);
+        assert_eq!(tree.leaves, 0);
+    }
+
+    #[test]
+    fn with_leaf_holds_the_whole_buffer() {
+        let tree = Tree::with_leaf(3, 5);
+        assert_eq!(tree.len, 5);
+        assert_eq!(tree.leaves, 1);
+        assert_eq!(tree.height(), 1);
+        assert_eq!(tree.node_text_len(tree.root), 5);
+        assert_eq!(tree.node_at(tree.root).start(), 3);
+        assert_eq!(tree.node_at(tree.root).leaf_len(), 5);
+    }
+
+    #[test]
+    fn released_leaf_slot_is_reused() {
+        let mut tree = Tree::new();
+        let first = tree.alloc_leaf(0, 4);
+        assert_eq!(tree.leaves, 1);
+        assert_eq!(tree.node_count(), 1);
+        tree.release(first);
+        assert_eq!(tree.leaves, 0);
+        assert_eq!(tree.node_count(), 0);
+        assert_eq!(tree.free_len(), 1);
+        let second = tree.alloc_leaf(0, 4);
+        assert_eq!(
+            second, first,
+            "слот свободного узла должен переиспользоваться"
+        );
+    }
+
+    #[test]
+    fn release_tree_returns_every_node() {
+        let mut tree = pieced_tree(&[(0, 3), (5, 3), (10, 3)]);
+        assert!(tree.node_count() > 1);
+        tree.release_tree(tree.root);
+        assert_eq!(tree.node_count(), 0);
+        assert_eq!(tree.leaves, 0);
+    }
+
+    #[test]
+    fn reset_clears_the_pool() {
+        let mut tree = pieced_tree(&[(0, 3), (3, 3)]);
+        tree.reset();
+        assert_eq!(tree.root, NIL);
+        assert_eq!(tree.len, 0);
+        assert_eq!(tree.leaves, 0);
+        assert_eq!(tree.node_count(), 0);
+        assert_eq!(tree.free_len(), 0);
+    }
+
+    #[test]
+    fn collapse_to_a_single_leaf() {
+        let mut tree = pieced_tree(&[(0, 3), (3, 3), (6, 3)]);
+        tree.collapse_to(2, 7);
+        assert_eq!(tree.len, 7);
+        assert_eq!(tree.leaves, 1);
+        assert_eq!(tree.height(), 1);
+        tree.collapse_to(0, 0);
+        assert_eq!(tree.root, NIL);
+        assert_eq!(tree.len, 0);
+    }
+
+    #[test]
+    fn concat_merges_buffer_adjacent_leaves() {
+        let mut tree = Tree::new();
+        let left = tree.alloc_leaf(0, 3);
+        let right = tree.alloc_leaf(3, 4);
+        let merged = tree.concat(left, right);
+        assert_eq!(tree.leaves, 1, "смежные листья склеиваются в один");
+        assert_eq!(tree.node_at(merged).start(), 0);
+        assert_eq!(tree.node_at(merged).leaf_len(), 7);
+    }
+
+    #[test]
+    fn concat_keeps_a_gap_between_leaves() {
+        // Между кусками буфера лежит текст, который отмена вернёт: склеивать
+        // их нельзя.
+        let tree = pieced_tree(&[(0, 3), (5, 4)]);
+        assert_eq!(tree.leaves, 2);
+        let pieces: Vec<_> = tree
+            .leaves_in_order()
+            .iter()
+            .map(|leaf| (leaf.start, leaf.len))
+            .collect();
+        assert_eq!(pieces, vec![(0, 3), (5, 4)]);
+    }
+
+    #[test]
+    fn concat_ignores_nil_children() {
+        let mut tree = pieced_tree(&[(0, 3)]);
+        let leaf = tree.root;
+        assert_eq!(tree.concat(NIL, leaf), leaf);
+        assert_eq!(tree.concat(leaf, NIL), leaf);
+    }
+
+    #[test]
+    fn insert_leaf_into_an_empty_tree() {
+        let mut tree = Tree::new();
+        let leaf = tree.alloc_leaf(0, 4);
+        tree.insert_leaf(0, leaf);
+        assert_eq!(tree.len, 4);
+        assert_eq!(tree.leaves, 1);
+    }
+
+    #[test]
+    fn insert_leaf_at_start_and_end() {
+        let mut tree = Tree::new();
+        let tail = tree.alloc_leaf(4, 3);
+        tree.insert_leaf(0, tail);
+        let head = tree.alloc_leaf(0, 4);
+        tree.insert_leaf(0, head);
+        let last = tree.alloc_leaf(7, 2);
+        tree.insert_leaf(tree.len, last);
+        assert_eq!(tree.len, 9);
+        assert_eq!(tree.leaf_end(), 9);
+    }
+
+    #[test]
+    fn insert_leaf_in_the_middle_splits_the_leaf() {
+        let mut tree = Tree::with_leaf(0, 6);
+        let leaf = tree.alloc_leaf(100, 2);
+        tree.insert_leaf(3, leaf);
+        assert_eq!(tree.len, 8);
+        assert_eq!(tree.leaves, 3);
+        let pieces = tree.leaves_in_order();
+        assert_eq!(
+            pieces.iter().map(|l| (l.start, l.len)).collect::<Vec<_>>(),
+            vec![(0, 3), (100, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn inserting_an_empty_leaf_changes_nothing() {
+        let mut tree = Tree::with_leaf(0, 4);
+        let empty = tree.alloc_leaf(0, 0);
+        tree.insert_leaf(2, empty);
+        assert_eq!(tree.len, 4);
+        assert_eq!(tree.leaves, 1);
+    }
+
+    #[test]
+    fn replace_swaps_a_range_for_a_leaf() {
+        let mut tree = Tree::with_leaf(0, 10);
+        let leaf = tree.alloc_leaf(100, 3);
+        tree.replace(2, 4, leaf);
+        assert_eq!(tree.len, 9);
+        assert_eq!(
+            tree.leaves_in_order()
+                .iter()
+                .map(|l| (l.start, l.len))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (100, 3), (6, 4)]
+        );
+    }
+
+    #[test]
+    fn replace_without_removal_is_an_insert() {
+        let mut tree = Tree::with_leaf(0, 4);
+        let leaf = tree.alloc_leaf(50, 2);
+        tree.replace(4, 0, leaf);
+        assert_eq!(tree.len, 6);
+        assert_eq!(tree.leaf_end(), 50 + 2);
+    }
+
+    #[test]
+    fn replace_with_an_empty_leaf_is_a_cut() {
+        let mut tree = Tree::with_leaf(0, 10);
+        let empty = tree.alloc_leaf(0, 0);
+        tree.replace(3, 5, empty);
+        assert_eq!(tree.len, 5);
+        assert_eq!(
+            tree.leaves_in_order()
+                .iter()
+                .map(|l| (l.start, l.len))
+                .collect::<Vec<_>>(),
+            vec![(0, 3), (8, 2)]
+        );
+    }
+
+    #[test]
+    fn replace_into_an_empty_tree_places_the_leaf() {
+        let mut tree = Tree::new();
+        let leaf = tree.alloc_leaf(7, 5);
+        tree.replace(0, 2, leaf);
+        assert_eq!(tree.len, 5);
+        assert_eq!(tree.root, leaf);
+    }
+
+    #[test]
+    fn cut_removes_a_range_from_the_middle() {
+        let mut tree = Tree::with_leaf(0, 10);
+        tree.cut(3, 7);
+        assert_eq!(tree.len, 6);
+        assert_eq!(
+            tree.leaves_in_order()
+                .iter()
+                .map(|l| (l.start, l.len))
+                .collect::<Vec<_>>(),
+            vec![(0, 3), (7, 3)]
+        );
+    }
+
+    #[test]
+    fn cut_across_several_leaves() {
+        let mut tree = pieced_tree(&[(0, 3), (3, 3), (6, 3)]);
+        tree.cut(2, 7);
+        assert_eq!(tree.len, 4);
+        assert_eq!(
+            tree.leaves_in_order()
+                .iter()
+                .map(|l| (l.start, l.len))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (7, 2)]
+        );
+    }
+
+    #[test]
+    fn cut_ignores_an_empty_or_broken_range() {
+        let mut tree = Tree::with_leaf(0, 4);
+        tree.cut(3, 3);
+        tree.cut(0, 0);
+        assert_eq!(tree.len, 4, "пустой диапазон ничего не режет");
+        let mut empty = Tree::new();
+        empty.cut(0, 4);
+        assert_eq!(empty.len, 0);
+    }
+
+    #[test]
+    fn reading_returns_the_whole_buffer() {
+        let tree = pieced_tree(&[(0, 3), (100, 2), (3, 4)]);
+        let buffer = sample_buffer(120);
+        let mut reader = RangeReader::new(&buffer);
+        tree.read_into(&mut reader);
+        let expected: Vec<u8> = [(0, 3), (100, 2), (3, 4)]
+            .iter()
+            .flat_map(|&(start, len)| buffer[start as usize..(start + len) as usize].to_vec())
+            .collect();
+        assert_eq!(reader.text, expected);
+        assert_eq!(reader.ranges, vec![(0, 3), (100, 2), (3, 4)]);
+    }
+
+    #[test]
+    fn reading_a_range_clips_to_the_bounds() {
+        let tree = Tree::with_leaf(0, 10);
+        let buffer = sample_buffer(10);
+        let mut reader = RangeReader::new(&buffer);
+        tree.read_range_into(3, 7, &mut reader);
+        assert_eq!(reader.text, buffer[3..7].to_vec());
+    }
+
+    #[test]
+    fn reading_an_empty_range_gives_nothing() {
+        let tree = Tree::with_leaf(0, 10);
+        let buffer = sample_buffer(10);
+        let mut reader = RangeReader::new(&buffer);
+        tree.read_range_into(5, 5, &mut reader);
+        assert!(reader.text.is_empty());
+        assert!(reader.ranges.is_empty());
+    }
+
+    #[test]
+    fn reading_a_range_beyond_the_end_is_clipped() {
+        let tree = Tree::with_leaf(0, 4);
+        let buffer = sample_buffer(4);
+        let mut reader = RangeReader::new(&buffer);
+        tree.read_range_into(2, 100, &mut reader);
+        assert_eq!(reader.text, buffer[2..4].to_vec());
+    }
+
+    #[test]
+    fn leaves_in_order_lists_every_piece() {
+        let tree = pieced_tree(&[(0, 3), (10, 3), (20, 2)]);
+        let pieces: Vec<_> = tree
+            .leaves_in_order()
+            .iter()
+            .map(|leaf| (leaf.start, leaf.len))
+            .collect();
+        assert_eq!(pieces, vec![(0, 3), (10, 3), (20, 2)]);
+    }
+
+    #[test]
+    fn leaf_end_is_the_farthest_buffer_byte() {
+        let tree = pieced_tree(&[(0, 3), (3, 3), (10, 2)]);
+        assert_eq!(tree.leaf_end(), 12);
+        let empty = Tree::new();
+        assert_eq!(empty.leaf_end(), 0);
+    }
+
+    #[test]
+    fn staying_balanced_under_many_inserts() {
+        // Кусочки с разрывами: смежные слились бы в один лист, и балансировать
+        // было бы нечего.
+        let mut tree = Tree::new();
+        for i in 0..500u32 {
+            let leaf = tree.alloc_leaf(i * 4, 2);
+            tree.insert_leaf(tree.len, leaf);
+        }
+        let stats = tree.debug_stats();
+        assert_eq!(stats.height, tree.height());
+        assert!(
+            stats.worst_imbalance <= 1,
+            "перекос {}",
+            stats.worst_imbalance
+        );
+        assert_eq!(stats.height_mismatch, 0, "высота в узле разошлась");
+        assert!(tree.debug_sound());
+        assert_eq!(stats.nodes, tree.leaves * 2 - 1);
+    }
+
+    #[test]
+    fn debug_stats_on_an_empty_tree() {
+        let stats = Tree::new().debug_stats();
+        assert_eq!(stats.nodes, 0);
+        assert_eq!(stats.height, 0);
+        assert_eq!(stats.worst_imbalance, 0);
+        assert_eq!(stats.height_mismatch, 0);
+    }
+
+    #[test]
+    fn debug_sound_notices_a_cycle() {
+        // Собирается руками: узел ссылается сам на себя. Такого быть не
+        // должно, и проверка обязана это заметить, а не зациклиться.
+        let mut tree = Tree::new();
+        let leaf = tree.alloc_leaf(0, 2);
+        let branch = tree.make_branch(leaf, leaf);
+        tree.root = branch;
+        tree.nodes[branch as usize] = Node::branch(branch, branch, 4);
+        assert!(!tree.debug_sound());
+        assert_eq!(tree.debug_reachable_nodes(), None);
+    }
+
+    #[test]
+    fn node_at_and_node_text_len_describe_the_leaf() {
+        let mut tree = Tree::new();
+        let leaf = tree.alloc_leaf(9, 4);
+        let node = tree.node_at(leaf);
+        assert_eq!(node.start(), 9);
+        assert_eq!(node.leaf_len(), 4);
+        assert_eq!(tree.node_text_len(leaf), 4);
     }
 }
