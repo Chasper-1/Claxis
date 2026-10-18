@@ -132,7 +132,11 @@ impl History {
     /// остаться верными после восстановления.
     pub fn capture(doc: &Document) -> Self {
         let records = doc.path();
-        let mut bytes = Vec::new();
+        // Размер блоба известен заранее: заголовок, весь буфер и по
+        // `RECORD_SIZE` байту на запись. Берём сразу, чтобы не расти по кускам.
+        let mut bytes = Vec::with_capacity(
+            MAGIC.len() + 1 + 4 + 4 + doc.buffer_len() + 4 + records.len() * RECORD_SIZE,
+        );
         bytes.extend_from_slice(&MAGIC);
         bytes.push(VERSION);
         bytes.extend_from_slice(&doc.file_len().to_le_bytes());

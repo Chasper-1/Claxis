@@ -56,6 +56,11 @@ pub struct Tree {
     pub leaves: usize,
     /// Голова списка свободных.
     free_head: u32,
+    /// Сколько узлов в списке свободных.
+    ///
+    /// Считается на месте: без него `free_len` обходил бы весь список, а его
+    /// спрашивают и статистика памяти, и число занятых узлов.
+    free_count: usize,
     /// Самое позднее место буфера среди когда-либо выделенных листьев.
     ///
     /// Обновляется при выделении листа и не уменьшается до [`Tree::reset`]:
@@ -77,6 +82,7 @@ impl Tree {
             len: 0,
             leaves: 0,
             free_head: NIL,
+            free_count: 0,
             leaf_watermark: 0,
         }
     }
@@ -110,8 +116,9 @@ impl Tree {
     /// Длина текста узла: у листа — его длина, у ветки — длина поддерева.
     #[inline]
     pub fn node_text_len(&self, id: u32) -> u32 {
+        // Обращение к пулу одно: вид узла лежит в нём самом, а не рядом.
         let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             node.leaf_len()
         } else {
             node.subtree_len()
@@ -140,14 +147,9 @@ impl Tree {
     }
 
     /// Свободно узлов.
+    #[inline]
     pub fn free_len(&self) -> usize {
-        let mut free = 0;
-        let mut cursor = self.free_head;
-        while cursor != NIL {
-            free += 1;
-            cursor = self.nodes[cursor as usize].free_next();
-        }
-        free
+        self.free_count
     }
 
     /// Ёмкость пула.
@@ -180,8 +182,23 @@ impl Tree {
 
     /// Новая ветка над двумя поддеревьями: длина и высота считаются сами.
     fn make_branch(&mut self, left: u32, right: u32) -> u32 {
-        let len = self.node_text_len(left) + self.node_text_len(right);
-        let height = 1 + self.node_height(left).max(self.node_height(right));
+        // Оба ребёнка читаются из пула один раз: и длина, и высота лежат в
+        // самом узле, а лишние обращения — это лишние проверки границ в самом
+        // горячем пути.
+        let left_node = self.nodes[left as usize];
+        let right_node = self.nodes[right as usize];
+        let (left_len, left_height) = if left_node.is_leaf() {
+            (left_node.leaf_len(), 1)
+        } else {
+            (left_node.subtree_len(), left_node.height())
+        };
+        let (right_len, right_height) = if right_node.is_leaf() {
+            (right_node.leaf_len(), 1)
+        } else {
+            (right_node.subtree_len(), right_node.height())
+        };
+        let len = left_len + right_len;
+        let height = 1 + left_height.max(right_height);
         self.alloc_node(Node::branch(left, right, len, height))
     }
 
@@ -208,6 +225,7 @@ impl Tree {
         let id = if self.free_head != NIL {
             let id = self.free_head;
             self.free_head = self.nodes[id as usize].free_next();
+            self.free_count -= 1;
             id
         } else {
             let id = self.nodes.len() as u32;
@@ -219,12 +237,17 @@ impl Tree {
     }
 
     /// Вернуть узел в свободные.
+    #[inline]
     pub fn release(&mut self, id: u32) {
-        if self.is_leaf(id) {
+        // Узел читается один раз: и вид его, и запись в список берутся из
+        // одного обращения к пулу, а не из двух.
+        let node = self.nodes[id as usize];
+        if node.is_leaf() {
             self.leaves -= 1;
         }
         self.nodes[id as usize] = Node::free(self.free_head);
         self.free_head = id;
+        self.free_count += 1;
     }
 
     /// Вернуть поддерево в свободные.
@@ -234,7 +257,7 @@ impl Tree {
             return;
         }
         let node = self.nodes[id as usize];
-        if !self.is_leaf(id) {
+        if !node.is_leaf() {
             let (left, right) = (node.left(), node.right());
             self.release_tree(left);
             self.release_tree(right);
@@ -250,6 +273,7 @@ impl Tree {
         self.len = 0;
         self.leaves = 0;
         self.free_head = NIL;
+        self.free_count = 0;
         self.leaf_watermark = 0;
     }
 
@@ -310,8 +334,10 @@ impl Tree {
     fn adjacent_leaves(&self, left: u32, right: u32) -> bool {
         let left_node = self.nodes[left as usize];
         let right_node = self.nodes[right as usize];
-        self.is_leaf(left)
-            && self.is_leaf(right)
+        // Вид берётся из уже прочитанных узлов: отдельные `is_leaf` читали бы
+        // пул ещё раз.
+        left_node.is_leaf()
+            && right_node.is_leaf()
             && right_node.start() == left_node.start().saturating_add(left_node.leaf_len())
     }
 
@@ -564,14 +590,14 @@ impl Tree {
             return NIL;
         }
         let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             return id;
         }
         let (left, right) = (node.left(), node.right());
         let (left_height, right_height) = (self.node_height(left), self.node_height(right));
         if left_height > right_height + 1 {
             let left_node = self.nodes[left as usize];
-            if self.is_leaf(left) {
+            if left_node.is_leaf() {
                 return id;
             }
             let (left_left, left_right) = (left_node.left(), left_node.right());
@@ -597,7 +623,7 @@ impl Tree {
         }
         if right_height > left_height + 1 {
             let right_node = self.nodes[right as usize];
-            if self.is_leaf(right) {
+            if right_node.is_leaf() {
                 return id;
             }
             let (right_left, right_right) = (right_node.left(), right_node.right());
@@ -717,7 +743,9 @@ impl Tree {
 
     /// Сколько узлов достижимо обходом, или `None`, если обход зациклился.
     pub fn debug_reachable_nodes(&self) -> Option<usize> {
-        let mut seen = std::collections::HashSet::new();
+        // Отметки узлов — по слоту пула: вектор булей дешевле и меньше
+        // множества, а номер узла и есть индекс слота.
+        let mut seen = vec![false; self.nodes.len()];
         self.count_nodes(self.root, &mut seen, 0)
     }
 
@@ -728,20 +756,16 @@ impl Tree {
         self.debug_reachable_nodes().is_some()
     }
 
-    fn count_nodes(
-        &self,
-        id: u32,
-        seen: &mut std::collections::HashSet<u32>,
-        depth: u32,
-    ) -> Option<usize> {
+    fn count_nodes(&self, id: u32, seen: &mut [bool], depth: u32) -> Option<usize> {
         if id == NIL {
             return Some(0);
         }
-        if depth >= MAX_DEPTH || !seen.insert(id) {
+        // `replace` сразу ставит отметку и говорит, стояла ли она уже.
+        if depth >= MAX_DEPTH || std::mem::replace(&mut seen[id as usize], true) {
             return None;
         }
         let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             Some(1)
         } else {
             let left = self.count_nodes(node.left(), seen, depth + 1)?;
@@ -757,24 +781,19 @@ impl Tree {
     /// не такое, каким должно быть», сводки в этом случае нет вовсе: `None`
     /// честнее пустой сводки, по которой вышло бы, что всё в порядке.
     pub fn debug_stats(&self) -> Option<TreeStats> {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = vec![false; self.nodes.len()];
         self.collect_stats(self.root, &mut seen, 0)
     }
 
-    fn collect_stats(
-        &self,
-        id: u32,
-        seen: &mut std::collections::HashSet<u32>,
-        depth: u32,
-    ) -> Option<TreeStats> {
+    fn collect_stats(&self, id: u32, seen: &mut [bool], depth: u32) -> Option<TreeStats> {
         if id == NIL {
             return Some(TreeStats::EMPTY);
         }
-        if depth >= MAX_DEPTH || !seen.insert(id) {
+        if depth >= MAX_DEPTH || std::mem::replace(&mut seen[id as usize], true) {
             return None;
         }
         let node = self.nodes[id as usize];
-        if self.is_leaf(id) {
+        if node.is_leaf() {
             return Some(TreeStats {
                 nodes: 1,
                 height: 1,

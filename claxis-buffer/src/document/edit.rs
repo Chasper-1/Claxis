@@ -13,7 +13,12 @@ const NODE_HEADROOM: usize = 4096;
 
 impl Document {
     fn check(&self, anchor: u32, len: u32) -> Result<()> {
-        if anchor as u64 + len as u64 > self.tree.len as u64 {
+        // `checked_add` сразу ловит и переполнение на выходе за документ:
+        // сложение `as u64` — лишние инструкции в горячем пути.
+        if !anchor
+            .checked_add(len)
+            .is_some_and(|end| end <= self.tree.len)
+        {
             return Err(Error::OutOfBounds {
                 anchor,
                 len,
@@ -49,7 +54,7 @@ impl Document {
         self.ensure_buffer_room(data.len())?;
         self.ensure_node_room()?;
         self.discard_redo();
-        let text_offset = self.append(data)?;
+        let text_offset = self.append(data);
         let len = data.len() as u32;
         let record = Record::Insert {
             anchor,
@@ -74,7 +79,7 @@ impl Document {
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а
         // второго буфера быть не должно.
         let removed = self.slice(anchor, anchor + len);
-        let text_offset = self.append(&removed)?;
+        let text_offset = self.append(&removed);
         let record = Record::Delete {
             anchor,
             head: anchor + len,
@@ -102,8 +107,8 @@ impl Document {
         // Вырезанное копируется в хвост буфера: иначе отменять нечем, а второго
         // буфера быть не должно.
         let removed = self.slice(anchor, anchor + len);
-        let removed_offset = self.append(&removed)?;
-        let text_offset = self.append(data)?;
+        let removed_offset = self.append(&removed);
+        let text_offset = self.append(data);
 
         let record = Record::Replace {
             anchor,
@@ -121,19 +126,22 @@ impl Document {
     /// Буфер только растёт и переезжать не любит: запись правки хранит
     /// смещение, и оно обязано пережить всё, что случится с деревом.
     ///
-    /// Смещения в буфере 32-битные, поэтому за четыре гигабайта положить
-    /// нечего: попытка — это ошибка, а не тихая обрезка до нуля.
-    fn append(&mut self, data: &[u8]) -> Result<u32> {
-        self.ensure_buffer_room(data.len())?;
+    /// Место не проверяется: его проверяет вызывающий до побочных действий —
+    /// [`Document::ensure_buffer_room`] или [`Document::check_restore`]. Так
+    /// на правку приходится одна проверка, а не две.
+    #[inline(never)]
+    fn append(&mut self, data: &[u8]) -> u32 {
         let offset = self.bytes.len() as u32;
         self.bytes.extend_from_slice(data);
-        Ok(offset)
+        offset
     }
 
     /// Поместится ли в буфер ещё `extra` байт.
     ///
-    /// Отдельная проверка, чтобы её можно было сделать до побочных действий:
-    /// `append` падает с той же ошибкой, но уже после того, как правка началась.
+    /// Зовётся до побочных действий: правка, которой не хватило места, должна
+    /// закончиться ошибкой, ничего не тронув. Смещения в буфере 32-битные,
+    /// поэтому за четыре гигабайта положить нечего — это ошибка, а не тихая
+    /// обрезка до нуля.
     fn ensure_buffer_room(&self, extra: usize) -> Result<()> {
         let end = self.bytes.len() as u64 + extra as u64;
         if end > u32::MAX as u64 {
@@ -267,7 +275,7 @@ impl Document {
             .get(from as usize..end as usize)
             .ok_or(Error::HistoryOutOfBounds { offset: from, len })?
             .to_vec();
-        let start = self.append(&restored)?;
+        let start = self.append(&restored);
         let leaf = self.tree.alloc_leaf(start, len);
         self.tree.insert_leaf(anchor, leaf);
         Ok(())
@@ -388,12 +396,13 @@ impl Document {
 
     /// Отбросить redo-ветку: вершины в свободный список, текст в хвост.
     fn discard_redo(&mut self) {
-        let mut tail = None;
+        // Нужен только признак «ветка была»: границу обрезки считает
+        // `live_end`, а не самый ранний текст отброшенных записей.
+        let mut had_redo = false;
         let mut cursor = self.versions[self.current as usize].child;
         while cursor != NIL {
             let version = self.versions[cursor as usize];
-            let off = version.record.text_offset();
-            tail = Some(tail.map_or(off, |t: u32| t.min(off)));
+            had_redo = true;
             self.free.push(cursor);
             cursor = version.child;
         }
@@ -403,7 +412,7 @@ impl Document {
         // записи истории на активной ветке. Обрезка оставляет начало буфера,
         // поэтому резать можно только за самым концом живых ссылок — иначе
         // лист останется читать обрезанный участок и потеряет байты.
-        if tail.is_some() {
+        if had_redo {
             let end = self.live_end() as usize;
             if end < self.bytes.len() {
                 self.bytes.truncate(end);

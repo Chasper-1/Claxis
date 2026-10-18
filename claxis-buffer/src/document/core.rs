@@ -5,6 +5,13 @@ use super::record::{Record, Version};
 use crate::node::NIL;
 use crate::tree::Tree;
 
+/// Сколько вершин истории заказывается вперёд при сборке документа.
+///
+/// Столько же, сколько правок живёт до снимка при глубине по умолчанию: ещё
+/// одна такая же порция — и память пришлось бы просить заново. Больше брать
+/// нельзя: глубина настраивается и потолка не имеет.
+const VERSION_RESERVE: usize = 8 * 1024;
+
 /// Документ: текст, история и снапшоты.
 pub struct Document {
     /// Байты под деревом: исходный файл в начале, дальше вставки и вырезанное.
@@ -82,21 +89,30 @@ impl Document {
     }
 
     fn assemble(bytes: Vec<u8>, file_len: u32, depth: u32) -> Self {
+        // Вершин до снимка будет не больше, чем глубина; под обычную глубину
+        // память берётся сразу, чтобы правки не платили за реаллокацию. Но
+        // потолка у глубины нет — [`Document::with_depth`] принимает любое
+        // число, — поэтому запас ограничен: иначе `depth` в миллиарды просил
+        // бы гигабайты под пустую историю.
+        let reserve = depth.min(VERSION_RESERVE as u32) as usize;
+        let mut versions = Vec::with_capacity(reserve);
+        versions.push(Version {
+            record: Record::Delete {
+                anchor: 0,
+                head: 0,
+                text_offset: 0,
+            },
+            parent: NIL,
+            child: NIL,
+            live: 0,
+        });
         Self {
             tree: Tree::with_leaf(0, file_len),
             bytes,
             file_len,
-            versions: vec![Version {
-                record: Record::Delete {
-                    anchor: 0,
-                    head: 0,
-                    text_offset: 0,
-                },
-                parent: NIL,
-                child: NIL,
-                live: 0,
-            }],
-            free: Vec::new(),
+            versions,
+            // Свободных вершин бывает не больше, чем занятых: запас тот же.
+            free: Vec::with_capacity(reserve),
             current: 0,
             depth,
             sink: None,
@@ -164,7 +180,9 @@ impl Document {
         }
         let mut sink = Collect {
             bytes: &self.bytes,
-            out: Vec::new(),
+            // Кусок в буфере не длиннее самого диапазона: столько и просим,
+            // чтобы не реаллоцировать на каждом листе.
+            out: Vec::with_capacity(end.saturating_sub(start) as usize),
         };
         self.tree.read_range_into(start, end, &mut sink);
         sink.out
@@ -183,6 +201,19 @@ impl Document {
             return Vec::new();
         }
         self.slice(start, end)
+    }
+
+    /// Диапазон документа прямо в приёмник, без промежуточного `Vec`.
+    ///
+    /// За документ не выходит: лишнее отбрасывает дерево, как и у
+    /// [`Document::read_range`].
+    pub fn read_range_into<S: crate::Sink>(&self, start: u32, end: u32, sink: &mut S) {
+        self.tree.read_range_into(start, end, sink);
+    }
+
+    /// Весь документ прямо в приёмник, без промежуточного `Vec`.
+    pub fn read_into<S: crate::Sink>(&self, sink: &mut S) {
+        self.tree.read_range_into(0, self.len(), sink);
     }
 
     /// Основа документа: текст файла, каким он был до правок.
@@ -237,7 +268,8 @@ impl Document {
 
     /// Записи активной ветки, от корня к текущей вершине.
     pub fn path(&self) -> Vec<Record> {
-        let mut out = Vec::new();
+        // Ветка не длиннее числа занятых вершин: столько и просим.
+        let mut out = Vec::with_capacity(self.history_used() as usize);
         let mut cursor = self.current;
         // Ветка заканчивается на корне, а корень — это ноль, и обход на нём
         // уже остановлен. Отдельной проверки не нужно: у первой правки
@@ -387,6 +419,43 @@ mod tests {
         }
         assert_eq!(doc.path().len(), 50_000, "история росла вместе с правками");
         assert_eq!(doc.snapshots_taken(), 0, "снапшот брать было не пора");
+    }
+
+    #[test]
+    fn reading_into_a_sink_matches_the_vec() {
+        // Приёмник сам режет диапазоны по буферу: то же, что делает `slice`,
+        // но без промежуточного `Vec` на стороне документа.
+        struct Copy<'a> {
+            bytes: &'a [u8],
+            out: Vec<u8>,
+        }
+        impl crate::Sink for Copy<'_> {
+            fn range(&mut self, start: u32, len: u32) {
+                let from = (start as usize).min(self.bytes.len());
+                let to = (start as usize)
+                    .saturating_add(len as usize)
+                    .min(self.bytes.len());
+                self.out.extend_from_slice(&self.bytes[from..to]);
+            }
+        }
+
+        let mut doc = d("hello, world");
+        doc.insert(doc.len(), b"!").unwrap();
+        doc.delete(0, 2).unwrap();
+
+        let mut whole = Copy {
+            bytes: doc.buffer(),
+            out: Vec::new(),
+        };
+        doc.read_into(&mut whole);
+        assert_eq!(whole.out, doc.read());
+
+        let mut part = Copy {
+            bytes: doc.buffer(),
+            out: Vec::new(),
+        };
+        doc.read_range_into(3, 9, &mut part);
+        assert_eq!(part.out, doc.read_range(3, 9));
     }
 
     #[test]

@@ -51,7 +51,13 @@ impl Record {
     /// [`Record::removed`] и в `len` не входит — иначе сдвиг `text_offset`
     /// разъехался бы с длиной.
     pub fn len(&self) -> u32 {
-        self.anchor().abs_diff(self.head())
+        // Один разбор варианта вместо двух: `anchor()` и `head()` — это два
+        // отдельных `match` по той же записи.
+        match self {
+            Record::Insert { anchor, head, .. }
+            | Record::Delete { anchor, head, .. }
+            | Record::Replace { anchor, head, .. } => anchor.abs_diff(*head),
+        }
     }
 
     /// Несёт ли запись свой текст.
@@ -130,11 +136,30 @@ pub enum Kind {
 /// Самое позднее место буфера, куда смотрит запись: её собственный текст и
 /// вырезанный ею.
 pub(super) fn record_end(record: &Record) -> u32 {
-    let mut end = record.text_offset().saturating_add(record.len());
-    if let Some((offset, len)) = record.removed() {
-        end = end.max(offset.saturating_add(len));
+    // Один разбор варианта: собственный текст и вырезанный считаются за раз,
+    // а не тремя `match` подряд.
+    match record {
+        Record::Insert {
+            anchor,
+            head,
+            text_offset,
+        }
+        | Record::Delete {
+            anchor,
+            head,
+            text_offset,
+        } => text_offset.saturating_add(anchor.abs_diff(*head)),
+        Record::Replace {
+            anchor,
+            head,
+            text_offset,
+            removed_offset,
+            removed_len,
+        } => {
+            let inserted = text_offset.saturating_add(anchor.abs_diff(*head));
+            inserted.max(removed_offset.saturating_add(*removed_len))
+        }
     }
-    end
 }
 
 /// Вершина истории: запись, родитель, ребёнок и граница буфера.
