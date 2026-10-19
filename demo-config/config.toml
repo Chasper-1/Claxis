@@ -38,7 +38,7 @@ right = [ , "position"  ]     #
 [Statusline.States]     # Отображаемые имена состояний в статус линии
 edit = "Edit"
 command = "Command"
-file = "File"
+files = "Files"
 
 [Statusline.Modes]     # Отображаемые имена режимов в статус линии
 # state edit
