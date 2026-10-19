@@ -440,6 +440,14 @@ impl Document {
     pub fn history_used(&self) -> u32 {
         self.versions.len() as u32 - self.free.len() as u32
     }
+
+    /// Переросла ли история в памяти глубину.
+    ///
+    /// Считаются правки, а не записи: корневая вершина — основание дерева, а
+    /// не правка, и глубина в одну правку означает одну правку.
+    pub fn history_is_full(&self) -> bool {
+        self.history_used().saturating_sub(1) > self.depth
+    }
 }
 
 #[cfg(test)]

@@ -317,11 +317,12 @@ pub(super) mod support {
     pub struct Share(pub std::rc::Rc<std::cell::RefCell<Ring>>);
 
     impl SnapshotSink for Share {
-        fn accept(&mut self, path: &std::path::Path, text: &[u8], history: &[u8]) {
+        fn accept(&mut self, path: &std::path::Path, text: &[u8], history: &[u8]) -> bool {
             self.0
                 .borrow_mut()
                 .written
                 .push((path.to_path_buf(), text.to_vec(), history.to_vec()));
+            true
         }
 
         fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
@@ -344,9 +345,10 @@ pub(super) mod support {
     }
 
     impl SnapshotSink for Attached {
-        fn accept(&mut self, path: &std::path::Path, text: &[u8], history: &[u8]) {
+        fn accept(&mut self, path: &std::path::Path, text: &[u8], history: &[u8]) -> bool {
             self.accepted
                 .push((path.to_path_buf(), text.to_vec(), history.to_vec()));
+            true
         }
 
         fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
@@ -355,6 +357,35 @@ pub(super) mod support {
                 .rev()
                 .find(|(file, _, _)| file == path)
                 .map(|(_, _, history)| history.clone())
+        }
+    }
+
+    /// Приёмник, который не смог записать снимок: `accept` отвечает `false`.
+    ///
+    /// Так выглядит поломка диска: снимок не сохранён, и история обязана
+    /// остаться в памяти целиком.
+    #[derive(Debug, Default)]
+    pub struct Refusing {
+        /// Что приёмнику предлагали записать. Вход не пропадает молча даже у
+        /// сломанного приёмника.
+        pub offered: Vec<(std::path::PathBuf, Vec<u8>, Vec<u8>)>,
+    }
+
+    impl SnapshotSink for Refusing {
+        fn accept(&mut self, path: &std::path::Path, text: &[u8], history: &[u8]) -> bool {
+            self.offered
+                .push((path.to_path_buf(), text.to_vec(), history.to_vec()));
+            false
+        }
+
+        fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
+            // Снимков не принимали, поэтому истории старее нет ни для какого
+            // файла. Путь сверяется с журналом попыток, чтобы приёмник не
+            // притворялся немым на заданный вопрос.
+            if self.offered.iter().any(|(file, _, _)| file == path) {
+                return None;
+            }
+            None
         }
     }
 

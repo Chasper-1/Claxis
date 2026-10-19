@@ -21,22 +21,48 @@ impl Document {
     /// приёмник отдаёт из базы следующий: в базе он уже есть, его читают, а не
     /// забирают.
     pub fn snapshot(&mut self) {
-        let document = self.read();
-        let history = crate::history::History::capture(self);
+        // Куда уходить снимку, проверяется до сборки текста и истории: без
+        // приёмника собирать нечего, а обход документа стоит его длины. Сюда
+        // заглядывают после каждой правки (проверка глубины), поэтому здесь
+        // ни копий, ни сборки.
         let Some(file) = self.file.clone() else {
             // Снимку некуда уйти, значит он не сделан. Схлопывать память
             // тогда нельзя: история нигде не лежит и пропала бы вместе с
             // возможностью отменить.
             return;
         };
-        let Some(sink) = self.sink.as_mut() else {
+        if self.sink.is_none() {
             return;
-        };
+        }
+        let document = self.read();
+        let history = crate::history::History::capture(self);
+        let stored = self
+            .sink
+            .as_mut()
+            .is_some_and(|sink| sink.accept(&file, &document, history.as_bytes()));
+        if !stored {
+            // Снимок не лёг: история осталась только в памяти. Схлопывать её
+            // нельзя — иначе отменять будет нечего, а работа потеряна.
+            return;
+        }
         self.snapshots += 1;
-        sink.accept(&file, &document, history.as_bytes());
         // Готовый текст снимка идёт в схлопывание: второй раз документ не
         // собирается.
         self.compact_with(document);
+    }
+
+    /// Снять снапшот, если правок в памяти набралось больше глубины.
+    ///
+    /// Глубина — это предел памяти, а не расписания: снапшот по времени
+    /// сохраняет сессию, а этот — не даёт истории расти без конца.
+    ///
+    /// Без приёмника снапшот не делается (см. [`Document::snapshot`]), и
+    /// история продолжает расти: терять возможность отменить ради экономии
+    /// памяти нельзя.
+    pub fn snapshot_if_over_depth(&mut self) {
+        if self.history_is_full() {
+            self.snapshot();
+        }
     }
 
     /// Схлопнуть документ в одну базу и обрезать историю в памяти.
@@ -383,6 +409,80 @@ mod tests {
         // И документ продолжает работать.
         doc.insert(5, b"Z").unwrap();
         assert_eq!(doc.read(), b"abcXYZ");
+    }
+
+    #[test]
+    fn the_history_overflows_into_a_snapshot_by_depth() {
+        // Глубина — предел памяти, а не расписания: как только правок стало
+        // больше, чем разрешено, история уезжает в снимок, а память
+        // возвращается. Без этого история росла бы вместе с правками.
+        let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
+        let mut doc = Document::with_depth(b"abc", 4).unwrap();
+        doc.set_sink(
+            std::path::PathBuf::from("/tmp/d.txt"),
+            Box::new(Share(std::rc::Rc::clone(&ring))),
+        );
+
+        for _ in 0..4 {
+            doc.insert(doc.len(), b"x").unwrap();
+            doc.snapshot_if_over_depth();
+        }
+        assert_eq!(doc.path().len(), 4, "глубина ещё не переросла");
+        assert_eq!(ring.borrow().written.len(), 0, "снимок рано");
+
+        doc.insert(doc.len(), b"x").unwrap();
+        doc.snapshot_if_over_depth();
+        assert_eq!(ring.borrow().written.len(), 1, "глубина переросла");
+        assert_eq!(doc.path().len(), 0, "история обрезана в памяти");
+        assert_eq!(doc.read(), b"abcxxxxx");
+
+        // Откат через границу по-прежнему доходит до начала: снимок — это
+        // сохранённая история, а не обрыв.
+        for _ in 0..5 {
+            doc.undo().unwrap().expect("откат идёт через снимок");
+        }
+        assert_eq!(doc.read(), b"abc");
+        assert!(doc.undo().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_refused_snapshot_keeps_the_history() {
+        // Снимок не лёг: история осталась только в памяти, и схлопывать её
+        // нельзя. Иначе отменять было бы нечем — на диске ведь ничего нет, и
+        // работа потеряна. Потерять историю нельзя ни при каких условиях.
+        let mut doc = Document::with_depth(b"abc", 4).unwrap();
+        doc.set_sink(
+            std::path::PathBuf::from("/tmp/d.txt"),
+            Box::new(Refusing::default()),
+        );
+
+        for _ in 0..6 {
+            doc.insert(doc.len(), b"x").unwrap();
+            doc.snapshot_if_over_depth();
+        }
+        assert_eq!(doc.snapshots_taken(), 0, "не принятый снимок не в счёт");
+        assert_eq!(doc.path().len(), 6, "история осталась целиком");
+        assert_eq!(doc.read(), b"abcxxxxxx", "текст на месте");
+
+        // Отмену ничего не съело: доходим до начала по памяти.
+        for _ in 0..6 {
+            doc.undo().unwrap().expect("отмена идёт по памяти");
+        }
+        assert_eq!(doc.read(), b"abc");
+        assert!(doc.undo().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_depth_counts_edits_not_the_root() {
+        // Корневая вершина — основание дерева, а не правка. Глубина в одну
+        // правку означает ровно одну правку, иначе первая же вставка
+        // переполняла бы историю.
+        let mut doc = Document::with_depth(b"abc", 1).unwrap();
+        assert!(!doc.history_is_full(), "пустая история не переполнена");
+        doc.insert(3, b"x").unwrap();
+        assert!(!doc.history_is_full(), "одна правка — это ещё не больше");
+        doc.insert(4, b"y").unwrap();
+        assert!(doc.history_is_full(), "вторая правка переросла глубину");
     }
 
     #[test]

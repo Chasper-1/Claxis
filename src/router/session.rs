@@ -108,7 +108,7 @@ struct Stored {
 }
 
 impl SnapshotSink for StoreSink {
-    fn accept(&mut self, file: &Path, text: &[u8], history: &[u8]) {
+    fn accept(&mut self, file: &Path, text: &[u8], history: &[u8]) -> bool {
         // История идёт вместе с текстом: без неё после перезапуска отменять
         // было бы нечего, то есть снапшот сохранил бы половину работы.
         //
@@ -134,17 +134,20 @@ impl SnapshotSink for StoreSink {
                         history: history.to_vec(),
                     });
                     self.cursor = None;
-                    return;
+                    return true;
                 }
                 Err(e) => last = Some(e),
             }
         }
         // Пять попыток не помогли. Что именно — известно: ошибка с файлом,
-        // номером снимка и обеими суммами, а не «не получилось».
+        // номером снимка и обеими суммами, а не «не получилось». Возвращаем
+        // `false`: снимок не сохранён, и буфер обязан оставить историю в
+        // памяти, а не схлопнуть её в никуда.
         *self.failed.borrow_mut() = Some(
             last.map(|e| e.text())
                 .unwrap_or_else(|| format!("snapshot write failed after {WRITE_ATTEMPTS} tries")),
         );
+        false
     }
 
     fn older(&mut self, file: &Path) -> Option<Vec<u8>> {
@@ -337,6 +340,7 @@ impl Document {
         self.buffer.insert(anchor, data)?;
         self.lines.insert(anchor, data);
         stats::note_input(&mut self.stats, data);
+        self.snapshot_if_over_depth();
         Ok(())
     }
 
@@ -345,6 +349,7 @@ impl Document {
         self.buffer.delete(anchor, len)?;
         self.lines.delete(anchor, anchor + len);
         stats::note_deleted(&mut self.stats, len);
+        self.snapshot_if_over_depth();
         Ok(())
     }
 
@@ -353,6 +358,7 @@ impl Document {
         self.buffer.replace(anchor, len, data)?;
         self.replace_in_lines(anchor, len, data);
         stats::note_replace(&mut self.stats, data, len);
+        self.snapshot_if_over_depth();
         Ok(())
     }
 
@@ -481,7 +487,8 @@ impl Document {
     ///
     /// Время, а не число правок: человек может править один и тот же абзац
     /// десять минут, и снапшот каждые пять минут отдаст память обратно. И
-    /// наоборот — сто правок подряд за минуту снапшот не заслужили.
+    /// наоборот — сто правок подряд за минуту снапшот не заслужили. Предел
+    /// памяти — отдельный повод, и он проверяется прямо на правке.
     pub fn snapshot_if_due(&mut self) {
         // Ноль — это «снимков нет вообще», а не «на каждой правке». Иначе
         // человек, выключивший интервал, получил бы обратный смысл настройки
@@ -498,13 +505,35 @@ impl Document {
     pub fn snapshot(&mut self) {
         // Текст от этого не меняется, поэтому карта строк остаётся в силе.
         self.buffer.snapshot();
+        self.take_sink_failure();
+        self.last_snapshot = self.clock.elapsed();
+    }
+
+    /// Снять снапшот, если история в памяти переросла глубину.
+    ///
+    /// Это второй повод для снимка, кроме времени: время сохраняет сессию, а
+    /// глубина не даёт памяти расти без конца. Время сдвигается только когда
+    /// снимок правда снят, — иначе следующий плановый снимок отложился бы
+    /// из-за схлопывания по глубине.
+    fn snapshot_if_over_depth(&mut self) {
+        let before = self.buffer.snapshots_taken();
+        self.buffer.snapshot_if_over_depth();
+        // Ошибку приёмника забираем в любом случае: снимок мог не лечь, и
+        // тогда история осталась в памяти — об этом человек обязан узнать.
+        self.take_sink_failure();
+        if self.buffer.snapshots_taken() != before {
+            self.last_snapshot = self.clock.elapsed();
+        }
+    }
+
+    /// Забрать ошибку приёмника, если он не смог записать снимок.
+    fn take_sink_failure(&mut self) {
         // Приёмник отдал текст и историю и ошибться мог там, где у него нет
         // вызывающего. Ошибку забираем здесь: она про работу пользователя, а не
         // про кеш, и молчать о ней нельзя.
         if let Some(reason) = self.sink_failed.borrow_mut().take() {
             self.snapshot_failed = Some(reason);
         }
-        self.last_snapshot = self.clock.elapsed();
     }
 
     /// Снапшот не лёг на диск. Текст с причиной, уже переведённый.
@@ -539,8 +568,8 @@ pub struct Session {
 
 /// Что применилось сразу, а что ждёт перезапуска.
 ///
-/// Не всё настраивается на лету: размер пула узлов задан при создании буфера,
-/// и сменить его можно только пересоздав буфер вместе с историей. Лучше сказать
+/// Не всё настраивается на лету: глубина истории задана при создании буфера,
+/// и сменить её можно только пересоздав буфер вместе с историей. Лучше сказать
 /// пользователю, что нужен перезапуск, чем применить наполовину и сделать
 /// вид, что всё в порядке.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -678,8 +707,8 @@ impl Session {
     /// `snapshots_keep` применяется сразу: это число вокруг которого
     /// выбираются снапшоты. `snapshots_persist` — сразу для документов,
     /// которые откроются дальше; уже открытые держат то, что получили при
-    /// открытии. `history_depth` задаёт размер пула узлов при создании буфера
-    /// и без пересоздания истории не меняется.
+    /// открытии. `history_depth` задаёт, сколько правок живёт в памяти до
+    /// снапшота, и у открытого документа не меняется.
     pub fn apply(&mut self, settings: &crate::router::Settings) -> Applied {
         let mut applied = Applied::default();
 
@@ -1227,21 +1256,21 @@ mod tests {
         // Настройка конфига доходит до кольца в базе.
         let tmp = Temp::new("keep");
         let file = tmp.file("a.rs");
-        // Короткая история: снапшот срабатывает каждые несколько записей.
+        // Короткая история: снапшот по глубине срабатывает каждые несколько
+        // правок, и кольцо успевает провернуться.
         let session = tmp.short_session(2, 8);
 
         let mut doc = session.open_file(&file).unwrap();
-        // Часы стоят: ни одна из сорока вставок не успевает за интервал.
+        // Часы стоят: по времени снимков не будет, только по глубине.
         doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
         for _ in 0..40 {
             let end = doc.buffer().len();
             doc.insert(end, b"z").unwrap();
             doc.snapshot_if_due();
         }
-        assert_eq!(
-            doc.buffer().snapshots_taken(),
-            0,
-            "за сорок вставок подряд снапшот не заслужили"
+        assert!(
+            doc.buffer().snapshots_taken() > 2,
+            "глубина обязана проворачивать кольцо"
         );
         drop(doc);
 
@@ -1299,6 +1328,62 @@ mod tests {
         assert_eq!(session.history_depth(), 4);
         let doc = session.open_file(&file).unwrap();
         assert_eq!(doc.buffer().history_depth(), 4);
+    }
+
+    #[test]
+    fn the_depth_starts_a_new_history_in_a_snapshot() {
+        // Два повода для снимка: время сохраняет сессию, а глубина не даёт
+        // истории расти без конца. Здесь часы стоят, значит снимок делает
+        // именно глубина.
+        let tmp = Temp::new("depth-snapshot");
+        let file = tmp.file("a.rs");
+        let session = tmp.short_session(3, 4);
+
+        let mut doc = session.open_file(&file).unwrap();
+        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
+        for _ in 0..10 {
+            let end = doc.buffer().len();
+            doc.insert(end, b"x").unwrap();
+            doc.snapshot_if_due();
+        }
+
+        assert_eq!(
+            doc.buffer().snapshots_taken(),
+            2,
+            "глубина переросла дважды и каждый раз снимался снимок"
+        );
+        assert!(
+            doc.buffer().path().len() <= 4,
+            "в памяти не больше глубины правок"
+        );
+        assert_eq!(doc.text().len(), 10, "текст цел");
+
+        // История старше снимка сохранена: откат проходит через границу до
+        // самого начала.
+        for _ in 0..10 {
+            doc.undo().unwrap().expect("откат идёт через снимки");
+        }
+        assert!(doc.undo().unwrap().is_none(), "дальше отменять нечего");
+        assert!(doc.text().is_empty(), "дошли до пустого документа");
+    }
+
+    #[test]
+    fn a_full_history_without_a_sink_keeps_the_edits() {
+        // Без приёмника снимку некуда уйти. Тогда история не обрезается:
+        // терять возможность отменить ради памяти нельзя.
+        let tmp = Temp::new("depth-no-sink");
+        let file = tmp.file("a.rs");
+        let session = tmp.no_persist_session(3, 4);
+
+        let mut doc = session.open_file(&file).unwrap();
+        for _ in 0..10 {
+            let end = doc.buffer().len();
+            doc.insert(end, b"x").unwrap();
+            doc.snapshot_if_due();
+        }
+        assert_eq!(doc.buffer().snapshots_taken(), 0, "снимку некуда уйти");
+        assert_eq!(doc.buffer().path().len(), 10, "история осталась целой");
+        assert_eq!(session.store().count(&file).unwrap(), 0, "и на диске пусто");
     }
 
     #[test]
@@ -1593,14 +1678,14 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_is_taken_by_the_clock_and_not_by_the_edit_count() {
-        // Снапшот снимает время. Правок может быть сколько угодно, и лимит на
-        // них не влияет: интервал честно отсчитывается часами.
+    fn a_snapshot_is_taken_by_the_clock_when_the_history_has_room() {
+        // Снапшот снимает время, если глубина истории ещё не выбрана: правок
+        // может быть много, и интервал честно отсчитывается часами.
         let tmp = Temp::new("snapshot-by-time");
         let file = tmp.dir.join("doc.txt");
         std::fs::write(&file, "x\n").unwrap();
 
-        let mut session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let mut session = Session::open_at_with(tmp.dir.clone(), 3, true, 10_000).unwrap();
         session.set_snapshot_interval(Duration::from_secs(300));
 
         // Часы стоят: сколько правок ни сделай, пяти минут не прошло.
