@@ -10,19 +10,19 @@ theme = "~/.config/claxis/theme"     # указывается папка, это
 # setting = "аналогично"     # новое состояние, там будут некоторые только настройки прямо из редактора, конфиг — основной способ и главный.
 
 [General]
-language = "ru"     # enum ru, en, uk...
+language = "rus"     # enum rus, eng, deu... Standart of langs codes — ISO 639-3
 color_modes = true
-auto_format = true     # enable automatic formatting on save
 insert_final_newline = true
 
 # mouse settings
-mouse_mode = true
+mouse_enable = true
 middle_click_paste = true
+selection_auto_copy = false     # 
 step_scroll_lines = 3     # u8 1..255. Меньше 0 ошибка
 
 # space edit settings
 end_padding = 5     # u8 0..255. 0 не работает значит
-shell_os = "unix"     # enum unix = "sh -c" / windows = "cmd /C"
+shell_os = "unix"     # enum unix = "sh -c" / windows = "cmd.exe /C"
 numberline = "relative"     # enum absolute or relative.
 cursor_numberline = "column_start"     # enum column_start or column_end
 continue_comments = true     # if you create a new line while in the comment line, the new line will continue the comment.
@@ -33,7 +33,7 @@ max_line_width = 0     # u8 0..255. 0 не работает значит
 [Statusline]
 left = []
 center = []
-right = [ "position",  ]
+right = [ , "position"  ]     # 
 
 [Statusline.States]     # Отображаемые имена состояний в статус линии
 edit = "Edit"
@@ -52,11 +52,15 @@ file_manager = "Manager"
 git = "Git"
 
 [Statusline.Setting]
-position = { cursor = "{number}", selection = "{number}" }     # selection = "percentage", cursor = "percentage"
+position = {
+    file = "{percent}",
+    cursor = "{line}:{line_char}",
+    selection = "{number} char"
+}     # selection = "{percent}", cursor = "{char}", file = ""
 
 [Commandline]
 hide = true
-center_mode = true
+position = "center"
 
 [Keyboard]
 
@@ -72,8 +76,11 @@ mode = "fullscreen"     # enum из режимов на весь эран, ок�
 input_char = true
 delete_char = true
 history_usage = true
-
+key_time = true     # time of typing session
+time = true     # time of session
 
 [Savescreen.Setting]
-history_usage = { percent = "{used}", number = "{remaining}" }     # enum used or remaining. remaining = max - used
+input_char = [ "all", "rus", "eng", "deu" ]     # filtering input char session
+delete_char = [ "all", "rus", "eng", "deu" ]     # filtering delete char session
+history_usage = { used = "{percent}", remaining = "{number}" }     # remaining = max - used
 
