@@ -1,6 +1,10 @@
 [package]
 name = "claxis-text"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
+
+[features]
+# Временные каталоги для тестов других крейтов.
+test-support = []
 
 [dependencies]

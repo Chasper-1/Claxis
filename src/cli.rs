@@ -7,10 +7,12 @@
 use std::io::Write;
 
 use crate::api::buffer;
+use crate::api::commands;
 use crate::api::config;
 use crate::api::disk;
 use crate::api::i18n;
 use crate::api::term;
+use crate::api::theme;
 use crate::main_messages;
 
 /// Что просил пользователь в командной строке.
@@ -56,12 +58,14 @@ pub fn parse(args: &[String]) -> Command {
 /// Каждое сообщение выводится с настоящими значениями вместо имён в
 /// фигурных скобках, иначе переводчик не поймёт, что подставляется.
 pub fn print_messages(out: &mut impl Write) -> std::io::Result<()> {
-    let crates: [(&str, Vec<(&str, String)>); 7] = [
+    let crates: [(&str, Vec<(&str, String)>); 9] = [
         ("claxis-buffer", buffer::messages::samples()),
         ("claxis-disk", disk::messages::samples()),
         ("claxis-term", term::messages::samples()),
         ("claxis-i18n", i18n::messages::samples()),
         ("claxis-config", config::messages::samples()),
+        ("claxis-theme", theme::messages::samples()),
+        ("claxis-commands", commands::messages::samples()),
         ("Claxis", crate::messages::samples()),
         ("Claxis (main)", main_messages::samples()),
     ];
@@ -233,6 +237,8 @@ mod tests {
             "claxis-term",
             "claxis-i18n",
             "claxis-config",
+            "claxis-theme",
+            "claxis-commands",
             "Claxis",
         ] {
             assert!(text.contains(crate_name), "{crate_name} не попал в вывод");
@@ -258,6 +264,8 @@ mod tests {
         assert!(!term::messages::samples().is_empty());
         assert!(!i18n::messages::samples().is_empty());
         assert!(!config::messages::samples().is_empty());
+        assert!(!theme::messages::samples().is_empty());
+        assert!(!commands::messages::samples().is_empty());
         assert!(!main_messages::samples().is_empty());
     }
 

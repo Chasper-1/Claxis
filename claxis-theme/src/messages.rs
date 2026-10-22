@@ -15,6 +15,10 @@ pub trait Messages {
     fn read_dir_failed(&self, dir: &str, reason: &str) -> String;
     /// Имя темы не годится: путь уводит за пределы папки.
     fn invalid_theme_name(&self, name: &str) -> String;
+    /// Строка не похожа на код цвета.
+    fn not_a_colour(&self, value: &str) -> String;
+    /// Канал или альфа цвета вне допустимого диапазона.
+    fn colour_channel_out_of_range(&self, value: &str) -> String;
 }
 
 /// Английские сообщения — язык по умолчанию.
@@ -42,6 +46,17 @@ impl Messages for En {
     fn invalid_theme_name(&self, name: &str) -> String {
         substitute("invalid theme name: {name}", &[("name", name.to_string())])
     }
+
+    fn not_a_colour(&self, value: &str) -> String {
+        substitute("not a colour: {value}", &[("value", value.to_string())])
+    }
+
+    fn colour_channel_out_of_range(&self, value: &str) -> String {
+        substitute(
+            "colour channel out of range: {value}",
+            &[("value", value.to_string())],
+        )
+    }
 }
 
 /// Все сообщения крейте с примерами значений.
@@ -62,6 +77,11 @@ pub fn samples() -> Vec<(&'static str, String)> {
         (
             "invalid_theme_name",
             m.invalid_theme_name("../../etc/passwd"),
+        ),
+        ("not_a_colour", m.not_a_colour("#xyz")),
+        (
+            "colour_channel_out_of_range",
+            m.colour_channel_out_of_range("rgb(300, 0, 0)"),
         ),
     ]
 }

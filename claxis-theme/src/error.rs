@@ -26,6 +26,16 @@ pub enum Error {
         /// Что пришло в качестве имени.
         name: String,
     },
+    /// Строка не похожа на код цвета: `{value}`.
+    NotAColor {
+        /// Что пришло в качестве цвета.
+        value: String,
+    },
+    /// Канал или альфа цвета вне допустимого диапазона: `{value}`.
+    ColorChannel {
+        /// Что пришло в качестве цвета.
+        value: String,
+    },
 }
 
 impl Error {
@@ -35,6 +45,8 @@ impl Error {
             Error::UnknownTheme { name, available } => messages.unknown_theme(name, available),
             Error::ReadDir { dir, reason } => messages.read_dir_failed(dir, reason),
             Error::InvalidName { name } => messages.invalid_theme_name(name),
+            Error::NotAColor { value } => messages.not_a_colour(value),
+            Error::ColorChannel { value } => messages.colour_channel_out_of_range(value),
         }
     }
 

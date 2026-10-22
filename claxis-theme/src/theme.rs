@@ -147,31 +147,25 @@ pub fn is_valid_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claxis_text::temp::Temp;
 
-    struct Temp(std::path::PathBuf);
+    /// Что тестам нужно сверх общего каталога: файлы внутри него.
+    trait TempThemes {
+        fn theme(&self, file: &str) -> &Self;
+        fn dir_in(&self, name: &str);
+        fn names(&self) -> Vec<String>;
+    }
 
-    impl Temp {
-        fn new(name: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("claxis-theme-{name}"));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
-        }
+    impl TempThemes for Temp {
         fn theme(&self, file: &str) -> &Self {
-            std::fs::write(self.0.join(file), "").unwrap();
+            std::fs::write(self.path().join(file), "").unwrap();
             self
         }
         fn dir_in(&self, name: &str) {
-            std::fs::create_dir_all(self.0.join(name)).unwrap();
+            std::fs::create_dir_all(self.path().join(name)).unwrap();
         }
         fn names(&self) -> Vec<String> {
-            names_in(&list(&self.0).unwrap())
-        }
-    }
-
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            names_in(&list(self.path()).unwrap())
         }
     }
 
@@ -195,8 +189,8 @@ mod tests {
         // Файл с тем же именем перекрывает `default`, а не дублирует его.
         let tmp = Temp::new("override");
         tmp.theme("default.toml");
-        assert_eq!(names_in(&list(&tmp.0).unwrap()), vec!["default"]);
-        let found = find(&tmp.0, DEFAULT_THEME).unwrap();
+        assert_eq!(names_in(&list(tmp.path()).unwrap()), vec!["default"]);
+        let found = find(tmp.path(), DEFAULT_THEME).unwrap();
         assert!(found.path.ends_with("default.toml"), "файл должен победить");
     }
 
@@ -242,7 +236,7 @@ mod tests {
     fn a_known_theme_is_found() {
         let tmp = Temp::new("find");
         tmp.theme("everforest.toml");
-        let found = find(&tmp.0, "everforest").unwrap();
+        let found = find(tmp.path(), "everforest").unwrap();
         assert_eq!(found.name, "everforest");
         assert!(found.path.ends_with("everforest.toml"));
     }
@@ -252,7 +246,7 @@ mod tests {
         // Сообщение должно говорить, что есть: иначе пользователь гадает.
         let tmp = Temp::new("unknown");
         tmp.theme("default.toml").theme("everforest.toml");
-        let err = find(&tmp.0, "solarized").unwrap_err();
+        let err = find(tmp.path(), "solarized").unwrap_err();
         match &err {
             Error::UnknownTheme { name, available } => {
                 assert_eq!(name, "solarized");
@@ -280,16 +274,16 @@ mod tests {
             vec!["default", "everforest", "nord", "solarized"]
         );
         // Но пока имя не написано в конфиге, работает `default`.
-        assert_eq!(find(&tmp.0, DEFAULT_THEME).unwrap().name, "default");
+        assert_eq!(find(tmp.path(), DEFAULT_THEME).unwrap().name, "default");
         // Написано — работает именно она, а не какая попалась.
-        assert_eq!(find(&tmp.0, "solarized").unwrap().name, "solarized");
+        assert_eq!(find(tmp.path(), "solarized").unwrap().name, "solarized");
     }
 
     #[test]
     fn a_message_always_offers_the_builtin_theme() {
         // Список не бывает пустым: `default` есть всегда.
         let tmp = Temp::new("empty");
-        let err = find(&tmp.0, "solarized").unwrap_err();
+        let err = find(tmp.path(), "solarized").unwrap_err();
         let text = err.text();
         assert!(text.contains("solarized"), "{text}");
         assert!(text.contains("default"), "в тексте нет тем: {text}");
@@ -301,7 +295,7 @@ mod tests {
         let tmp = Temp::new("escape");
         tmp.theme("default.toml");
         for name in ["../../../etc/passwd", "..", "../default", ""] {
-            let err = find(&tmp.0, name).unwrap_err();
+            let err = find(tmp.path(), name).unwrap_err();
             assert!(
                 matches!(err, Error::InvalidName { .. }),
                 "имя {name:?} должно быть отбито, получено: {err:?}"
@@ -367,7 +361,7 @@ mod tests {
         let tmp = Temp::new("extension");
         tmp.theme("everforest.txt");
         tmp.theme("readme");
-        assert_eq!(names_in(&list(&tmp.0).unwrap()), vec!["default"]);
+        assert_eq!(names_in(&list(tmp.path()).unwrap()), vec!["default"]);
     }
 
     #[test]
@@ -375,7 +369,7 @@ mod tests {
         // Содержимое темы пока не разбирается: важно только имя файла.
         let tmp = Temp::new("empty-file");
         tmp.theme("empty.toml");
-        let found = find(&tmp.0, "empty").unwrap();
+        let found = find(tmp.path(), "empty").unwrap();
         assert!(found.path.ends_with("empty.toml"));
     }
 
@@ -384,9 +378,9 @@ mod tests {
         // Редактор в Linux различает регистр: `Dark` и `dark` — разные темы.
         let tmp = Temp::new("case");
         tmp.theme("dark.toml");
-        assert!(find(&tmp.0, "dark").is_ok());
+        assert!(find(tmp.path(), "dark").is_ok());
         assert!(matches!(
-            find(&tmp.0, "Dark").unwrap_err(),
+            find(tmp.path(), "Dark").unwrap_err(),
             Error::UnknownTheme { .. }
         ));
     }
@@ -396,9 +390,9 @@ mod tests {
         let tmp = Temp::new("unknown-list");
         tmp.theme("everforest.toml");
         tmp.theme("gruvbox.toml");
-        let error = find(&tmp.0, "нет-такой").unwrap_err();
+        let error = find(tmp.path(), "нет-такой").unwrap_err();
         assert!(matches!(error, Error::InvalidName { .. }));
-        let error = find(&tmp.0, "solarized").unwrap_err();
+        let error = find(tmp.path(), "solarized").unwrap_err();
         let text = error.text();
         assert!(text.contains("solarized"), "{text}");
         assert!(text.contains("everforest"), "{text}");
@@ -410,7 +404,7 @@ mod tests {
         // Тема исчезла бы из списка молча, а человек смотрел бы в свой файл.
         let tmp = Temp::new("unreadable");
         tmp.theme("visible.toml");
-        let blocked = tmp.0.join("blocked.toml");
+        let blocked = tmp.path().join("blocked.toml");
         std::fs::write(&blocked, b"body").unwrap();
         let mut permissions = std::fs::metadata(&blocked).unwrap().permissions();
         #[cfg(unix)]
@@ -422,7 +416,7 @@ mod tests {
         permissions.set_readonly(true);
         std::fs::set_permissions(&blocked, permissions).unwrap();
 
-        let result = list(&tmp.0);
+        let result = list(tmp.path());
         // Читается ли файл — зависит от прав: проверяем именно то, что при
         // отказе мы узнаём об этом, а не теряем тему.
         if let Ok(themes) = &result {

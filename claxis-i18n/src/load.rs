@@ -90,24 +90,16 @@ pub fn check_complete(
 mod tests {
     use super::*;
     use crate::Catalog;
+    use claxis_text::temp::Temp;
 
-    struct Temp(std::path::PathBuf);
-
-    impl Temp {
-        fn new(name: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("claxis-lang-{name}"));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
-        }
-        fn write(&self, name: &str, body: &str) {
-            std::fs::write(self.0.join(name), body).unwrap();
-        }
+    /// Что тестам нужно сверх общего каталога: файл перевода внутри него.
+    trait TempLang {
+        fn write(&self, name: &str, body: &str);
     }
 
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+    impl TempLang for Temp {
+        fn write(&self, name: &str, body: &str) {
+            std::fs::write(self.path().join(name), body).unwrap();
         }
     }
 
@@ -127,7 +119,7 @@ mod tests {
     fn a_language_is_read_from_disk() {
         let tmp = Temp::new("read");
         tmp.write("ru.toml", good());
-        let catalog = load(&tmp.0, "ru").unwrap();
+        let catalog = load(tmp.path(), "ru").unwrap();
         assert_eq!(catalog.get("Open file"), Some("Открыть файл"));
         assert_eq!(catalog.get("Save file"), Some("Сохранить файл"));
     }
@@ -142,10 +134,10 @@ mod tests {
         tmp.write("de.toml", good());
         tmp.write("pt-br.toml", good());
         // Читается именно запрошенный.
-        let catalog = load(&tmp.0, "de").unwrap();
+        let catalog = load(tmp.path(), "de").unwrap();
         assert_eq!(catalog.get("Open file"), Some("Открыть файл"));
         // Английский зашит и не читается, сколько бы файлов ни лежало.
-        assert!(load(&tmp.0, "en").unwrap().is_empty());
+        assert!(load(tmp.path(), "en").unwrap().is_empty());
     }
 
     #[test]
@@ -155,7 +147,7 @@ mod tests {
         let tmp = Temp::new("broken-unused");
         tmp.write("ru.toml", good());
         tmp.write("de.toml", "\"Open file\" = \n");
-        let catalog = load(&tmp.0, "ru").unwrap();
+        let catalog = load(tmp.path(), "ru").unwrap();
         assert_eq!(catalog.get("Open file"), Some("Открыть файл"));
     }
 
@@ -164,7 +156,7 @@ mod tests {
         // Молча остаться на английском — значит показать не тот интерфейс,
         // который пользователь попросил.
         let tmp = Temp::new("missing");
-        let err = load(&tmp.0, "ru").unwrap_err();
+        let err = load(tmp.path(), "ru").unwrap_err();
         assert!(
             matches!(err, crate::Error::Read { .. }),
             "получено: {err:?}"
@@ -175,7 +167,7 @@ mod tests {
     fn broken_toml_reports_what_and_where() {
         let tmp = Temp::new("broken");
         tmp.write("ru.toml", "\"Open file\" = \n");
-        let err = load(&tmp.0, "ru").unwrap_err();
+        let err = load(tmp.path(), "ru").unwrap_err();
         assert!(
             matches!(err, crate::Error::Parse { .. }),
             "получено: {err:?}"
@@ -188,7 +180,7 @@ mod tests {
     fn value_must_be_a_string() {
         let tmp = Temp::new("notstring");
         tmp.write("ru.toml", "\"Open file\" = 42\n");
-        let err = load(&tmp.0, "ru").unwrap_err();
+        let err = load(tmp.path(), "ru").unwrap_err();
         assert!(
             matches!(err, crate::Error::NotAString { .. }),
             "получено: {err:?}"
@@ -201,7 +193,7 @@ mod tests {
         // Вложенность означала бы, что ключ придумал файл, а не код.
         let tmp = Temp::new("table");
         tmp.write("ru.toml", "[General]\n\"Open file\" = \"Открыть\"\n");
-        let err = load(&tmp.0, "ru").unwrap_err();
+        let err = load(tmp.path(), "ru").unwrap_err();
         assert!(
             matches!(err, crate::Error::NotAString { .. }),
             "получено: {err:?}"
@@ -216,7 +208,7 @@ mod tests {
             "ru.toml",
             "\"Open file\" = \"Открыть\"\n\"Open file\" = \"Открыть и посмотреть\"\n",
         );
-        let err = load(&tmp.0, "ru").unwrap_err();
+        let err = load(tmp.path(), "ru").unwrap_err();
         assert!(
             matches!(err, crate::Error::Parse { .. }),
             "получено: {err:?}"
@@ -231,7 +223,7 @@ mod tests {
     #[test]
     fn language_code_cannot_escape_the_directory() {
         let tmp = Temp::new("escape");
-        let err = load(&tmp.0, "../../etc/passwd").unwrap_err();
+        let err = load(tmp.path(), "../../etc/passwd").unwrap_err();
         assert!(
             matches!(err, crate::Error::UnknownLang { .. }),
             "получено: {err:?}"
