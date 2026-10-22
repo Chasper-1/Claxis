@@ -101,14 +101,7 @@ pub fn render(file: ConfigFile, catalog: &claxis_i18n::Catalog) -> String {
         // предложение плюс допустимые значения, больше ничего.
         let value = value_text(key);
         let comment = key_comment(key, catalog);
-        if key.active {
-            out.push_str(&format!("{} = {value}  # {comment}\n\n", key.key()));
-        } else {
-            // Ключ есть и понятен, но значения ему не назначено, поэтому он
-            // не действует. Причина в самом ключе, а не в коде: пользователю
-            // не нужно знать, что внутри.
-            out.push_str(&format!("#{} = {value}  # {comment}\n\n", key.key()));
-        }
+        out.push_str(&format!("{} = {value}  # {comment}\n\n", key.key()));
     }
 
     // Секция может состоять только из встроенной таблицы: обычных ключей в
@@ -292,9 +285,6 @@ fn table_name(table: &schema::TableDef) -> &str {
     table.path.rsplit('.').next().unwrap_or(table.path)
 }
 
-/// Ключ есть в конфиге, но не применяется.
-pub const NOT_USED: &str = "Not in use.";
-
 /// Перевод английской фразы. Без перевода остаётся английский.
 fn tr<'a>(catalog: &'a claxis_i18n::Catalog, text: &'a str) -> &'a str {
     catalog.get(text).unwrap_or(text)
@@ -335,9 +325,6 @@ fn key_comment(key: &KeyDef, catalog: &claxis_i18n::Catalog) -> String {
     let range = range_hint(key.kind);
     if !range.is_empty() {
         text.push_str(&format!(" {}", tr(catalog, range)));
-    }
-    if !key.active {
-        text.push_str(&format!(". {}", tr(catalog, NOT_USED)));
     }
     text
 }
@@ -670,7 +657,6 @@ mod tests {
                     "Keys with two meanings, and how long a press counts as held, in milliseconds.",
                     "Клавиши со значением, и окно удержания для каждой.",
                 ),
-                ("Not in use.", "Не используется."),
                 (
                     "Edits kept in memory before taking a snapshot.",
                     "Правок в памяти до снапшота.",
@@ -777,34 +763,6 @@ mod tests {
     }
 
     #[test]
-    fn active_flag_matches_the_code() {
-        // Правдивость флага: подключено ровно то, что код читает. Список
-        // читается руками, но тест заставит его обновить, когда читать
-        // станет больше.
-        const READ: &[&str] = &[
-            "General.language",
-            "General.theme",
-            "General.history_depth",
-            "General.snapshots_keep",
-            "General.snapshots_persist",
-            "General.snapshots_interval",
-            "Savescreen.include",
-            "Savescreen.mode",
-            "Savescreen.Statistic.input_char",
-            "Savescreen.Statistic.delete_char",
-            "Savescreen.Statistic.history_usage",
-        ];
-        for key in KEYS {
-            let should = READ.contains(&key.path);
-            assert_eq!(
-                key.active, should,
-                "{}: код читает, а флаг говорит {:?}. Список READ в тесте обновить.",
-                key.path, key.active
-            );
-        }
-    }
-
-    #[test]
     fn used_theme_and_language_are_written_active() {
         // Язык и тема работают, значит в свежем конфиге они не закомментированы:
         // иначе пришлось бы раскомментировать их руками перед первым же
@@ -884,7 +842,6 @@ mod tests {
                 default: value,
                 kind: *kind,
                 comment: "probe",
-                active: true,
             };
             assert!(
                 crate::load::value_matches(&key, value),
@@ -918,7 +875,6 @@ mod tests {
             default: "\"a\"",
             kind: Kind::Array,
             comment: "probe",
-            active: true,
         };
         assert!(crate::load::value_matches(&key, "\"a\", \"b\""));
         assert!(
@@ -1148,7 +1104,6 @@ mod tests {
             text.push_str(&render(file, &plain()));
         }
         for phrase in [
-            NOT_USED,
             "Edits kept in memory before taking a snapshot.",
             "Snapshots of one file to keep, oldest dropped first. Zero means memory only.",
             "Keep snapshots between runs.",

@@ -400,7 +400,6 @@ fn check_kind(
         default: "0",
         kind,
         comment: "",
-        active: true,
     };
     check(&placeholder, item)
 }

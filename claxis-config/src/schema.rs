@@ -146,16 +146,6 @@ pub struct KeyDef {
     /// Комментарий к ключу. Он же ключ в каталоге перевода: английский текст
     /// и есть то, что переводится.
     pub comment: &'static str,
-    /// Применяется ли значение сейчас.
-    ///
-    /// Нужен для ключей, которые появились в схеме раньше, чем код, который их
-    /// читает. Такой ключ есть и понятен, но по умолчанию не применяется:
-    /// пользователь может раскомментировать его, и тогда он заработает.
-    ///
-    /// Правдивость этого поля проверяется тестом: если ключ помечен как
-    /// подключённый, а его никто не читает, пользователь правит настройку и
-    /// не видит никакой разницы.
-    pub active: bool,
 }
 
 impl KeyDef {
@@ -244,7 +234,6 @@ pub const KEYS: &[KeyDef] = &[
         default: claxis_i18n::defaults::DEFAULT_LANGUAGE,
         kind: Kind::Str,
         comment: "Interface language. File name in the lang folder.",
-        active: true,
     },
     KeyDef {
         file: ConfigFile::Global,
@@ -252,7 +241,6 @@ pub const KEYS: &[KeyDef] = &[
         default: "default",
         kind: Kind::Str,
         comment: "Colours and attributes. File name in the theme folder.",
-        active: true,
     },
     // ── edit.toml ──────────────────────────────────────────────────────
     KeyDef {
@@ -261,7 +249,6 @@ pub const KEYS: &[KeyDef] = &[
         default: "8192",
         kind: Kind::U16,
         comment: "Edits kept in memory before taking a snapshot.",
-        active: true,
     },
     // ── files.toml ─────────────────────────────────────────────────────
     KeyDef {
@@ -270,7 +257,6 @@ pub const KEYS: &[KeyDef] = &[
         default: "3",
         kind: Kind::U8,
         comment: "Snapshots of one file to keep, oldest dropped first. Zero means memory only.",
-        active: true,
     },
     KeyDef {
         file: ConfigFile::Files,
@@ -278,18 +264,13 @@ pub const KEYS: &[KeyDef] = &[
         default: "true",
         kind: Kind::Bool,
         comment: "Keep snapshots between runs.",
-        active: true,
     },
-    // Ключ, который появился в схеме раньше, чем код, который его читает.
-    // Он есть и понятен, но по умолчанию не применяется: пользователь может
-    // раскомментировать его, и тогда он заработает.
     KeyDef {
         file: ConfigFile::Files,
         path: "General.snapshots_interval",
         default: "300",
         kind: Kind::U16,
         comment: "Seconds between snapshots of one document. Zero means no snapshots at all.",
-        active: true,
     },
     // ── экран статистики после сохранения ────────────────────────────────
     //
@@ -302,7 +283,6 @@ pub const KEYS: &[KeyDef] = &[
         default: "true",
         kind: Kind::Bool,
         comment: "Show the statistics screen after saving.",
-        active: true,
     },
     KeyDef {
         file: ConfigFile::Global,
@@ -310,7 +290,6 @@ pub const KEYS: &[KeyDef] = &[
         default: "fullscreen",
         kind: Kind::Str,
         comment: "How the statistics screen shows: one of fullscreen, message, window.",
-        active: true,
     },
     KeyDef {
         file: ConfigFile::Global,
@@ -318,7 +297,6 @@ pub const KEYS: &[KeyDef] = &[
         default: "true",
         kind: Kind::Bool,
         comment: "Show how many characters were typed.",
-        active: true,
     },
     KeyDef {
         file: ConfigFile::Global,
@@ -326,7 +304,6 @@ pub const KEYS: &[KeyDef] = &[
         default: "true",
         kind: Kind::Bool,
         comment: "Show how many characters were deleted.",
-        active: true,
     },
     KeyDef {
         file: ConfigFile::Global,
@@ -334,15 +311,6 @@ pub const KEYS: &[KeyDef] = &[
         default: "true",
         kind: Kind::Bool,
         comment: "Show how much of the undo history is used.",
-        active: true,
-    },
-    KeyDef {
-        file: ConfigFile::Files,
-        path: "General.snapshots_compression",
-        default: "true",
-        kind: Kind::Bool,
-        comment: "Compress snapshots on disk.",
-        active: false,
     },
 ];
 
