@@ -1,11 +1,12 @@
 [package]
 name = "claxis-i18n"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
+claxis-disk = { path = "../claxis-disk" }
 claxis-text = { path = "../claxis-text" }
 toml_edit = "0.22"
 
 [dev-dependencies]
-claxis-text = { path = "../claxis-text", features = ["test-support"] }
+claxis-disk = { path = "../claxis-disk", features = ["test-support"] }

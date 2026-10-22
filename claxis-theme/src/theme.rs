@@ -51,32 +51,15 @@ pub struct Theme {
 /// и становится обычной темой со своими цветами.
 pub fn list(dir: impl AsRef<Path>) -> Result<Vec<Theme>> {
     let dir = dir.as_ref();
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        // Папки нет — остаётся только `default`, то есть цвета терминала.
-        // Так и бывает до первого запуска.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![builtin()]),
-        Err(e) => {
-            return Err(Error::ReadDir {
-                dir: dir.display().to_string(),
-                reason: e.to_string(),
-            });
-        }
-    };
+    // Папки нет — остаётся только `default`, то есть цвета терминала. Так и
+    // бывает до первого запуска; диск возвращает пустой список, а не ошибку.
+    let files = claxis_disk::list_files(dir).map_err(|e| Error::ReadDir {
+        dir: dir.display().to_string(),
+        reason: e.text(),
+    })?;
 
     let mut themes = vec![builtin()];
-    for entry in entries {
-        // Ошибка чтения отдельной записи — это ошибка чтения папки: молчать
-        // здесь нельзя, иначе тема просто исчезнет из списка, и человек будет
-        // искать её в файле, который есть.
-        let entry = entry.map_err(|e| Error::ReadDir {
-            dir: dir.display().to_string(),
-            reason: e.to_string(),
-        })?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
+    for path in files {
         let Some(name) = theme_name(&path) else {
             continue;
         };
@@ -147,7 +130,7 @@ pub fn is_valid_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claxis_text::temp::Temp;
+    use claxis_disk::temp::Temp;
 
     /// Что тестам нужно сверх общего каталога: файлы внутри него.
     trait TempThemes {

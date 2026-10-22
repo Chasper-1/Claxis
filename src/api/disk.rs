@@ -9,6 +9,6 @@ pub use claxis_disk::defaults::{CACHE_DIR, KEEP, PERSIST};
 pub use claxis_disk::messages;
 pub use claxis_disk::watch::{BlindSpot, Changed};
 pub use claxis_disk::{
-    Error, Fingerprint, Snapshot, SnapshotStore, StorePaths, Watch, create_dir, fingerprint,
-    write_blob, write_text,
+    Error, Fingerprint, Snapshot, SnapshotStore, StorePaths, Watch, create_dir, file_len,
+    fingerprint, read_bytes, read_text, write_blob, write_text,
 };

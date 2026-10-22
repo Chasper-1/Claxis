@@ -162,16 +162,23 @@ mod tests {
 
     #[test]
     fn only_the_disk_crate_touches_the_disk() {
-        // Запись на диск в проекте одна. Если второй крейт начнёт писать сам,
-        // правило разъедется: у него будут свои пути, своя атомарность и своя
-        // обработка ошибок, а правка одной не дойдёт до другой.
+        // Работа с диском в проекте одна. Если второй крейт начнёт читать или
+        // писать сам, правило разъедется: у него будут свои пути, своя
+        // атомарность и своя обработка ошибок, а правка одной не дойдёт до
+        // другой.
         let mut offenders = Vec::new();
+        let mut sources = Vec::new();
         for crate_name in crate_names() {
-            // Сам крейт диска и его тесты — ему положено.
-            if crate_name == "claxis-disk" {
+            // Диску и конфигу положено: первый делает работу, второй знает
+            // раскладку. Остальным — только через них.
+            if crate_name == "claxis-disk" || crate_name == "claxis-config" {
                 continue;
             }
-            let src = root().join(&crate_name).join("src");
+            sources.push(root().join(&crate_name).join("src"));
+        }
+        // Бинарник — такой же код, как и крейты: правило одно на всех.
+        sources.push(root().join("src"));
+        for src in sources {
             for entry in walk(&src) {
                 let text = std::fs::read_to_string(&entry).expect("файл читается");
                 // Всё после `#[cfg(test)]` — тесты, а тестам положено писать
@@ -187,7 +194,16 @@ mod tests {
                     if line.starts_with("//") || n >= test_start {
                         continue;
                     }
-                    for call in ["fs::write", "fs::remove_file", "fs::rename"] {
+                    for call in [
+                        "fs::write",
+                        "fs::remove_file",
+                        "fs::rename",
+                        "fs::create_dir_all",
+                        "fs::remove_dir_all",
+                        "fs::read_to_string",
+                        "fs::read_dir",
+                        "fs::metadata",
+                    ] {
                         if line.contains(call) {
                             let rel = entry.strip_prefix(root()).unwrap_or(&entry);
                             offenders.push(format!("{}:{}: {line}", rel.display(), n + 1));

@@ -4,6 +4,8 @@ use std::io;
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
+use crate::messages::Messages;
+
 /// Guard на raw mode.
 ///
 /// При выходе и при панике терминал возвращается в исходное состояние. Без
@@ -35,7 +37,7 @@ impl Drop for RawMode {
         // Молчать нельзя — сломанный терминал человек будет искать причину ещё
         // минуту после выхода из редактора.
         if let Err(e) = disable_raw_mode() {
-            eprintln!("cannot leave raw mode: {e}");
+            eprintln!("{}", crate::messages::En.raw_mode_failed(&e.to_string()));
         }
     }
 }

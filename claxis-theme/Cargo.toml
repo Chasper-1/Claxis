@@ -1,10 +1,11 @@
 [package]
 name = "claxis-theme"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
+claxis-disk = { path = "../claxis-disk" }
 claxis-text = { path = "../claxis-text" }
 
 [dev-dependencies]
-claxis-text = { path = "../claxis-text", features = ["test-support"] }
+claxis-disk = { path = "../claxis-disk", features = ["test-support"] }

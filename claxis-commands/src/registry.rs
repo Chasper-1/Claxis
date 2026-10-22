@@ -59,13 +59,12 @@ impl Registry {
     /// Найти команду по имени.
     pub fn get(&self, name: &str) -> Result<&CommandName, Error> {
         let wanted = CommandName::parse(name)?;
-        if self.names.contains(&wanted) {
-            Ok(&self.names[self.names.iter().position(|n| n == &wanted).unwrap()])
-        } else {
-            Err(Error::UnknownCommand {
+        self.names
+            .iter()
+            .find(|n| *n == &wanted)
+            .ok_or_else(|| Error::UnknownCommand {
                 name: name.to_string(),
             })
-        }
     }
 
     /// Все зарегистрированные имена.

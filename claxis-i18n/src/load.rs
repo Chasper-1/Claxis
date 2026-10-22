@@ -29,9 +29,9 @@ pub fn load(dir: impl AsRef<Path>, lang: &str) -> crate::Result<crate::Catalog> 
         return Ok(crate::Catalog::new());
     }
     let path = LangPath::new(dir, lang)?;
-    let body = std::fs::read_to_string(path.file()).map_err(|e| crate::Error::Read {
+    let body = claxis_disk::read_text(path.file()).map_err(|e| crate::Error::Read {
         path: path.file().display().to_string(),
-        reason: e.to_string(),
+        reason: e.text(),
     })?;
     parse(&path, &body)
 }
@@ -90,7 +90,7 @@ pub fn check_complete(
 mod tests {
     use super::*;
     use crate::Catalog;
-    use claxis_text::temp::Temp;
+    use claxis_disk::temp::Temp;
 
     /// Что тестам нужно сверх общего каталога: файл перевода внутри него.
     trait TempLang {

@@ -36,6 +36,8 @@ pub trait Messages {
 
     /// Сломано столько проблем, что работать не с чем: `{issues}`.
     fn no_usable_config(&self, issues: usize) -> String;
+    /// Схема конфига сломана: `{reason}`.
+    fn schema_failed(&self, reason: &str) -> String;
     /// Файл больше, чем помещается в `u32`.
     ///
     /// Байты — точное число, гигабайты приложены для удобства. Считаются в
@@ -112,6 +114,13 @@ impl Messages for En {
         )
     }
 
+    fn schema_failed(&self, reason: &str) -> String {
+        substitute(
+            "config schema is broken: {reason}",
+            &[("reason", reason.to_string())],
+        )
+    }
+
     fn file_too_large(&self, bytes: u64, size_gb: f64, limit_bytes: u64, limit_gb: f64) -> String {
         substitute(
             "file is too large: {bytes} bytes ({size_gb} GB),\n\
@@ -161,6 +170,10 @@ pub fn samples() -> Vec<(&'static str, String)> {
             m.snapshot_failed("/home/user/notes.txt", "disk is full"),
         ),
         ("no_usable_config", m.no_usable_config(2)),
+        (
+            "schema_failed",
+            m.schema_failed("default value of General.history_depth is not a number"),
+        ),
         (
             "not_watched",
             m.not_watched("/home/user/.config/claxis/theme: too many open files"),

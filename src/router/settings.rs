@@ -25,10 +25,8 @@ const HISTORY_USAGE_TABLE: &str = "Savescreen.Setting.history_usage";
 /// Таблица приходит в конфиг тем же путём, что и обычный ключ. Если её нет в
 /// конфиге, работает `apply_defaults_table`, который берёт то же значение из
 /// схемы: два места читают одну таблицу, и двойной поиск здесь не нужен.
-fn table_string(config: &Config, key: &str, path: &str) -> String {
-    let Some(def) = schema::find_table(ConfigFile::Global, path) else {
-        return String::new();
-    };
+fn table_string(config: &Config, key: &str, path: &str) -> Option<String> {
+    let def = schema::find_table(ConfigFile::Global, path)?;
     config
         .table(def)
         .into_iter()
@@ -36,7 +34,6 @@ fn table_string(config: &Config, key: &str, path: &str) -> String {
         // Таблица отдаёт значение как оно в TOML, вместе с кавычками: подпись
         // нужна сама по себе, без них.
         .map(|(_, v)| v.trim_matches('"').to_string())
-        .unwrap_or_default()
 }
 
 /// Настройки редактора вместе с языком интерфейса.
@@ -74,8 +71,16 @@ pub struct Settings {
 
 impl Settings {
     /// Настройки по умолчанию: английский, значения из схемы.
-    pub fn defaults() -> Self {
-        let mut settings = Self {
+    ///
+    /// Ошибка значит, что умолчание схемы не разбирается: это огрех схемы, а
+    /// не пользователя, но тихий ноль здесь недопустим.
+    pub fn defaults() -> Result<Self, crate::api::config::Error> {
+        Self::from_config(&Config::new())
+    }
+
+    /// Пустые настройки: все поля заполняет [`Settings::from_config`].
+    fn empty() -> Self {
+        Self {
             history_depth: 0,
             snapshots_keep: 0,
             snapshots_persist: false,
@@ -90,10 +95,7 @@ impl Settings {
             language: DEFAULT_LANGUAGE.to_string(),
             catalog: Catalog::new(),
             theme: DEFAULT_THEME.to_string(),
-        };
-        settings.apply_defaults_table();
-        settings.apply_defaults();
-        settings
+        }
     }
 
     /// Прочитать настройки из набора файлов конфига.
@@ -110,7 +112,8 @@ impl Settings {
     /// знает только редактор. Язык запоминается, файл грузится отдельно —
     /// [`Settings::load_language`].
     pub fn from_config(config: &Config) -> Result<Self, crate::api::config::Error> {
-        let mut settings = Self::defaults();
+        let mut settings = Self::empty();
+        settings.apply_defaults_table();
 
         if let Some(def) = schema::find(ConfigFile::Global, "General.language") {
             settings.language = config.string_or_default(def);
@@ -147,10 +150,14 @@ impl Settings {
         if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.history_usage") {
             settings.savescreen_history_usage = config.bool_or_default(def)?;
         }
-        settings.savescreen_history_usage_percent =
-            table_string(config, "percent", HISTORY_USAGE_TABLE);
-        settings.savescreen_history_usage_number =
-            table_string(config, "number", HISTORY_USAGE_TABLE);
+        // Таблицы может не быть: тогда остаётся значение из схемы, а не
+        // пустая подпись.
+        if let Some(value) = table_string(config, "percent", HISTORY_USAGE_TABLE) {
+            settings.savescreen_history_usage_percent = value;
+        }
+        if let Some(value) = table_string(config, "number", HISTORY_USAGE_TABLE) {
+            settings.savescreen_history_usage_number = value;
+        }
         Ok(settings)
     }
 
@@ -187,36 +194,6 @@ impl Settings {
                     _ => {}
                 }
             }
-        }
-    }
-
-    fn apply_defaults(&mut self) {
-        if let Some(def) = schema::find(ConfigFile::Edit, "General.history_depth") {
-            self.history_depth = def.default.parse().unwrap_or(0);
-        }
-        if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_keep") {
-            self.snapshots_keep = def.default.parse().unwrap_or(0);
-        }
-        if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_persist") {
-            self.snapshots_persist = def.default == "true";
-        }
-        if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_interval") {
-            self.snapshots_interval = def.default.parse().unwrap_or(0);
-        }
-        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.mode") {
-            self.savescreen_mode = def.default.to_string();
-        }
-        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.include") {
-            self.savescreen_include = def.default == "true";
-        }
-        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.input_char") {
-            self.savescreen_input_char = def.default == "true";
-        }
-        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.delete_char") {
-            self.savescreen_delete_char = def.default == "true";
-        }
-        if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.Statistic.history_usage") {
-            self.savescreen_history_usage = def.default == "true";
         }
     }
 }
@@ -257,7 +234,7 @@ mod tests {
     #[test]
     fn defaults_come_from_the_schema() {
         // Настройки без конфига берутся из схемы, а не из зашитых чисел.
-        let settings = Settings::defaults();
+        let settings = Settings::defaults().unwrap();
         let depth = crate::api::config::schema::find(
             crate::api::config::ConfigFile::Edit,
             "General.history_depth",
@@ -300,6 +277,19 @@ mod tests {
         assert_eq!(settings.history_depth, 64);
         assert_eq!(settings.snapshots_keep, 7);
         assert!(!settings.snapshots_persist);
+    }
+
+    #[test]
+    fn a_missing_history_table_keeps_the_schema_default() {
+        // Нет таблицы в конфиге — значит, работает умолчание схемы, а не
+        // пустая подпись: иначе экран статистики показал бы пустое место.
+        let config = crate::api::config::Config::from_documents([(
+            crate::api::config::ConfigFile::Global,
+            "[General]\n".parse().unwrap(),
+        )]);
+        let settings = Settings::from_config(&config).unwrap();
+        assert_eq!(settings.savescreen_history_usage_percent, "{used}");
+        assert_eq!(settings.savescreen_history_usage_number, "{remaining}");
     }
 
     #[test]
@@ -384,7 +374,7 @@ mod tests {
     fn editor_builds_session_from_settings() {
         // Настройки действительно доходят до сессии, а не лежат мёртвым грузом.
         let tmp = Temp::new("editor");
-        let mut settings = Settings::defaults();
+        let mut settings = Settings::defaults().unwrap();
         settings.history_depth = 32;
         settings.snapshots_keep = 5;
         settings.snapshots_persist = false;
@@ -398,7 +388,7 @@ mod tests {
 
     #[test]
     fn the_statistics_screen_defaults_to_the_schema() {
-        let settings = Settings::defaults();
+        let settings = Settings::defaults().unwrap();
         assert!(settings.savescreen_include);
         assert_eq!(settings.savescreen_mode, "fullscreen");
         assert_eq!(settings.savescreen_history_usage_percent, "{used}");

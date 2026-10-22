@@ -84,10 +84,13 @@ impl Drop for Terminal {
         if let Some(raw) = self.raw.take()
             && let Err(e) = raw.leave()
         {
-            eprintln!("cannot leave raw mode: {e}");
+            eprintln!("{}", crate::messages::En.raw_mode_failed(&e.to_string()));
         }
         if let Err(e) = protocol::disable() {
-            eprintln!("cannot disable the keyboard protocol: {e}");
+            eprintln!(
+                "{}",
+                crate::messages::En.protocol_disable_failed(&e.to_string())
+            );
         }
     }
 }

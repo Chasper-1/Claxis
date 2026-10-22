@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "claxis-config"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "claxis-disk",
  "claxis-i18n",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "claxis-disk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "claxis-text",
  "notify",
@@ -77,8 +77,9 @@ dependencies = [
 
 [[package]]
 name = "claxis-i18n"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "claxis-disk",
  "claxis-text",
  "toml_edit",
 ]
@@ -89,7 +90,7 @@ version = "0.2.3"
 
 [[package]]
 name = "claxis-term"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "claxis-text",
  "crossterm",
@@ -97,12 +98,13 @@ dependencies = [
 
 [[package]]
 name = "claxis-text"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "claxis-theme"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
+ "claxis-disk",
  "claxis-text",
 ]
 

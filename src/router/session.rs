@@ -15,7 +15,7 @@ use crate::api::buffer::defaults::buffer::HISTORY_DEPTH;
 use crate::api::buffer::{
     Document as Rope, Error as RopeError, History, MIN_DEPTH, Record as RopeRecord, SnapshotSink,
 };
-use crate::api::disk::{KEEP, PERSIST, SnapshotStore, StorePaths};
+use crate::api::disk::{KEEP, PERSIST, SnapshotStore, StorePaths, file_len, read_bytes};
 use crate::messages::Messages;
 use crate::router::lines::LineMap;
 use crate::router::stats::{self, Stats};
@@ -143,10 +143,12 @@ impl SnapshotSink for StoreSink {
         // номером снимка и обеими суммами, а не «не получилось». Возвращаем
         // `false`: снимок не сохранён, и буфер обязан оставить историю в
         // памяти, а не схлопнуть её в никуда.
-        *self.failed.borrow_mut() = Some(
-            last.map(|e| e.text())
-                .unwrap_or_else(|| format!("snapshot write failed after {WRITE_ATTEMPTS} tries")),
-        );
+        // Сюда можно прийти только с ошибкой: каждая попытка либо вернула
+        // `true`, либо записала причину в `last`. Если инвариант когда-нибудь
+        // сломают, пользователь не получит выдуманный текст на чужом языке.
+        if let Some(error) = last {
+            *self.failed.borrow_mut() = Some(error.text());
+        }
         false
     }
 
@@ -161,11 +163,21 @@ impl SnapshotSink for StoreSink {
             }
             // Дальше идём по кольцу назад. В базе снимки остаются, их оттуда
             // просто читают; убирает их кольцо, и только когда придёт новый.
-            Some(from) => {
-                let older = self.store.older(file, from).ok().flatten()?;
-                self.cursor = Some(older.seq);
-                Some(older.history)
-            }
+            Some(from) => match self.store.older(file, from) {
+                Ok(Some(older)) => {
+                    self.cursor = Some(older.seq);
+                    Some(older.history)
+                }
+                // Снимков больше нет: откат дошёл до конца, и это не ошибка.
+                Ok(None) => None,
+                // База не прочиталась: молча оборвать откат значило бы
+                // потерять историю без объяснения. Ошибка уходит туда же,
+                // откуда приходит ошибка записи, — к пользователю.
+                Err(e) => {
+                    *self.failed.borrow_mut() = Some(e.text());
+                    None
+                }
+            },
         }
     }
 }
@@ -737,23 +749,17 @@ impl Session {
 
         // Проверяем размер до чтения: буфер работает с u32, файл больше
         // u32::MAX байт не помещается.
-        if let Ok(metadata) = std::fs::metadata(&path) {
-            let len = metadata.len();
-            if len > u32::MAX as u64 {
-                return Err(SessionError::FileTooLarge { bytes: len });
-            }
+        let read_error = |e: crate::api::disk::Error| SessionError::ReadFile {
+            path: path.display().to_string(),
+            reason: e.text(),
+        };
+        if let Some(len) = file_len(&path).map_err(read_error)?
+            && len > u32::MAX as u64
+        {
+            return Err(SessionError::FileTooLarge { bytes: len });
         }
 
-        let text = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => {
-                return Err(SessionError::ReadFile {
-                    path: path.display().to_string(),
-                    reason: e.to_string(),
-                });
-            }
-        };
+        let text = read_bytes(&path).map_err(read_error)?.unwrap_or_default();
         let mut buffer = Rope::with_depth(text.clone(), self.history_depth_for_new_documents()?)
             .map_err(SessionError::Buffer)?;
         let mut changed_outside = false;

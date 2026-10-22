@@ -39,6 +39,11 @@ pub trait Messages {
     fn no_usable_config(&self, issues: usize) -> String;
     /// Ключ с таким именем попал в файл не в своей секции.
     fn unknown_key_in_file(&self, file: &str, key: &str) -> String;
+    /// Комментарий после ключа не переносится: `{name}`, `{raw}`.
+    ///
+    /// Значение всё равно запишется, но пояснение на строке ключа уйдёт, и
+    /// человек должен знать, что именно осталось за бортом.
+    fn odd_comment(&self, name: &str, raw: &str) -> String;
 
     /// Текст проблемы конфига: `{where_}` — это `файл:строка`.
     fn issue(&self, issue: &Issue) -> String {
@@ -159,6 +164,13 @@ impl Messages for En {
             &[("file", file.to_string()), ("key", key.to_string())],
         )
     }
+
+    fn odd_comment(&self, name: &str, raw: &str) -> String {
+        substitute(
+            "comment after {name} has unusual escapes and was left as is: {raw}",
+            &[("name", name.to_string()), ("raw", raw.to_string())],
+        )
+    }
 }
 
 /// Все сообщения крейте с примерами значений.
@@ -223,6 +235,10 @@ pub fn samples() -> Vec<(&'static str, String)> {
         (
             "unknown_key_in_file",
             m.unknown_key_in_file("files.toml", "General.history_depth"),
+        ),
+        (
+            "odd_comment",
+            m.odd_comment("history_depth", "\" # глубина\\r\""),
         ),
         // Сводная строка проблемы: переводчик видит, как выглядит всё вместе.
         (

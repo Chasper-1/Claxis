@@ -49,9 +49,15 @@ fn raw(row: &rusqlite::Row<'_>) -> rusqlite::Result<Raw> {
 /// Сумма сходится всегда, если содержимое не трогали. Не сходится — значит
 /// запись испортили извне, и это надо назвать, а не отдать текст как есть:
 /// иначе человек увидит битый документ и не поймёт, откуда он.
-fn checked(file: &str, (seq, text, history, checksum): Raw) -> Result<Snapshot> {
+fn checked(
+    file: &str,
+    seq: i64,
+    text: Vec<u8>,
+    history: Vec<u8>,
+    checksum: i64,
+) -> Result<Snapshot> {
     let expected = checksum::of_pair(&text, &history);
-    let got = checksum.unwrap_or_default() as u64;
+    let got = checksum as u64;
     if expected != got {
         return Err(Error::Corrupted {
             file: file.to_string(),
@@ -122,10 +128,11 @@ impl SnapshotStore {
     /// Буфер живёт дольше сессии, которая его открыла, и не должен её держать.
     /// SQLite это позволяет: подключений может быть сколько угодно.
     pub fn reopen(&self) -> Result<Self> {
-        Self::open(
-            &StorePaths::new(self.path.parent().unwrap_or(std::path::Path::new("."))),
-            self.keep,
-        )
+        let parent = self.path.parent().ok_or_else(|| Error::Open {
+            path: self.path.display().to_string(),
+            reason: "the database path has no parent directory".to_string(),
+        })?;
+        Self::open(&StorePaths::new(parent), self.keep)
     }
 
     /// Сколько снапшотов одного файла хранится.
@@ -188,10 +195,10 @@ impl SnapshotStore {
     /// нечем, и называть её порчей — враньё. Такая принимается как есть, а
     /// сумма дописывается, чтобы дальше она уже проверялась.
     fn take(&self, file: &str, row: Raw) -> Result<Snapshot> {
-        if row.3.is_some() {
-            return checked(file, row);
+        let (seq, text, history, checksum) = row;
+        if let Some(got) = checksum {
+            return checked(file, seq, text, history, got);
         }
-        let (seq, text, history, _) = row;
         let sum = checksum::of_pair(&text, &history);
         let taken = snapshot(file, seq as u64, text, history, sum);
         self.conn

@@ -41,6 +41,11 @@ pub enum StartError {
         /// Сколько проблем в файлах.
         issues: usize,
     },
+    /// Схема конфига сломана так, что умолчания не разбираются: `{reason}`.
+    Schema {
+        /// Что именно не разобралось.
+        reason: String,
+    },
 }
 
 impl StartError {
@@ -52,6 +57,7 @@ impl StartError {
             StartError::ConfigDir { path, reason } => m.config_dir_failed(path, reason),
             StartError::NoHomeDir => m.no_home_dir(),
             StartError::NoUsableConfig { issues } => m.no_usable_config(*issues),
+            StartError::Schema { reason } => m.schema_failed(reason),
         }
     }
 
@@ -192,14 +198,17 @@ impl Editor {
             crate::api::config::path::theme_dir(config_dir),
             crate::api::config::path::lang_dir(config_dir),
         ];
-        let watch = crate::api::disk::Watch::new(config_dir, &watched_dirs).ok();
+        let (watch, watch_error) = match crate::api::disk::Watch::new(config_dir, &watched_dirs) {
+            Ok(watch) => (Some(watch), None),
+            Err(e) => (None, Some(e.text())),
+        };
 
         // Папки, за которыми следить не вышло: смена темы или языка в них не
         // применится сама. Пользователь должен знать про это, иначе он будет
         // искать ошибку в конфиге, которого никто не прочитал.
         // Папка без причины выглядит как «что-то сломалось в системе», а с
         // причиной человек сразу видит, куда смотреть.
-        let blind_spots: Vec<String> = watch
+        let mut blind_spots: Vec<String> = watch
             .as_ref()
             .map(|w| {
                 w.blind_spots()
@@ -208,13 +217,21 @@ impl Editor {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(reason) = watch_error {
+            blind_spots.push(reason);
+        }
 
         // Ошибка схемы — не пользовательская: это огрех наших же значений по
         // умолчанию. Сообщаем и работаем на значениях по умолчанию, чтобы
         // редактор открылся: чинить схему должен тот, кто её писал.
         let (mut settings, schema_error) = match Settings::from_config(&config) {
             Ok(settings) => (settings, None),
-            Err(e) => (Settings::defaults(), Some(e)),
+            Err(e) => match Settings::defaults() {
+                Ok(settings) => (settings, Some(e)),
+                // Ни настройки из конфига, ни умолчания не собрались:
+                // работать не с чем, и молча подставлять нули нельзя.
+                Err(_) => return Err(StartError::Schema { reason: e.text() }),
+            },
         };
         // Перевод не входит в конфиг, но отсутствие файла — это ровно та же
         // поломка: пользователь попросил язык, которого нет. Сообщаем, но не
@@ -324,7 +341,20 @@ impl Editor {
         // нём нельзя.
         let (mut settings, schema_error) = match Settings::from_config(&loaded.config) {
             Ok(settings) => (settings, None),
-            Err(e) => (Settings::defaults(), Some(e)),
+            Err(e) => match Settings::defaults() {
+                Ok(settings) => (settings, Some(e)),
+                Err(_) => {
+                    // Новые настройки не собрались даже на умолчаниях:
+                    // оставляем старые и говорим об ошибке схемы, а не
+                    // применяем половину.
+                    self.schema_error = Some(e);
+                    return Reloaded {
+                        applied: Applied::default(),
+                        issues: Vec::new(),
+                        accepted: false,
+                    };
+                }
+            },
         };
         // Перевод грузится здесь же: язык меняется в конфиге, и ждать
         // перезапуска для смены языка незачем.
@@ -436,7 +466,7 @@ fn save_last_good(store_dir: &Path, dir: &Path) {
     };
     for &file in ConfigFile::ALL {
         let path = dir.join(file.file_name());
-        if let Ok(body) = std::fs::read_to_string(&path) {
+        if let Ok(body) = crate::api::disk::read_text(&path) {
             let _ = store.save_last_good(file.file_name(), &body);
         }
     }

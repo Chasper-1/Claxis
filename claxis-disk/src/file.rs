@@ -45,7 +45,7 @@ impl Fingerprint {
         }
         Ok(Some(Self {
             len: meta.len(),
-            modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+            modified: meta.modified().map_err(|e| crate::error::io(path, e))?,
         }))
     }
 
@@ -97,6 +97,61 @@ pub fn changed_since(path: &Path, was: &Fingerprint) -> Result<Change> {
         return Ok(Change::Changed { by_length: false });
     }
     Ok(Change::Unchanged)
+}
+
+/// Прочитать файл как текст.
+///
+/// Чтение живёт здесь по тому же правилу, что и запись: диск — это один
+/// крейт. Ошибка несёт путь, иначе человек не поймёт, какой файл не открылся.
+pub fn read_text(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|e| crate::error::io(path, e))
+}
+
+/// Прочитать файл как байты. `None`, если файла нет.
+///
+/// Отсутствие файла — не ошибка для вызывающего, который открывает документ:
+/// новый файл ещё не создан, и это нормальный первый шаг.
+pub fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(crate::error::io(path, e)),
+    }
+}
+
+/// Размер файла. `None`, если файла нет.
+///
+/// Размер нужен до чтения: буфер не примет файл больше `u32::MAX` байт, и
+/// узнать это лучше, чем прочитать гигабайты в память.
+pub fn file_len(path: &Path) -> Result<Option<u64>> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(Some(meta.len())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(crate::error::io(path, e)),
+    }
+}
+
+/// Файлы в каталоге.
+///
+/// Только обычные файлы, без подкаталогов: вызывающему нужен список файлов,
+/// а не дерево. Отсутствующий каталог даёт пустой список — до первого запуска
+/// папки ещё нет, и это не поломка.
+pub fn list_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(crate::error::io(dir, e)),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| crate::error::io(dir, e))?;
+        let path = entry.path();
+        let meta = std::fs::metadata(&path).map_err(|e| crate::error::io(&path, e))?;
+        if meta.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(files)
 }
 
 /// Записать текст в файл.
@@ -210,6 +265,54 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "history_depth = 64\n"
         );
+    }
+
+    #[test]
+    fn text_is_read_back_by_the_disk_crate() {
+        let temp = Temp::new("read-text");
+        let path = temp.file("theme.toml");
+        std::fs::write(&path, "background = \"#000000\"").unwrap();
+        assert_eq!(read_text(&path).unwrap(), "background = \"#000000\"");
+    }
+
+    #[test]
+    fn a_missing_file_is_a_read_error_with_its_path() {
+        let temp = Temp::new("read-missing");
+        let path = temp.file("missing.toml");
+        let error = read_text(&path).unwrap_err();
+        assert!(error.text().contains("missing.toml"), "{error}");
+    }
+
+    #[test]
+    fn bytes_are_read_and_absence_is_not_an_error() {
+        let temp = Temp::new("read-bytes");
+        let path = temp.file("document.txt");
+        std::fs::write(&path, b"\x00\x01\xff").unwrap();
+        assert_eq!(read_bytes(&path).unwrap(), Some(vec![0, 1, 255]));
+        assert_eq!(read_bytes(&temp.file("none.txt")).unwrap(), None);
+    }
+
+    #[test]
+    fn the_length_is_known_before_reading() {
+        let temp = Temp::new("file-len");
+        let path = temp.file("document.txt");
+        std::fs::write(&path, "12345").unwrap();
+        assert_eq!(file_len(&path).unwrap(), Some(5));
+        assert_eq!(file_len(&temp.file("none.txt")).unwrap(), None);
+    }
+
+    #[test]
+    fn listing_skips_folders_and_a_missing_folder_is_empty() {
+        let temp = Temp::new("list-files");
+        std::fs::write(temp.file("one.toml"), "").unwrap();
+        std::fs::create_dir(temp.file("folder")).unwrap();
+        let names: Vec<String> = list_files(&temp.dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["one.toml"]);
+        assert!(list_files(&temp.dir.join("none")).unwrap().is_empty());
     }
 
     #[test]

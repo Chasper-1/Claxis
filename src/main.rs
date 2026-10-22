@@ -24,7 +24,10 @@ fn main() {
         }
         Command::Help => {
             let mut out = std::io::stdout().lock();
-            let _ = cli::print_help(&mut out, &messages).and_then(|()| out.flush());
+            if let Err(e) = cli::print_help(&mut out, &messages).and_then(|()| out.flush()) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
             return;
         }
         // Такого аргумента нет: молча открывать файл с именем `--что-то` хуже, чем
