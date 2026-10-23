@@ -7,11 +7,7 @@
 //! Никакого списка токенов не хранится. Обход идёт по байтам через границы
 //! графем, поэтому эмодзи и буква с комбинирующим знаком остаются целыми.
 
-#[cfg(test)]
-use std::iter::Peekable;
-
 use claxis_text::grapheme;
-use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 /// Вид токена.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -192,103 +188,11 @@ impl<'a> Line<'a> {
     }
 
     fn next(&self, at: usize) -> usize {
-        let len = self.len();
-        let at = at.min(len);
-        if at >= len {
-            return len;
-        }
-        if self.bytes[at] == b'\r' && self.bytes.get(at + 1) == Some(&b'\n') {
-            return at + 2;
-        }
-        if self.bytes[at].is_ascii() && self.bytes.get(at + 1).is_none_or(|next| next.is_ascii()) {
-            return at + 1;
-        }
-        let mut span = 16;
-        loop {
-            let end = (at + span).min(len);
-            match std::str::from_utf8(&self.bytes[at..end]) {
-                Ok(text) => {
-                    if let Some(grapheme) = text.graphemes(true).next() {
-                        let next = at + grapheme.len();
-                        if next < end || end == len {
-                            return next;
-                        }
-                    } else {
-                        return len;
-                    }
-                }
-                Err(error) => {
-                    let valid = error.valid_up_to();
-                    if valid == 0 {
-                        return at + 1;
-                    }
-                    if error.error_len().is_none() && end < len {
-                        // Окно разрезало символ, нужен кусок побольше.
-                    } else if let Ok(text) = std::str::from_utf8(&self.bytes[at..at + valid])
-                        && let Some(grapheme) = text.graphemes(true).next()
-                    {
-                        return at + grapheme.len();
-                    } else {
-                        return at + 1;
-                    }
-                }
-            }
-            if end == len {
-                return len;
-            }
-            span = span.saturating_mul(2);
-        }
+        grapheme::next(self.bytes, at)
     }
 
     fn prev(&self, at: usize) -> usize {
-        let len = self.len();
-        let at = at.min(len);
-        if at == 0 {
-            return 0;
-        }
-        let after_crlf = at >= 2 && self.bytes[at - 2] == b'\r' && self.bytes[at - 1] == b'\n';
-        if self.bytes[at - 1].is_ascii()
-            && !after_crlf
-            && !(self.bytes[at - 1] == b'\r' && self.bytes.get(at) == Some(&b'\n'))
-            && self.bytes.get(at).is_none_or(|next| next.is_ascii())
-        {
-            return at - 1;
-        }
-        let mut end = at;
-        while end < len && self.bytes[end] & 0b1100_0000 == 0b1000_0000 {
-            end += 1;
-        }
-        let mut span = 16;
-        loop {
-            let mut begin = end.saturating_sub(span);
-            while begin > 0 && self.bytes[begin] & 0b1100_0000 == 0b1000_0000 {
-                begin -= 1;
-            }
-            let Ok(text) = std::str::from_utf8(&self.bytes[begin..end]) else {
-                return grapheme::prev(self.bytes, at);
-            };
-            let mut cursor = GraphemeCursor::new(end - begin, text.len(), true);
-            match cursor.prev_boundary(text, 0) {
-                Ok(Some(previous)) => {
-                    if previous > 0 || begin == 0 {
-                        return begin + previous;
-                    }
-                    span = span.saturating_mul(2);
-                }
-                Ok(None) => {
-                    if begin == 0 {
-                        return 0;
-                    }
-                    span = span.saturating_mul(2);
-                }
-                Err(_) => {
-                    if begin == 0 {
-                        return grapheme::prev(self.bytes, at);
-                    }
-                    span = span.saturating_mul(2);
-                }
-            }
-        }
+        grapheme::prev(self.bytes, at)
     }
 
     fn is_boundary(&self, at: usize) -> bool {
@@ -488,49 +392,6 @@ fn previous_filtered(line: Line<'_>, at: usize, filter: TokenFilter) -> Option<T
     None
 }
 
-/// Обход непрерывных отрезков из подходящих токенов.
-///
-/// Два соседних токена склеиваются, только если между ними нет пробела и оба
-/// входят в фильтр. Так `word / symbol` перепрыгивает `foo_bar` целиком, а
-/// `word | symbol` делает два отдельных прыжка.
-#[cfg(test)]
-struct RunIter<'a> {
-    tokens: Peekable<TokenIter<'a>>,
-    filter: TokenFilter,
-}
-
-#[cfg(test)]
-fn runs(text: &[u8], filter: TokenFilter) -> RunIter<'_> {
-    RunIter {
-        tokens: tokens(text).peekable(),
-        filter,
-    }
-}
-
-#[cfg(test)]
-impl Iterator for RunIter<'_> {
-    type Item = (usize, usize);
-
-    fn next(&mut self) -> Option<(usize, usize)> {
-        loop {
-            let first = self.tokens.next()?;
-            if !self.filter.contains(first.kind) {
-                continue;
-            }
-            let start = first.start;
-            let mut end = first.end;
-            while let Some(next) = self.tokens.peek() {
-                if !self.filter.contains(next.kind) || next.start != end {
-                    break;
-                }
-                end = next.end;
-                self.tokens.next();
-            }
-            return Some((start, end));
-        }
-    }
-}
-
 /// Первый символ графемы.
 fn first_char(text: &[u8], start: usize, end: usize) -> Option<char> {
     std::str::from_utf8(&text[start..end])
@@ -556,7 +417,7 @@ fn kind_of(text: &[u8], start: usize, end: usize) -> TokenKind {
 mod tests {
     use claxis_text::grapheme;
 
-    use super::{JumpMode, TokenFilter, TokenKind, next, prev, runs, tokens};
+    use super::{JumpMode, TokenFilter, TokenKind, is_space, kind_of, next, prev, tokens};
 
     fn seen(text: &str) -> Vec<(TokenKind, &str)> {
         tokens(text.as_bytes())
@@ -768,12 +629,66 @@ mod tests {
         assert!(!filter.is_empty());
     }
 
+    /// Независимый обход: только текст и границы графем, без `TokenIter`.
+    fn reference_runs(text: &[u8], filter: TokenFilter) -> Vec<(usize, usize)> {
+        let mut tokens = Vec::new();
+        let mut at = 0;
+        while at < text.len() {
+            let end = grapheme::next(text, at);
+            if is_space(text, at, end) {
+                at = end;
+                continue;
+            }
+            let kind = kind_of(text, at, end);
+            let start = at;
+            let mut token_end = end;
+            loop {
+                let next_end = grapheme::next(text, token_end);
+                if next_end == token_end {
+                    break;
+                }
+                if is_space(text, token_end, next_end) || kind_of(text, token_end, next_end) != kind
+                {
+                    break;
+                }
+                token_end = next_end;
+            }
+            tokens.push((start, token_end, kind));
+            at = token_end;
+        }
+
+        let mut out = Vec::new();
+        let mut current: Option<(usize, usize)> = None;
+        for (start, end, kind) in tokens {
+            if !filter.contains(kind) {
+                if let Some(run) = current.take() {
+                    out.push(run);
+                }
+                continue;
+            }
+            match current {
+                Some((run_start, run_end)) if run_end == start => {
+                    current = Some((run_start, end));
+                }
+                Some(run) => {
+                    out.push(run);
+                    current = Some((start, end));
+                }
+                None => current = Some((start, end)),
+            }
+        }
+        if let Some(run) = current {
+            out.push(run);
+        }
+        out
+    }
+
     fn naive_next(text: &[u8], at: usize, filter: TokenFilter, mode: JumpMode) -> usize {
         let at = at.min(text.len());
         if filter.is_empty() {
             return at;
         }
-        for (start, end) in runs(text, filter) {
+        for (start, end) in reference_runs(text, filter) {
             if at >= start && at < end {
                 match mode {
                     JumpMode::FinishCurrent => return end,
@@ -796,7 +711,7 @@ mod tests {
             return at;
         }
         let mut previous = 0;
-        for (start, end) in runs(text, filter) {
+        for (start, end) in reference_runs(text, filter) {
             if at > start && at <= end {
                 return match mode {
                     JumpMode::FinishCurrent => start,
@@ -898,6 +813,7 @@ mod tests {
         check_all_positions("привет_мир 42".as_bytes());
         check_all_positions("e\u{301}x!".as_bytes());
         check_all_positions("👨‍👩‍👧‍👦! a".as_bytes());
+        check_all_positions("aaaaaaaaaaaaaaaaa🇺🇸🇷🇸🇮".as_bytes());
         check_all_positions(b"a\r\nb");
         check_all_positions(b"a\xFFb");
         check_all_positions(b"   ");

@@ -359,6 +359,27 @@ mod tests {
     }
 
     #[test]
+    fn line_edges_do_not_land_inside_crlf_or_after_cr() {
+        let text = b"a\r\nb";
+        let lines = LineMap::build(text);
+        let mut cursor = Cursor::new(Position::new(0));
+        cursor.line_end(&lines, 4);
+        assert_eq!(cursor.head(), Position::new(1), "конец строки — \\r");
+        cursor.go_to_line(1, &lines, 4);
+        assert_eq!(cursor.head(), Position::new(3));
+        cursor.line_start(&lines, 4);
+        assert_eq!(cursor.head(), Position::new(3));
+
+        let text = b"a\rb";
+        let lines = LineMap::build(text);
+        let mut cursor = Cursor::new(Position::new(0));
+        cursor.line_end(&lines, 3);
+        assert_eq!(cursor.head(), Position::new(1));
+        cursor.go_to_line(1, &lines, 3);
+        assert_eq!(cursor.head(), Position::new(2));
+    }
+
+    #[test]
     fn a_column_is_counted_in_graphemes() {
         let text = "a\u{301}bc";
         let line = text.as_bytes();

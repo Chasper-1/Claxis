@@ -8,14 +8,24 @@
 //! Функции работают с куском текста, обычно со строкой. Документ целиком не
 //! нужен: границы локальны, а хранить их между вызовами незачем.
 
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete, UnicodeSegmentation};
+
+/// Размер первого окна для локальной проверки UTF-8.
+///
+/// Хватает на обычную букву с парой комбинирующихся знаков. Дальше окно
+/// растёт, пока графема в него не влезет целиком.
+const FIRST_WINDOW: usize = 16;
 
 /// Начало следующей графемы после `at`.
 ///
 /// `at` — байт на границе графемы. Внутри многобайтовой последовательности
 /// функция всё равно не паникует: такой байт считается отдельной графемой,
 /// чтобы битый текст не останавливал курсор.
+///
+/// UTF-8 проверяется только в окне вокруг `at`, а не во всём остатке строки:
+/// время шага зависит от длины графемы, но не от длины строки.
 pub fn next(text: &[u8], at: usize) -> usize {
+    let at = at.min(text.len());
     if at >= text.len() {
         return text.len();
     }
@@ -27,16 +37,18 @@ pub fn next(text: &[u8], at: usize) -> usize {
     if text[at].is_ascii() && text.get(at + 1).is_none_or(|next| next.is_ascii()) {
         return at + 1;
     }
-    first_in(text, at)
+    forward_in_window(text, at)
 }
 
 /// Начало предыдущей графемы перед `at`.
 ///
-/// Идём вперёд от начала куска: обратные правила склейки сложнее прямых, а
-/// строки, по которым ходит курсор, короткие. `at` не обязана быть границей —
-/// тогда возвращается граница слева.
+/// Обратные правила склейки сложнее прямых, поэтому окно растёт назад, пока
+/// `GraphemeCursor` не найдёт границу. Курсор знает полную длину текста и
+/// начало окна, поэтому не принимает за границу место, где просто кончился
+/// кусок. `at` не обязана быть границей — тогда возвращается граница слева.
 pub fn prev(text: &[u8], at: usize) -> usize {
-    let at = at.min(text.len());
+    let len = text.len();
+    let at = at.min(len);
     if at == 0 {
         return 0;
     }
@@ -49,6 +61,96 @@ pub fn prev(text: &[u8], at: usize) -> usize {
     {
         return at - 1;
     }
+    // Если `at` попала внутрь символа, идём от начала следующего символа.
+    let mut end = at;
+    while end < len && text[end] & 0b1100_0000 == 0b1000_0000 {
+        end += 1;
+    }
+    let mut span = FIRST_WINDOW;
+    loop {
+        let mut begin = end.saturating_sub(span);
+        while begin > 0 && text[begin] & 0b1100_0000 == 0b1000_0000 {
+            begin -= 1;
+        }
+        let Ok(part) = std::str::from_utf8(&text[begin..end]) else {
+            return scan_back_from_start(text, at);
+        };
+        let mut cursor = GraphemeCursor::new(end, len, true);
+        match cursor.prev_boundary(part, begin) {
+            Ok(Some(previous)) => {
+                if previous > begin {
+                    return previous;
+                }
+                if begin == 0 {
+                    return 0;
+                }
+                span = span.saturating_mul(2);
+            }
+            Ok(None) => {
+                if begin == 0 {
+                    return 0;
+                }
+                span = span.saturating_mul(2);
+            }
+            Err(GraphemeIncomplete::PrevChunk) => {
+                if begin == 0 {
+                    return 0;
+                }
+                span = span.saturating_mul(2);
+            }
+            Err(GraphemeIncomplete::PreContext(need)) => {
+                if need == 0 {
+                    return 0;
+                }
+                span = (end - need).max(span.saturating_mul(2));
+            }
+            Err(_) => return scan_back_from_start(text, at),
+        }
+    }
+}
+
+/// Конец первой графемы в растущем окне.
+fn forward_in_window(text: &[u8], at: usize) -> usize {
+    let len = text.len();
+    let mut span = FIRST_WINDOW;
+    loop {
+        let end = (at + span).min(len);
+        match std::str::from_utf8(&text[at..end]) {
+            Ok(valid) => {
+                if let Some(grapheme) = valid.graphemes(true).next() {
+                    let next = at + grapheme.len();
+                    if next < end || end == len {
+                        return next;
+                    }
+                } else {
+                    return len;
+                }
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid == 0 {
+                    return at + 1;
+                }
+                if error.error_len().is_none() && end < len {
+                    // Окно разрезало символ, нужен кусок побольше.
+                } else if let Ok(prefix) = std::str::from_utf8(&text[at..at + valid])
+                    && let Some(grapheme) = prefix.graphemes(true).next()
+                {
+                    return at + grapheme.len();
+                } else {
+                    return at + 1;
+                }
+            }
+        }
+        if end == len {
+            return len;
+        }
+        span = span.saturating_mul(2);
+    }
+}
+
+/// Полный обход назад — только когда локальное окно встретило битый UTF-8.
+fn scan_back_from_start(text: &[u8], at: usize) -> usize {
     let mut start = 0;
     loop {
         let end = next(text, start);
@@ -59,26 +161,51 @@ pub fn prev(text: &[u8], at: usize) -> usize {
     }
 }
 
-/// Конец первой графемы, начинающейся в `at`.
-fn first_in(text: &[u8], at: usize) -> usize {
-    let rest = &text[at..];
-    let valid = match std::str::from_utf8(rest) {
-        Ok(text) => text,
-        Err(error) if error.valid_up_to() == 0 => return at + 1,
-        Err(error) => match std::str::from_utf8(&rest[..error.valid_up_to()]) {
-            Ok(text) => text,
-            Err(_) => return at + 1,
-        },
-    };
-    match valid.graphemes(true).next() {
-        Some(grapheme) => at + grapheme.len(),
-        None => at + 1,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use unicode_segmentation::UnicodeSegmentation;
+
     use super::{next, prev};
+
+    /// Старый полный обход вперёд: проверяет весь остаток строки.
+    fn full_next(text: &[u8], at: usize) -> usize {
+        let at = at.min(text.len());
+        if at >= text.len() {
+            return text.len();
+        }
+        if text[at] == b'\r' && text.get(at + 1) == Some(&b'\n') {
+            return at + 2;
+        }
+        if text[at].is_ascii() && text.get(at + 1).is_none_or(|next| next.is_ascii()) {
+            return at + 1;
+        }
+        let rest = &text[at..];
+        let valid = match std::str::from_utf8(rest) {
+            Ok(text) => text,
+            Err(error) if error.valid_up_to() == 0 => return at + 1,
+            Err(error) => match std::str::from_utf8(&rest[..error.valid_up_to()]) {
+                Ok(text) => text,
+                Err(_) => return at + 1,
+            },
+        };
+        match valid.graphemes(true).next() {
+            Some(grapheme) => at + grapheme.len(),
+            None => at + 1,
+        }
+    }
+
+    /// Старый полный обход назад: идёт от начала куска.
+    fn full_prev(text: &[u8], at: usize) -> usize {
+        let at = at.min(text.len());
+        let mut start = 0;
+        loop {
+            let end = full_next(text, start);
+            if end >= at {
+                return start;
+            }
+            start = end;
+        }
+    }
 
     fn boundaries(text: &str) -> Vec<usize> {
         let bytes = text.as_bytes();
@@ -178,6 +305,60 @@ mod tests {
                 assert_eq!(prev(bytes, end), at, "не вернулись из {text:?} на {at}");
                 at = end;
             }
+        }
+    }
+
+    #[test]
+    fn prev_sees_context_before_the_window() {
+        // Окно начинается внутри первой пары флагов. Если курсор не знает
+        // начало куска, он принимает за границу середину пары и отдаёт 29.
+        let text = "aaaaaaaaaaaaaaaaa🇺🇸🇷🇸🇮";
+        assert_eq!(prev(text.as_bytes(), 34), 33);
+        assert_eq!(prev(text.as_bytes(), 35), 33);
+    }
+
+    #[test]
+    fn local_walk_matches_a_full_scan() {
+        let long_marks = format!("e{}x", "\u{301}".repeat(100));
+        let long_zwj = "👨‍👩‍👧‍👦".repeat(8);
+        let long_flags = "🇷".repeat(20);
+        for text in [
+            "hello",
+            "привет",
+            "e\u{301}x",
+            "👨‍👩‍👧‍👦!",
+            "🇷🇺🇺🇸",
+            "aaaaaaaaaaaaaaaaa🇺🇸🇷🇸🇮",
+            "\u{1100}\u{1161}\u{11A8}",
+            "a\r\nb",
+            "a\r\n\r\nb",
+            long_marks.as_str(),
+            long_zwj.as_str(),
+            long_flags.as_str(),
+        ] {
+            let bytes = text.as_bytes();
+            for at in 0..=bytes.len() {
+                assert_eq!(
+                    next(bytes, at),
+                    full_next(bytes, at),
+                    "вперёд: {text:?}, позиция {at}"
+                );
+                assert_eq!(
+                    prev(bytes, at),
+                    full_prev(bytes, at),
+                    "назад: {text:?}, позиция {at}"
+                );
+            }
+        }
+
+        let broken = b"a\xFFb";
+        for at in 0..=broken.len() {
+            assert_eq!(
+                next(broken, at),
+                full_next(broken, at),
+                "битый вперёд: {at}"
+            );
+            assert_eq!(prev(broken, at), full_prev(broken, at), "битый назад: {at}");
         }
     }
 }
