@@ -7,6 +7,7 @@
 pub mod buffer;
 pub mod commands;
 pub mod config;
+pub mod core;
 pub mod disk;
 pub mod i18n;
 pub mod input;

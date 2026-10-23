@@ -14,6 +14,7 @@
 //!         │
 //!         ▼
 //!   session ──► claxis-buffer          документ и снятые снапшоты
+//!         ├──► claxis-core            карта строк и курсор
 //!         └──► claxis-disk            всё, что пишется на диск
 //!
 //!   editor ──► session                 всё вместе, верхний уровень
@@ -30,7 +31,6 @@
 //! | Файл | Что связывает |
 //! | --- | --- |
 //! | [`session`] | буфер и хранилище: открыть документ, снять снапшот на диск |
-//! | [`lines`] | карта строк: номер строки для позиции и обратно |
 //! | [`stats`] | что человек делал: символы, нажатия, занятая история |
 //! | [`cycle`] | цикл: события терминала идут в документ |
 //! | [`settings`] | конфиг и перевод: язык, значения настроек, комментарии |
@@ -39,14 +39,13 @@
 mod commands;
 mod cycle;
 mod editor;
-mod lines;
 pub mod session;
 mod settings;
 pub mod stats;
 
+pub use crate::api::core::LineMap;
 pub use cycle::{Action, Cycle};
 pub use editor::{Editor, Reloaded, StartError};
-pub use lines::LineMap;
 pub use session::{Applied, Document, Session, SessionError};
 pub use settings::Settings;
 pub use stats::Stats;

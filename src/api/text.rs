@@ -3,4 +3,4 @@
 //! Один файл на крейт. Здесь только то, что крейт отдаёт наружу: подстановка
 //! значений в перевод и разбивка чисел по разрядам.
 
-pub use claxis_text::{group_digits, substitute};
+pub use claxis_text::{grapheme, group_digits, substitute};

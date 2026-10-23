@@ -15,9 +15,9 @@ use crate::api::buffer::defaults::buffer::HISTORY_DEPTH;
 use crate::api::buffer::{
     Document as Rope, Error as RopeError, History, MIN_DEPTH, Record as RopeRecord, SnapshotSink,
 };
+use crate::api::core::LineMap;
 use crate::api::disk::{KEEP, PERSIST, SnapshotStore, StorePaths, file_len, read_bytes};
 use crate::messages::Messages;
-use crate::router::lines::LineMap;
 use crate::router::stats::{self, Stats};
 
 /// Что пошло не так в сессии.

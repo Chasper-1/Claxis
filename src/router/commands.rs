@@ -10,11 +10,12 @@
 //! Список крейтов дописывается здесь, а не внутри `claxis-commands`: там чужих
 //! команд нет и знать о них нечего.
 
-use crate::api::buffer::COMMANDS;
+use crate::api::buffer::COMMANDS as BUFFER;
 use crate::api::commands::{Error, Registry};
+use crate::api::core::COMMANDS as CORE;
 
 /// Объявления крейтов: список имён из каждого `commands.rs`.
-const DECLARED: &[(&str, &[&str])] = &[("std", COMMANDS)];
+const DECLARED: &[(&str, &[&str])] = &[("std", BUFFER), ("std", CORE)];
 
 /// Реестр всех команд редактора.
 ///
@@ -60,6 +61,9 @@ mod tests {
     fn completion_walks_the_namespaces_of_real_commands() {
         let registry = registry().unwrap();
         assert_eq!(registry.complete(&[]), vec!["std"]);
-        assert_eq!(registry.complete(&["std", "edit"]), vec!["redo", "undo"]);
+        assert_eq!(
+            registry.complete(&["std", "edit"]),
+            vec!["move", "redo", "undo"]
+        );
     }
 }

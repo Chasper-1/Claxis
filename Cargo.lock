@@ -9,6 +9,7 @@ dependencies = [
  "claxis-buffer",
  "claxis-commands",
  "claxis-config",
+ "claxis-core",
  "claxis-disk",
  "claxis-i18n",
  "claxis-input",
@@ -67,6 +68,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "claxis-core"
+version = "0.1.0"
+dependencies = [
+ "claxis-text",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "claxis-disk"
 version = "0.1.1"
 dependencies = [
@@ -98,7 +107,10 @@ dependencies = [
 
 [[package]]
 name = "claxis-text"
-version = "0.3.1"
+version = "0.3.2"
+dependencies = [
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "claxis-theme"

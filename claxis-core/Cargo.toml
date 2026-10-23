@@ -1,0 +1,12 @@
+[package]
+name = "claxis-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+claxis-text = { path = "../claxis-text" }
+unicode-segmentation = "1.12"
+
+[[bench]]
+name = "cursor_bench"
+harness = false
