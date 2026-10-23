@@ -554,6 +554,8 @@ fn kind_of(text: &[u8], start: usize, end: usize) -> TokenKind {
 
 #[cfg(test)]
 mod tests {
+    use claxis_text::grapheme;
+
     use super::{JumpMode, TokenFilter, TokenKind, next, prev, runs, tokens};
 
     fn seen(text: &str) -> Vec<(TokenKind, &str)> {
@@ -834,6 +836,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn boundaries(text: &[u8]) -> Vec<usize> {
+        let mut out = vec![0];
+        let mut at = 0;
+        while at < text.len() {
+            at = grapheme::next(text, at);
+            out.push(at);
+        }
+        out
+    }
+
+    fn check_boundaries(text: &[u8]) {
+        let bounds = boundaries(text);
+        let filters = [
+            TokenFilter::word(),
+            TokenFilter::number(),
+            TokenFilter::symbol(),
+            TokenFilter::all(),
+            TokenFilter::word().union(TokenFilter::symbol()),
+            TokenFilter::default(),
+        ];
+        let modes = [JumpMode::FinishCurrent, JumpMode::NextStart];
+        for at in 0..=text.len() {
+            for filter in filters {
+                if filter.is_empty() {
+                    continue;
+                }
+                for mode in modes {
+                    let right = next(text, at, filter, mode);
+                    assert!(
+                        bounds.contains(&right),
+                        "вперёд попали внутрь байта: {text:?}, {at}, {filter:?}, {mode:?} -> {right}"
+                    );
+                    let left = prev(text, at, filter, mode);
+                    assert!(
+                        bounds.contains(&left),
+                        "назад попали внутрь байта: {text:?}, {at}, {filter:?}, {mode:?} -> {left}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jumps_stay_on_grapheme_boundaries() {
+        check_boundaries(b"foo_bar baz123");
+        check_boundaries("привет_мир 42".as_bytes());
+        check_boundaries("e\u{301}x!".as_bytes());
+        check_boundaries("👨‍👩‍👧‍👦! a".as_bytes());
+        check_boundaries(b"a\r\nb");
+        check_boundaries(b"a\xFFb");
+        check_boundaries(format!("e{}x", "\u{301}".repeat(100)).as_bytes());
     }
 
     #[test]
