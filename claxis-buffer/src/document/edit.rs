@@ -1,4 +1,4 @@
-use super::core::Document;
+use super::core::{Document, text_growth_margin};
 use super::error::{Error, Result};
 use super::record::{Record, Version, record_end};
 use crate::node::NIL;
@@ -132,8 +132,38 @@ impl Document {
     #[inline(never)]
     fn append(&mut self, data: &[u8]) -> u32 {
         let offset = self.bytes.len() as u32;
+        self.reserve_for_append(data.len());
         self.bytes.extend_from_slice(data);
         offset
+    }
+
+    /// Запасти место под хвост по кривой роста.
+    fn reserve_for_append(&mut self, extra: usize) {
+        let len = self.bytes.len();
+        let required = len.saturating_add(extra);
+        let capacity = self.bytes.capacity();
+        if required <= capacity {
+            return;
+        }
+        let grown = capacity.saturating_add(text_growth_margin(capacity));
+        let target = if required <= grown {
+            grown
+        } else {
+            required.saturating_add(text_growth_margin(required))
+        };
+        self.bytes.reserve_exact(target - len);
+    }
+
+    /// Оставить запас под первые правки, чтобы они не копировали весь буфер.
+    pub(super) fn reserve_text_headroom(&mut self) {
+        let len = self.bytes.len();
+        if len == 0 {
+            return;
+        }
+        let target = len.saturating_add(text_growth_margin(len));
+        if self.bytes.capacity() < target {
+            self.bytes.reserve_exact(target - len);
+        }
     }
 
     /// Поместится ли в буфер ещё `extra` байт.
@@ -452,6 +482,7 @@ impl Document {
 
 #[cfg(test)]
 mod tests {
+    use super::super::core::TEXT_GROWTH_MIN;
     use super::super::core::support::*;
     use super::*;
 
@@ -460,6 +491,45 @@ mod tests {
         let mut doc = d("abcdefghij");
         doc.insert(5, b"XXXXX").unwrap();
         assert_eq!(doc.read(), b"abcdeXXXXXfghij");
+    }
+
+    #[test]
+    fn opening_leaves_headroom_for_edits() {
+        // Вставки добавляют байты в хвост буфера. Запас на открытии должен
+        // покрыть их, иначе первая же правка копирует весь файл.
+        let mut doc = Document::new(vec![b'a'; 500_000]).unwrap();
+        let before = doc.memory().text_capacity;
+        assert!(before > 500_000, "у буфера нет запаса под правки");
+        for i in 0..8_000u32 {
+            doc.insert((i * 37) % (doc.len() + 1), b"xx").unwrap();
+        }
+        let memory = doc.memory();
+        assert_eq!(memory.text_len, 516_000);
+        assert_eq!(memory.text_capacity, before, "запас кончился");
+    }
+
+    #[test]
+    fn text_growth_slows_down_with_size() {
+        let small = text_growth_margin(16 * 1024) as f64 / (16 * 1024) as f64;
+        let medium = text_growth_margin(500 * 1024) as f64 / (500 * 1024) as f64;
+        let large = text_growth_margin(100 * 1024 * 1024) as f64 / (100 * 1024 * 1024) as f64;
+        assert!(small > medium, "мелкий буфер должен расти быстрее");
+        assert!(medium > large, "крупный буфер должен расти медленнее");
+        assert!(
+            text_growth_margin(100 * 1024 * 1024) < 10 * 1024 * 1024,
+            "слишком большой запас на 100 МБ"
+        );
+    }
+
+    #[test]
+    fn a_tiny_append_gets_a_minimum_step() {
+        let mut doc = Document::new(b"").unwrap();
+        doc.insert(0, b"x").unwrap();
+        let capacity = doc.memory().text_capacity;
+        assert!(
+            capacity >= TEXT_GROWTH_MIN,
+            "мелкий хвост не получил шаг роста: {capacity}"
+        );
     }
 
     #[test]

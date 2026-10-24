@@ -12,6 +12,38 @@ use crate::tree::Tree;
 /// нельзя: глубина настраивается и потолка не имеет.
 const VERSION_RESERVE: usize = 8 * 1024;
 
+/// Минимальный шаг роста текстового буфера.
+pub(super) const TEXT_GROWTH_MIN: usize = 4 * 1024;
+
+/// Запас под правки для буфера размера `size`.
+///
+/// Кривая убывает по логарифму размера: мелкий файл растёт вдвое, крупный —
+/// на проценты. Так мелкий буфер редко перевыделяется, а большой не держит
+/// лишние мегабайты только из-за коэффициента.
+pub(super) fn text_growth_margin(size: usize) -> usize {
+    if size == 0 {
+        return TEXT_GROWTH_MIN;
+    }
+    let log = (size as f64).log2();
+    let factor = if log <= 14.0 {
+        2.0
+    } else if log <= 18.0 {
+        2.0 - 0.5 * (log - 14.0) / 4.0
+    } else if log <= 19.0 {
+        1.5 - 0.25 * (log - 18.0)
+    } else if log <= 20.0 {
+        1.25 - 0.05 * (log - 19.0)
+    } else if log <= 24.0 {
+        1.2 - 0.1 * (log - 20.0) / 4.0
+    } else if log <= 30.0 {
+        1.1 - 0.09 * (log - 24.0) / 6.0
+    } else {
+        1.01
+    };
+    let margin = (size as f64 * (factor - 1.0)).round() as usize;
+    margin.max(TEXT_GROWTH_MIN)
+}
+
 /// Длина текста, влезающая в 32-битное смещение буфера.
 ///
 /// Проверка стоит до `as u32`: иначе длина обрезалась бы молча, и хвост
@@ -68,9 +100,18 @@ impl Document {
         if depth < MIN_DEPTH {
             return Err(Error::InvalidHistoryDepth { depth });
         }
-        let bytes = bytes.as_ref().to_vec();
-        let len = checked_len(bytes.len())?;
-        Ok(Self::assemble(bytes, len, depth))
+        let source = bytes.as_ref();
+        let len = checked_len(source.len())?;
+        let capacity = if source.is_empty() {
+            0
+        } else {
+            source
+                .len()
+                .saturating_add(text_growth_margin(source.len()))
+        };
+        let mut copy = Vec::with_capacity(capacity);
+        copy.extend_from_slice(source);
+        Ok(Self::assemble(copy, len, depth))
     }
 
     /// Документ из готового буфера: текст уже состоит из файла и хвоста.
@@ -109,7 +150,7 @@ impl Document {
             child: NIL,
             live: 0,
         });
-        Self {
+        let mut document = Self {
             tree: Tree::with_leaf(0, file_len),
             bytes,
             file_len,
@@ -123,7 +164,9 @@ impl Document {
             snapshots: 0,
             compacts: 0,
             crossings: 0,
-        }
+        };
+        document.reserve_text_headroom();
+        document
     }
 
     /// Весь текстовый буфер: файл и хвост вставок и вырезанного.

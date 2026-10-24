@@ -73,6 +73,7 @@ impl Document {
     /// приёмника.
     fn compact_with(&mut self, document: Vec<u8>) {
         self.bytes = document;
+        self.reserve_text_headroom();
         self.file_len = self.bytes.len() as u32;
         self.tree.collapse_to(0, self.file_len);
         self.free.clear();
