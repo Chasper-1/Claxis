@@ -62,9 +62,10 @@ pub trait Messages {
     /// `{anchor}` и `{head}` — границы диапазона из записи.
     fn invalid_record_range(&self, anchor: u32, head: u32) -> String;
 
-    /// Снимок, который подтянулся из базы для отката дальше, не разобрался:
-    /// `{reason}`.
-    fn older_snapshot_broken(&self, reason: &str) -> String;
+    /// История снята не с этого файла.
+    ///
+    /// `{expected}` — отпечаток из истории, `{got}` — отпечаток файла.
+    fn history_base_mismatch(&self, expected: u64, got: u64) -> String;
 
     /// В переводе встретилось имя, которого нет среди известных.
     ///
@@ -202,10 +203,13 @@ impl Messages for En {
         )
     }
 
-    fn older_snapshot_broken(&self, reason: &str) -> String {
+    fn history_base_mismatch(&self, expected: u64, got: u64) -> String {
         substitute(
-            "the older snapshot cannot be read: {reason}; undo stops here",
-            &[("reason", reason.to_string())],
+            "rope history belongs to another file: checksum is {got}, expected {expected}",
+            &[
+                ("expected", format!("{expected:016x}")),
+                ("got", format!("{got:016x}")),
+            ],
         )
     }
 
@@ -249,8 +253,8 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ("history_out_of_bounds", m.history_out_of_bounds(100, 150)),
         ("invalid_record_range", m.invalid_record_range(90, 10)),
         (
-            "older_snapshot_broken",
-            m.older_snapshot_broken("not a rope history blob"),
+            "history_base_mismatch",
+            m.history_base_mismatch(0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321),
         ),
         (
             "bad_placeholder",

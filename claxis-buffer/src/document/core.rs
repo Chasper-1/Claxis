@@ -74,14 +74,10 @@ pub struct Document {
     pub(super) sink: Option<Box<dyn SnapshotSink>>,
     pub(super) file: Option<PathBuf>,
     pub(super) snapshots: u64,
+    /// Сколько правок было в памяти на момент последнего снимка.
+    pub(super) snapshot_mark: u32,
     /// Сколько раз документ схлопывался в базу после сохранения.
     pub(super) compacts: u64,
-    /// Сколько раз откат переходил через границу памяти.
-    ///
-    /// Переход означает, что текст сменился целиком: документ взят из
-    /// снимка. Всё, что строилось по тексту по частям — карта строк, например,
-    /// — после такого надо собирать заново, а не править дельтой.
-    pub(super) crossings: u64,
 }
 
 impl Document {
@@ -162,8 +158,8 @@ impl Document {
             sink: None,
             file: None,
             snapshots: 0,
+            snapshot_mark: 0,
             compacts: 0,
-            crossings: 0,
         };
         document.reserve_text_headroom();
         document
@@ -351,7 +347,6 @@ pub(super) mod support {
     #[derive(Debug, Default)]
     pub struct Ring {
         pub written: Vec<(std::path::PathBuf, Vec<u8>, Vec<u8>)>,
-        pub served: usize,
     }
 
     /// Приёмник, умеющий делиться кольцом с тестом: приёмник уезжает внутрь
@@ -367,17 +362,6 @@ pub(super) mod support {
                 .push((path.to_path_buf(), text.to_vec(), history.to_vec()));
             true
         }
-
-        fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
-            let ring = &mut *self.0.borrow_mut();
-            // Снимки лежат по убыванию: последний, предпоследний, и так
-            // далее. В базе они остаются — отсюда просто читаются. Отдаётся
-            // только снимок того же файла: чужому документу он не история.
-            let at = ring.written.len().checked_sub(ring.served + 1)?;
-            ring.served += 1;
-            let (file, _, history) = ring.written.get(at)?;
-            (file == path).then(|| history.clone())
-        }
     }
 
     /// Приёмник для тестов, которым нужен только привязанный файл: снимок
@@ -392,14 +376,6 @@ pub(super) mod support {
             self.accepted
                 .push((path.to_path_buf(), text.to_vec(), history.to_vec()));
             true
-        }
-
-        fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
-            self.accepted
-                .iter()
-                .rev()
-                .find(|(file, _, _)| file == path)
-                .map(|(_, _, history)| history.clone())
         }
     }
 
@@ -419,16 +395,6 @@ pub(super) mod support {
             self.offered
                 .push((path.to_path_buf(), text.to_vec(), history.to_vec()));
             false
-        }
-
-        fn older(&mut self, path: &std::path::Path) -> Option<Vec<u8>> {
-            // Снимков не принимали, поэтому истории старее нет ни для какого
-            // файла. Путь сверяется с журналом попыток, чтобы приёмник не
-            // притворялся немым на заданный вопрос.
-            if self.offered.iter().any(|(file, _, _)| file == path) {
-                return None;
-            }
-            None
         }
     }
 
@@ -801,7 +767,7 @@ mod tests {
             let stored = history::History::capture(&doc);
             let mut back = history::History::decode(stored.as_bytes())
                 .expect("блоб разбирается")
-                .restore(DEFAULT_DEPTH)
+                .restore(b"base", DEFAULT_DEPTH)
                 .expect("документ собирается");
             assert_eq!(
                 back.read(),

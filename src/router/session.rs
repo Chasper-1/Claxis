@@ -83,13 +83,6 @@ struct StoreSink {
     /// кладётся в общую ячейку, документ забирает её после снятия снапшота и
     /// говорит о ней пользователю. Молчаливая потеря работы хуже всего.
     failed: Rc<RefCell<Option<String>>>,
-    /// Снимок, на котором сейчас стоит документ: буфер отката в памяти.
-    ///
-    /// Он же лежит в кольце, но в памяти хранится один — чтобы первая граница
-    /// отката не читала диск. Дальше идут снимки из базы.
-    latest: Option<Stored>,
-    /// Номер, с которого идти в базу: пока не начали, отдаём буфер из памяти.
-    cursor: Option<u64>,
 }
 
 /// Сколько раз пишется снимок, прежде чем признать запись негодной.
@@ -98,14 +91,6 @@ struct StoreSink {
 /// переписали между попытками, переписывание будет затирать чужое. Разница
 /// видна по тому, что именно вернулось, и на пятый раз об этом сказано.
 const WRITE_ATTEMPTS: u32 = 5;
-
-/// Снимок в памяти приёмника.
-#[derive(Debug)]
-struct Stored {
-    /// Номер в кольце: по нему ищем следующий, более старый.
-    seq: u64,
-    history: Vec<u8>,
-}
 
 impl SnapshotSink for StoreSink {
     fn accept(&mut self, file: &Path, text: &[u8], history: &[u8]) -> bool {
@@ -126,23 +111,13 @@ impl SnapshotSink for StoreSink {
                 }
             };
             match self.read_back(file, seq, text, history) {
-                Ok(()) => {
-                    // Новый снимок становится буфером: вытесняет предыдущий из
-                    // памяти, но в кольце предыдущий остаётся.
-                    self.latest = Some(Stored {
-                        seq,
-                        history: history.to_vec(),
-                    });
-                    self.cursor = None;
-                    return true;
-                }
+                Ok(()) => return true,
                 Err(e) => last = Some(e),
             }
         }
         // Пять попыток не помогли. Что именно — известно: ошибка с файлом,
         // номером снимка и обеими суммами, а не «не получилось». Возвращаем
-        // `false`: снимок не сохранён, и буфер обязан оставить историю в
-        // памяти, а не схлопнуть её в никуда.
+        // `false`: снимок не сохранён, история остаётся в памяти.
         // Сюда можно прийти только с ошибкой: каждая попытка либо вернула
         // `true`, либо записала причину в `last`. Если инвариант когда-нибудь
         // сломают, пользователь не получит выдуманный текст на чужом языке.
@@ -150,35 +125,6 @@ impl SnapshotSink for StoreSink {
             *self.failed.borrow_mut() = Some(error.text());
         }
         false
-    }
-
-    fn older(&mut self, file: &Path) -> Option<Vec<u8>> {
-        match self.cursor {
-            // Первая граница отката: документ стоит на последнем снимке, его
-            // история уже в памяти — диск не трогаем.
-            None => {
-                let buffer = self.latest.as_ref()?;
-                self.cursor = Some(buffer.seq);
-                Some(buffer.history.clone())
-            }
-            // Дальше идём по кольцу назад. В базе снимки остаются, их оттуда
-            // просто читают; убирает их кольцо, и только когда придёт новый.
-            Some(from) => match self.store.older(file, from) {
-                Ok(Some(older)) => {
-                    self.cursor = Some(older.seq);
-                    Some(older.history)
-                }
-                // Снимков больше нет: откат дошёл до конца, и это не ошибка.
-                Ok(None) => None,
-                // База не прочиталась: молча оборвать откат значило бы
-                // потерять историю без объяснения. Ошибка уходит туда же,
-                // откуда приходит ошибка записи, — к пользователю.
-                Err(e) => {
-                    *self.failed.borrow_mut() = Some(e.text());
-                    None
-                }
-            },
-        }
     }
 }
 
@@ -387,18 +333,10 @@ impl Document {
 
     /// Отменить правку. Карта строк едет вместе с текстом.
     pub fn undo(&mut self) -> Result<Option<u32>, RopeError> {
-        let crossings = self.buffer.crossings();
         let path = self.buffer.path();
         let Some(id) = self.buffer.undo()? else {
             return Ok(None);
         };
-        // Переход через границу памяти меняет текст целиком: документ взят из
-        // снимка. Дельта от прежнего состояния тут бессмысленна — карту надо
-        // собрать заново из того, что документ теперь содержит.
-        if self.buffer.crossings() != crossings {
-            self.lines = LineMap::build(&self.buffer.read());
-            return Ok(Some(id));
-        }
         // Запись узнаём по её месту в ветке: отмена убрала последнюю.
         if let Some(record) = path.get(path.len().wrapping_sub(1)) {
             self.undo_line(record);
@@ -521,12 +459,11 @@ impl Document {
         self.last_snapshot = self.clock.elapsed();
     }
 
-    /// Снять снапшот, если история в памяти переросла глубину.
+    /// Снять снапшот, если с прошлого прошло достаточно правок.
     ///
     /// Это второй повод для снимка, кроме времени: время сохраняет сессию, а
-    /// глубина не даёт памяти расти без конца. Время сдвигается только когда
-    /// снимок правда снят, — иначе следующий плановый снимок отложился бы
-    /// из-за схлопывания по глубине.
+    /// глубина задаёт шаг между снимками. Время сдвигается только когда снимок
+    /// правда снят, — иначе следующий плановый снимок отложился бы.
     fn snapshot_if_over_depth(&mut self) {
         let before = self.buffer.snapshots_taken();
         self.buffer.snapshot_if_over_depth();
@@ -763,31 +700,29 @@ impl Session {
         let mut buffer = Rope::with_depth(text.clone(), self.history_depth_for_new_documents()?)
             .map_err(SessionError::Buffer)?;
         let mut changed_outside = false;
-        // Снапшот под документом копит не только текст, но и историю правок.
-        // Восстанавливаем её: после перезапуска отменять должно быть можно,
-        // иначе половина работы пользователя просто исчезает.
+        // Снапшот хранит только правки поверх файла. Исходный текст уже прочитан
+        // с диска, поэтому история накладывается на него, а не заменяет его.
         if self.persist
             && let Ok(store) = self.store.reopen()
             && let Ok(Some(snapshot)) = store.latest(&path)
         {
             // Чужой или битый блоб историю не восстановит — и не должен:
-            // текст-то из базы верный, терять его из-за испорченного хвоста
-            // незачем.
+            // файл-то на месте, терять его из-за испорченного хвоста незачем.
             if let Ok(history) = History::decode(&snapshot.history) {
-                match history.base() {
+                match history.matches_base(&text) {
                     // Файл тот же, на котором снят снапшот: применяем.
-                    Ok(base) if base == text.as_slice() => {
+                    Ok(true) => {
                         // Глубина берётся у уже открытого буфера: в снимке её
                         // нет, а восстановленный документ должен снимать
                         // снимки по настройке, а не по умолчанию.
-                        if let Ok(restored) = history.restore(buffer.history_depth()) {
+                        if let Ok(restored) = history.restore(&text, buffer.history_depth()) {
                             buffer = restored;
                         }
                     }
                     // Файл могли поменять снаружи. Применять снапшот нельзя:
                     // правка извне станет невидимой и уедет под следующим
                     // сохранением. Открываем файл как есть и говорим об этом.
-                    Ok(_) => changed_outside = true,
+                    Ok(false) => changed_outside = true,
                     Err(_) => {}
                 }
             }
@@ -808,8 +743,6 @@ impl Session {
                 Box::new(StoreSink {
                     store,
                     failed: Rc::clone(&failed),
-                    latest: None,
-                    cursor: None,
                 }),
             );
             Some(failed)
@@ -942,10 +875,9 @@ mod tests {
     }
 
     #[test]
-    fn the_line_map_is_rebuilt_when_undo_crosses_a_boundary() {
-        // Переход через границу берёт текст из снимка целиком. Если карту
-        // править дельтой от прежнего документа, она разъедется с текстом
-        // сразу же — и разъезд будет невидим до первой отрисовки.
+    fn the_line_map_stays_in_sync_across_snapshots() {
+        // Снимок не меняет текст и не рвёт историю. Карта строк должна
+        // совпадать с текстом после каждого шага отмены.
         let tmp = Temp::new("lines-through-ring");
         let file = tmp.file("a.rs");
         let session = tmp.short_session(3, 1_000);
@@ -967,8 +899,8 @@ mod tests {
             "до отката карта жива"
         );
 
-        // Откатываем так, чтобы пересечь границу памяти.
-        let mut crossed = false;
+        // Откатываем всё до основания, проверяя карту на каждом шаге.
+        let mut undone = false;
         while doc.undo().unwrap().is_some() {
             let fresh = LineMap::build(&doc.text());
             assert_eq!(
@@ -978,9 +910,9 @@ mod tests {
                 doc.text()
             );
             assert_eq!(doc.line_count(), fresh.line_count());
-            crossed = true;
+            undone = true;
         }
-        assert!(crossed, "откат должен был что-то отменить");
+        assert!(undone, "откат должен был что-то отменить");
         assert_eq!(doc.text(), Vec::<u8>::new(), "откатилось всё");
         assert_eq!(
             doc.lines().breaks(),
@@ -990,10 +922,9 @@ mod tests {
     }
 
     #[test]
-    fn undo_walks_back_through_the_snapshots_on_disk() {
-        // Главное: откат не должен кончаться там, где кончилась память.
-        // В памяти снимок один, дальше идёт кольцо на диске — и человек
-        // отматывает всё, что наработал за четыре интервала.
+    fn undo_walks_back_through_all_edits() {
+        // Снимки не обрезают память: человек отматывает всё, что наработал,
+        // хотя на диск легли четыре снимка.
         let tmp = Temp::new("undo-through-ring");
         let file = tmp.file("a.rs");
         let session = tmp.short_session(4, 1_000);
@@ -1010,19 +941,19 @@ mod tests {
         }
         assert_eq!(session.store().count(&file).unwrap(), 4, "кольцо полное");
 
-        // Теперь четыре правки назад — через четыре границы памяти.
+        // Теперь четыре правки назад — вся история ещё в памяти.
         for _ in 0..4 {
             doc.undo()
                 .unwrap()
-                .expect("откат через кольцо должен продолжаться");
+                .expect("откат по истории должен продолжаться");
         }
         assert!(doc.text().is_empty(), "откатилось не всё");
     }
 
     #[test]
-    fn undo_stops_when_the_ring_runs_out() {
-        // Дальше первого снимка идти некуда, и это должно быть понятно, а не
-        // выглядеть как зависшая отмена.
+    fn undo_stops_after_the_last_edit() {
+        // Дальше основания истории идти некуда, и это должно быть понятно,
+        // а не выглядеть как зависшая отмена.
         let tmp = Temp::new("undo-ring-end");
         let file = tmp.file("a.rs");
         let session = tmp.short_session(4, 1_000);
@@ -1034,20 +965,18 @@ mod tests {
         assert_eq!(doc.buffer().snapshots_taken(), 1, "снимок снят");
         assert_eq!(session.store().count(&file).unwrap(), 1, "и лежит в кольце");
 
-        doc.undo()
-            .unwrap()
-            .expect("правка отменяется через снимок из кольца");
+        doc.undo().unwrap().expect("правка отменяется по истории");
         assert!(doc.text().is_empty(), "первая правка откатилась");
         assert!(
             doc.undo().unwrap().is_none(),
-            "снимок один, за ним откатываться некуда"
+            "правка одна, дальше откатываться некуда"
         );
     }
 
     #[test]
-    fn no_snapshots_at_all_means_undo_stops_at_the_first_snapshot() {
-        // `keep = 0` — снимки на диск не пишутся. Откат тогда упирается в
-        // память: это честное «дальше некуда», а не выдуманная граница.
+    fn without_snapshots_undo_stops_at_the_base() {
+        // `keep = 0` — снимки на диск не пишутся. Откат всё равно идёт по
+        // памяти до основания: это честное «дальше некуда».
         let tmp = Temp::new("undo-no-ring");
         let file = tmp.file("a.rs");
         let session = tmp.no_persist_session(0, 1_000);
@@ -1070,8 +999,7 @@ mod tests {
     #[test]
     fn without_a_ring_the_memory_keeps_the_whole_undo_chain() {
         // `keep = 0` — это «снимков не делаем», а не «снимки делаем и роняем
-        // историю». Без кольца схлопывать нечего и нельзя: иначе отменять
-        // было бы нечем, а правки пропали бы безвозвратно.
+        // историю». Без кольца история остаётся в памяти целиком.
         let tmp = Temp::new("no-ring-history");
         let file = tmp.file("a.rs");
         let session = tmp.session(0);
@@ -1194,10 +1122,15 @@ mod tests {
 
         let snaps = session.store().list(&file).unwrap();
         assert!(!snaps.is_empty(), "снапшот должен оказаться в базе");
+        assert!(snaps[0].text.is_empty(), "исходный текст в базу не пишется");
+        let restored = crate::api::buffer::History::decode(&snaps[0].history)
+            .unwrap()
+            .restore(b"", crate::api::buffer::DEFAULT_DEPTH)
+            .unwrap();
         assert_eq!(
-            snaps[0].text,
+            restored.read(),
             "abc".repeat(typed).into_bytes(),
-            "в базе лежит всё, что набрано к моменту снапшота"
+            "набранное восстанавливается из истории"
         );
     }
 
@@ -1214,7 +1147,12 @@ mod tests {
             let session = tmp.session(3);
             let snaps = session.store().list(&file).unwrap();
             assert!(!snaps.is_empty(), "после перезапуска снапшоты должны быть");
-            assert_eq!(snaps[0].text.len(), typed * 2);
+            assert!(snaps[0].text.is_empty(), "текст в базе не хранится");
+            let restored = crate::api::buffer::History::decode(&snaps[0].history)
+                .unwrap()
+                .restore(b"", crate::api::buffer::DEFAULT_DEPTH)
+                .unwrap();
+            assert_eq!(restored.read().len(), typed * 2);
         }
     }
 
@@ -1253,8 +1191,9 @@ mod tests {
 
         let sa = session.store().latest(&a).unwrap().expect("снапшот a");
         let sb = session.store().latest(&b).unwrap().expect("снапшот b");
-        assert!(sa.text.starts_with(b"a"));
-        assert!(sb.text.starts_with(b"b"));
+        assert!(sa.text.is_empty());
+        assert!(sb.text.is_empty());
+        assert_ne!(sa.history, sb.history, "истории не должны совпасть");
     }
 
     #[test]
@@ -1337,10 +1276,10 @@ mod tests {
     }
 
     #[test]
-    fn the_depth_starts_a_new_history_in_a_snapshot() {
-        // Два повода для снимка: время сохраняет сессию, а глубина не даёт
-        // истории расти без конца. Здесь часы стоят, значит снимок делает
-        // именно глубина.
+    fn the_depth_takes_snapshots_without_cutting_history() {
+        // Два повода для снимка: время сохраняет сессию, а глубина задаёт шаг
+        // между снимками. История из памяти не уходит — иначе восстановить её
+        // после перезапуска было бы не из чего.
         let tmp = Temp::new("depth-snapshot");
         let file = tmp.file("a.rs");
         let session = tmp.short_session(3, 4);
@@ -1358,16 +1297,15 @@ mod tests {
             2,
             "глубина переросла дважды и каждый раз снимался снимок"
         );
-        assert!(
-            doc.buffer().path().len() <= 4,
-            "в памяти не больше глубины правок"
+        assert_eq!(
+            doc.buffer().path().len(),
+            10,
+            "история целиком осталась в памяти"
         );
         assert_eq!(doc.text().len(), 10, "текст цел");
 
-        // История старше снимка сохранена: откат проходит через границу до
-        // самого начала.
         for _ in 0..10 {
-            doc.undo().unwrap().expect("откат идёт через снимки");
+            doc.undo().unwrap().expect("откат идёт по памяти");
         }
         assert!(doc.undo().unwrap().is_none(), "дальше отменять нечего");
         assert!(doc.text().is_empty(), "дошли до пустого документа");
@@ -1375,8 +1313,8 @@ mod tests {
 
     #[test]
     fn a_full_history_without_a_sink_keeps_the_edits() {
-        // Без приёмника снимку некуда уйти. Тогда история не обрезается:
-        // терять возможность отменить ради памяти нельзя.
+        // Без приёмника снимку некуда уйти. История при этом остаётся в
+        // памяти: терять возможность отменить нельзя.
         let tmp = Temp::new("depth-no-sink");
         let file = tmp.file("a.rs");
         let session = tmp.no_persist_session(3, 4);
@@ -1493,7 +1431,7 @@ mod tests {
             doc.insert(end, b"z").unwrap();
         }
         doc.snapshot();
-        // Приёмника нет, значит и снимка нет: память не схлопывается.
+        // Приёмника нет, значит и снимка нет: история остаётся в памяти.
         assert_eq!(
             doc.buffer().snapshots_taken(),
             0,
@@ -1625,7 +1563,7 @@ mod tests {
 
         let session2 = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
         let doc = session2.open_file(&file).unwrap();
-        assert_eq!(doc.text(), b"abcXY\n", "текст из снапшота");
+        assert_eq!(doc.text(), b"abcXY\n", "история легла поверх файла");
         assert!(!doc.changed_outside(), "файл не меняли, ложной тревоги нет");
     }
 
@@ -1678,7 +1616,7 @@ mod tests {
         // И разбирается тем же кодом, без потерь.
         let restored = crate::api::buffer::History::decode(&snapshot.history)
             .expect("блоб из базы — наш")
-            .restore(crate::api::buffer::DEFAULT_DEPTH)
+            .restore(b"abc\n", crate::api::buffer::DEFAULT_DEPTH)
             .expect("документ собирается");
         assert_eq!(restored.read(), b"abcXY\n");
     }
@@ -1974,11 +1912,9 @@ mod tests {
                     done = format!("заменить {at}..{} на {typed:?}", at + len);
                 }
                 3 => {
-                    // Снапшот схлопывает память, и карта строк после него
+                    // Снапшот не меняет текст, и карта строк после него
                     // обязана остаться в силе. Эталон делает то же самое:
-                    // история правок в памяти обрезается, а дальше откат идёт
-                    // через кольцо — здесь его нет, потому что снимки на
-                    // диск не пишутся.
+                    // история правок остаётся в памяти.
                     doc.snapshot();
                     history.clear();
                     done = "снапшот".to_string();

@@ -182,19 +182,12 @@ impl Document {
 
     /// Отменить одну правку обратной операцией.
     ///
-    /// Отмена не заканчивается там, где кончилась память: дойдя до конца,
-    /// документ подтягивает из приёмника снимок старее и продолжает откат с
-    /// него. В памяти лежит всего один снимок, поэтому переход за границу
-    /// читает диск — но он происходит один раз на снимок, а не на правку.
+    /// История целиком живёт в памяти: снимок её не обрезает. Дойдя до
+    /// основания, отмена заканчивается.
     pub fn undo(&mut self) -> Result<Option<u32>> {
         self.ensure_node_room()?;
-        // Границ может быть сколько угодно подряд, и каждая со своим пустым
-        // хвостом истории. Цикл, а не рекурсия: иначе глубина стека равнялась
-        // бы числу снимков.
-        while self.current == NIL {
-            if !self.step_over_the_boundary_once()? {
-                return Ok(None);
-            }
+        if self.current == NIL {
+            return Ok(None);
         }
         let id = self.current;
         let parent = self.versions[id as usize].parent;
@@ -237,45 +230,6 @@ impl Document {
             }
         }
         Ok(Some(id))
-    }
-
-    /// Перейти за границу памяти один раз: подтянуть снимок старее.
-    ///
-    /// `false` — снимков больше нет. Отмену сама не делает: её выполняет цикл
-    /// [`Document::undo`], чтобы не уходить в рекурсию на глубину снимков.
-    fn step_over_the_boundary_once(&mut self) -> Result<bool> {
-        let Some(file) = self.file.clone() else {
-            return Ok(false);
-        };
-        let Some(sink) = self.sink.as_mut() else {
-            return Ok(false);
-        };
-        let Some(history) = sink.older(&file) else {
-            return Ok(false);
-        };
-        let depth = self.depth;
-        let snapshot = crate::history::History::decode(&history)
-            .and_then(|h| h.restore(depth))
-            .map_err(|reason| Error::OlderSnapshotBroken {
-                reason: Box::new(reason),
-            })?;
-        // Счётчики принадлежат документу, а не снимку: снимок — это состояние
-        // текста, а не новая сессия. Сбросить их значило бы соврать так же, как
-        // врал счётчик самих снимков.
-        let snapshots = self.snapshots;
-        let compacts = self.compacts;
-        let sink = self.sink.take();
-        let file = self.file.clone();
-        let crossings = self.crossings;
-        *self = snapshot;
-        // Приёмник и путь переживают смену документа: они принадлежат файлу,
-        // а не состоянию. Без них следующая граница была бы последней.
-        self.sink = sink;
-        self.file = file;
-        self.crossings = crossings + 1;
-        self.snapshots = snapshots;
-        self.compacts = compacts;
-        Ok(true)
     }
 
     /// Проверить, что кусок `from..from+len` есть в буфере и что копия
@@ -874,7 +828,7 @@ mod tests {
         doc.replace(0, cut, "новый".as_bytes()).unwrap();
         let history = history::History::capture(&doc);
         let mut back = history
-            .restore(crate::DEFAULT_DEPTH)
+            .restore("исходный текст".as_bytes(), crate::DEFAULT_DEPTH)
             .expect("снапшот разбирается");
         assert_eq!(back.read(), "новый текст".as_bytes());
         back.undo().unwrap().expect("история живая");

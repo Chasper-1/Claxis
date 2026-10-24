@@ -14,63 +14,51 @@ impl Document {
 
     // ── снапшот ──────────────────────────────────────────────────────────
 
-    /// Снять снапшот: текст и вся история уезжают, память встаёт на место снимка.
+    /// Снять снапшот: в хранилище уходят только правки поверх файла.
     ///
-    /// В памяти остаётся **один** снимок — тот, что снят последним, — и он же
-    /// лежит в кольце на диске. Откат доходит до него по памяти, а уйти дальше
-    /// приёмник отдаёт из базы следующий: в базе он уже есть, его читают, а не
-    /// забирают.
+    /// Исходный текст не собирается и не пишется: он лежит в файле, а история
+    /// хранит лишь хвост изменений и их записи. Память снимок не меняет —
+    /// история остаётся на месте, и отменять по-прежнему можно.
     pub fn snapshot(&mut self) {
-        // Куда уходить снимку, проверяется до сборки текста и истории: без
-        // приёмника собирать нечего, а обход документа стоит его длины. Сюда
-        // заглядывают после каждой правки (проверка глубины), поэтому здесь
-        // ни копий, ни сборки.
         let Some(file) = self.file.clone() else {
-            // Снимку некуда уйти, значит он не сделан. Схлопывать память
-            // тогда нельзя: история нигде не лежит и пропала бы вместе с
-            // возможностью отменить.
             return;
         };
         if self.sink.is_none() {
             return;
         }
-        let document = self.read();
         let history = crate::history::History::capture(self);
         let stored = self
             .sink
             .as_mut()
-            .is_some_and(|sink| sink.accept(&file, &document, history.as_bytes()));
+            .is_some_and(|sink| sink.accept(&file, &[], history.as_bytes()));
         if !stored {
-            // Снимок не лёг: история осталась только в памяти. Схлопывать её
-            // нельзя — иначе отменять будет нечего, а работа потеряна.
             return;
         }
         self.snapshots += 1;
-        // Готовый текст снимка идёт в схлопывание: второй раз документ не
-        // собирается.
-        self.compact_with(document);
+        self.snapshot_mark = self.history_used();
     }
 
-    /// Снять снапшот, если правок в памяти набралось больше глубины.
+    /// Снять снапшот, если после прошлого снимка прошло больше глубины правок.
     ///
-    /// Глубина — это предел памяти, а не расписания: снапшот по времени
-    /// сохраняет сессию, а этот — не даёт истории расти без конца.
-    ///
-    /// Без приёмника снапшот не делается (см. [`Document::snapshot`]), и
-    /// история продолжает расти: терять возможность отменить ради экономии
-    /// памяти нельзя.
+    /// Глубина здесь — шаг между снимками, а не предел памяти: история в
+    /// памяти не обрезается, иначе восстанавливать её было бы не из чего.
     pub fn snapshot_if_over_depth(&mut self) {
-        if self.history_is_full() {
+        if self.history_is_full()
+            && self.history_used().saturating_sub(self.snapshot_mark) > self.depth
+        {
             self.snapshot();
         }
     }
 
-    /// Схлопнуть документ в одну базу и обрезать историю в памяти.
+    /// Схлопнуть документ в текущий текст и обрезать историю в памяти.
     ///
-    /// Память не должна расти вместе с правками, поэтому после снимка
-    /// история обрезается, а то, что было до неё, лежит в снимке. Текст уже
-    /// собран вызывающим — тот, кто снимал снимок, читал документ и для
-    /// приёмника.
+    /// Отдельная операция после сохранения файла: только тогда старый текст
+    /// перестаёт быть нужен для восстановления. Снапшот её не трогает.
+    pub fn compact(&mut self) {
+        let document = self.read();
+        self.compact_with(document);
+    }
+
     fn compact_with(&mut self, document: Vec<u8>) {
         self.bytes = document;
         self.reserve_text_headroom();
@@ -86,6 +74,7 @@ impl Document {
         self.versions[0].parent = NIL;
         self.versions[0].child = NIL;
         self.current = 0;
+        self.snapshot_mark = 0;
         self.compacts += 1;
     }
 
@@ -97,14 +86,6 @@ impl Document {
     /// Сколько раз документ схлопывался после сохранения.
     pub fn compacts_taken(&self) -> u64 {
         self.compacts
-    }
-
-    /// Сколько раз откат переходил через границу памяти.
-    ///
-    /// Число растёт, когда текст сменился целиком: значит, всё построенное по
-    /// тексту по частям после этого уже не годится.
-    pub fn crossings(&self) -> u64 {
-        self.crossings
     }
 
     // ── диагностика ──────────────────────────────────────────────────────
@@ -154,10 +135,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn undo_crosses_the_memory_boundary_into_the_ring() {
-        // Три снимка, между ними по одной правке. В памяти после каждого
-        // снимка пусто, но откат идёт дальше по кольцу — и не должен кончаться
-        // на границе.
+    fn a_snapshot_leaves_the_history_in_memory() {
+        // Снимок только пишет правки в хранилище. История в памяти остаётся,
+        // поэтому откат идёт по ней, а не по кольцу.
         let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
         let mut doc = Document::new(b"abc").unwrap();
         doc.set_sink(
@@ -169,21 +149,26 @@ mod tests {
             doc.snapshot();
         }
         assert_eq!(ring.borrow().written.len(), 3, "все три в кольце");
-        assert_eq!(doc.path().len(), 0, "в памяти пусто");
+        assert_eq!(doc.path().len(), 3, "история осталась в памяти");
+        assert!(
+            ring.borrow()
+                .written
+                .iter()
+                .all(|(_, text, _)| text.is_empty()),
+            "исходный текст в хранилище не пишется"
+        );
 
-        doc.undo().unwrap().expect("откат за границу памяти");
-        assert_eq!(doc.read(), b"abcxx");
-        doc.undo().unwrap().expect("и следующий снимок");
-        assert_eq!(doc.read(), b"abcx");
-        doc.undo().unwrap().expect("и третий");
-        assert_eq!(doc.read(), b"abc");
-        assert!(doc.undo().unwrap().is_none(), "дальше снимков нет");
+        for expected in [b"abcxx".as_slice(), b"abcx", b"abc"] {
+            doc.undo().unwrap().expect("откат идёт по памяти");
+            assert_eq!(doc.read(), expected);
+        }
+        assert!(doc.undo().unwrap().is_none(), "дальше правок нет");
     }
 
     #[test]
-    fn an_undo_that_crosses_the_boundary_stays_in_memory() {
-        // После перехода через границу отказ должен продолжать работать
-        // в том же сеансе: границ сколько угодно, и каждая не конец света.
+    fn snapshots_do_not_interrupt_undo() {
+        // Сколько бы снимков ни было, отмена доходит до начала по памяти:
+        // снимок не создаёт границу.
         let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
         let mut doc = Document::new(b"").unwrap();
         doc.set_sink(
@@ -204,10 +189,9 @@ mod tests {
     }
 
     #[test]
-    fn crossing_the_boundary_keeps_the_depth_and_the_counters() {
+    fn a_snapshot_keeps_the_depth_and_the_counters() {
         // Снимок — это состояние текста, а не новая сессия. Глубина истории и
-        // счётчики снимков принадлежат документу и обязаны пережить переход
-        // через границу памяти, иначе настройка теряется, а счётчики врут.
+        // счётчики снимков принадлежат документу и не меняются от снимка.
         let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
         let mut doc = Document::with_depth(b"abc", 5).unwrap();
         doc.set_sink(
@@ -219,9 +203,9 @@ mod tests {
             doc.snapshot();
         }
         assert_eq!(doc.snapshots_taken(), 3);
-        assert_eq!(doc.path().len(), 0, "в памяти пусто");
+        assert_eq!(doc.path().len(), 3, "история осталась в памяти");
 
-        doc.undo().unwrap().expect("откат за границу памяти");
+        doc.undo().unwrap().expect("откат идёт");
         assert_eq!(doc.history_depth(), 5, "глубина истории пережила снимок");
         assert_eq!(doc.snapshots_taken(), 3, "счётчик снимков не сброшен");
     }
@@ -345,8 +329,8 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_carries_text_and_history() {
-        // Снапшот уносит состояние целиком: и текст, и историю. Без истории
+    fn a_snapshot_carries_history() {
+        // Снапшот уносит историю правок, а не копию файла. Без истории
         // документ верный, а отменять нечего.
         let (text, history) = {
             let mut doc = d("abc");
@@ -356,7 +340,6 @@ mod tests {
             );
             doc.insert(3, b"XY").unwrap();
             doc.delete(0, 1).unwrap();
-            // История снимается до снапшота: снимок её уводит, это его смысл.
             let history = history::History::capture(&doc);
             let text = doc.read();
             doc.snapshot();
@@ -365,17 +348,18 @@ mod tests {
         };
         assert_eq!(text, b"bcXY");
 
-        let mut back = history.restore(DEFAULT_DEPTH).expect("снапшот разбирается");
+        let mut back = history
+            .restore(b"abc", DEFAULT_DEPTH)
+            .expect("снапшот разбирается");
         assert_eq!(back.read(), text);
         back.undo().unwrap().expect("история восстановлена");
         assert_eq!(back.read(), b"abcXY");
     }
 
     #[test]
-    fn a_snapshot_keeps_only_the_newest_edit_in_memory() {
-        // Снапшот схлопывает память: всё, что было до него, уезжает в кольцо,
-        // а в памяти остаётся ровно один снимок. Откат доходит до него без
-        // диска, дальше — приёмник отдаёт следующий из базы.
+    fn a_snapshot_does_not_cut_the_history() {
+        // Снимок ничего не удаляет из памяти: вся история остаётся, и откат
+        // может пройти её целиком.
         let mut doc = Document::with_depth(b"abc", 4).unwrap();
         doc.set_sink(
             std::path::PathBuf::from("/tmp/d.txt"),
@@ -388,7 +372,7 @@ mod tests {
 
         doc.snapshot();
         assert_eq!(doc.snapshots_taken(), 1, "по прямой просьбе снимается");
-        assert_eq!(doc.path().len(), 0, "в памяти один снимок и ничего");
+        assert_eq!(doc.path().len(), 100, "история осталась в памяти");
         assert_eq!(doc.read().len(), 103, "текст на месте");
     }
 
@@ -413,10 +397,9 @@ mod tests {
     }
 
     #[test]
-    fn the_history_overflows_into_a_snapshot_by_depth() {
-        // Глубина — предел памяти, а не расписания: как только правок стало
-        // больше, чем разрешено, история уезжает в снимок, а память
-        // возвращается. Без этого история росла бы вместе с правками.
+    fn the_history_is_snapshotted_every_depth_edits() {
+        // Глубина здесь — шаг между снимками. История из памяти не уходит,
+        // поэтому следующий снимок снимается после ещё стольких же правок.
         let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
         let mut doc = Document::with_depth(b"abc", 4).unwrap();
         doc.set_sink(
@@ -434,13 +417,26 @@ mod tests {
         doc.insert(doc.len(), b"x").unwrap();
         doc.snapshot_if_over_depth();
         assert_eq!(ring.borrow().written.len(), 1, "глубина переросла");
-        assert_eq!(doc.path().len(), 0, "история обрезана в памяти");
+        assert_eq!(doc.path().len(), 5, "история осталась в памяти");
         assert_eq!(doc.read(), b"abcxxxxx");
 
-        // Откат через границу по-прежнему доходит до начала: снимок — это
-        // сохранённая история, а не обрыв.
-        for _ in 0..5 {
-            doc.undo().unwrap().expect("откат идёт через снимок");
+        for _ in 0..4 {
+            doc.insert(doc.len(), b"x").unwrap();
+            doc.snapshot_if_over_depth();
+        }
+        assert_eq!(
+            ring.borrow().written.len(),
+            1,
+            "следующий шаг ещё не набран"
+        );
+        doc.insert(doc.len(), b"x").unwrap();
+        doc.snapshot_if_over_depth();
+        assert_eq!(ring.borrow().written.len(), 2, "снимок продолжает историю");
+
+        for expected in 0..10 {
+            doc.undo().unwrap().expect("откат идёт по памяти");
+            let tail = "x".repeat(9 - expected);
+            assert_eq!(doc.read(), format!("abc{tail}").into_bytes());
         }
         assert_eq!(doc.read(), b"abc");
         assert!(doc.undo().unwrap().is_none());
@@ -448,9 +444,8 @@ mod tests {
 
     #[test]
     fn a_refused_snapshot_keeps_the_history() {
-        // Снимок не лёг: история осталась только в памяти, и схлопывать её
-        // нельзя. Иначе отменять было бы нечем — на диске ведь ничего нет, и
-        // работа потеряна. Потерять историю нельзя ни при каких условиях.
+        // Снимок не лёг: история осталась в памяти. Терять её нельзя ни при
+        // каких условиях — иначе отменять будет нечем.
         let mut doc = Document::with_depth(b"abc", 4).unwrap();
         doc.set_sink(
             std::path::PathBuf::from("/tmp/d.txt"),
@@ -488,8 +483,8 @@ mod tests {
 
     #[test]
     fn a_snapshot_leaves_undo_working_after_it() {
-        // Главное про память: отмена после снимка живая. Дальше по границу
-        // уходит приёмник, а не обрыв цепочки.
+        // Главное про память: отмена после снимка живая, история никуда не
+        // делась.
         let mut doc = Document::new(b"abc").unwrap();
         doc.set_sink(
             std::path::PathBuf::from("/tmp/d.txt"),
@@ -505,9 +500,9 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_snapshot_replaces_the_previous_one_in_memory() {
-        // В памяти снимок один: новый вытесняет старый, но старый остаётся в
-        // кольце. Откат за границу идёт по ним в порядке убывания.
+    fn snapshots_do_not_drop_edits_from_memory() {
+        // Каждый снимок пишет продолжение истории, а не начинает её заново.
+        // В памяти остаются все правки.
         let mut doc = Document::new(b"abc").unwrap();
         doc.set_sink(
             std::path::PathBuf::from("/tmp/d.txt"),
@@ -518,7 +513,7 @@ mod tests {
             doc.snapshot();
         }
         assert_eq!(doc.snapshots_taken(), 5);
-        assert_eq!(doc.path().len(), 0, "в памяти один снимок, не пять");
+        assert_eq!(doc.path().len(), 5, "в памяти все пять правок");
         assert_eq!(doc.read(), b"abcxxxxx");
     }
 
@@ -686,7 +681,7 @@ mod tests {
             }
             let text = doc.read();
             let captured = history::History::capture(&doc);
-            let mut back = captured.restore(DEFAULT_DEPTH)?;
+            let mut back = captured.restore("начало".as_bytes(), DEFAULT_DEPTH)?;
             assert_eq!(back.read(), text, "seed {seed}: текст разошёлся");
             assert_eq!(
                 back.path().len(),
@@ -712,10 +707,9 @@ mod tests {
 
     #[test]
     fn the_tree_stays_sound_across_snapshots_and_undos() -> Result<()> {
-        // Снимок схлопывает дерево в один лист, а откат за границу памяти
-        // собирает текст заново из снимка. После каждого шага дерево обязано
-        // остаться связным и ровно покрыть текст: ошибка тут всплывает не
-        // сразу, а после серии снимков и переходов.
+        // Снимок не трогает дерево, а откат идёт по истории в памяти. После
+        // каждого шага дерево обязано остаться связным и ровно покрыть текст:
+        // ошибка тут всплывает не сразу, а после серии снимков и отмен.
         for seed in 0..6u64 {
             let ring = std::rc::Rc::new(std::cell::RefCell::new(Ring::default()));
             let mut rng = Rng(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
@@ -758,8 +752,7 @@ mod tests {
             }
 
             // Откат до основания: текст обязан вернуться байт в байт, а дерево
-            // — оставаться связным на каждом шаге, в том числе за границами
-            // памяти.
+            // — оставаться связным на каждом шаге.
             while doc.undo()?.is_some() {
                 let stats = doc.tree_debug_stats().expect("дерево не зациклено");
                 assert!(
