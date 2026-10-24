@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use claxis_buffer::Document;
+use claxis_buffer::{Document, Sink};
 
 /// Число **вставок**, а не листьев: лист появляется там, где вставка режет
 /// существующий диапазон, и их всегда больше, чем вставок.
@@ -13,10 +13,19 @@ const INSERTS: [u32; 3] = [1_000, 4_000, 8_000];
 const ROUNDS: u32 = 20_000;
 
 /// Тот же документ, что и у буфера: 500 КБ основания и рассеянные вставки.
+///
+/// Позиция берётся из хеша, а не `i * 37`: шаг 37 при 8 тыс. вставок уходит
+/// меньше чем на 300 КБ, и середина документа остаётся одним куском. Тогда
+/// бенч диапазона сравнивает разное число листьев и врёт.
 fn document(n: u32) -> Document {
     let mut doc = Document::new(vec![b'a'; 500_000]).expect("valid document");
-    for i in 0..n {
-        doc.insert((i * 37) % (doc.len() + 1), b"xx").unwrap();
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..n {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let pos = ((seed >> 32) as u32) % (doc.len() + 1);
+        doc.insert(pos, b"xx").unwrap();
     }
     doc
 }
@@ -65,11 +74,20 @@ fn bench_insert() {
     }
 }
 
+/// Считает, из скольких листьев состоит диапазон.
+struct Pieces(usize);
+
+impl Sink for Pieces {
+    fn range(&mut self, _start: u32, _len: u32) {
+        self.0 += 1;
+    }
+}
+
 fn bench_read() {
     println!("--- чтение ---");
     println!(
-        "{:>9} | {:>8} | {:>9} | {:>10} | {:>10}",
-        "вставок", "листьев", "байт", "всё целиком", "диапазон"
+        "{:>9} | {:>8} | {:>9} | {:>10} | {:>10} | {:>8}",
+        "вставок", "листьев", "байт", "всё целиком", "диапазон", "кусков"
     );
     for target in INSERTS {
         let doc = document(target);
@@ -84,6 +102,8 @@ fn bench_read() {
         let full = start.elapsed() / 50;
 
         let mid = doc.len() / 2;
+        let mut pieces = Pieces(0);
+        doc.read_range_into(mid, mid + 4096, &mut pieces);
         let part_start = Instant::now();
         for _ in 0..50 {
             let text = doc.read_range(mid, mid + 4096);
@@ -92,12 +112,13 @@ fn bench_read() {
         let part = part_start.elapsed() / 50;
 
         println!(
-            "{:>9} | {:>8} | {:>9} | {:>10} | {:>10}",
+            "{:>9} | {:>8} | {:>9} | {:>10} | {:>10} | {:>8}",
             target,
             leaves,
             bytes,
             fmt(full),
-            fmt(part)
+            fmt(part),
+            pieces.0
         );
     }
 }
