@@ -41,16 +41,15 @@ impl Tree {
         let (left_height, right_height) = (left_node.height(), right_node.height());
         if left_height > right_height + 1 {
             let middle = self.concat(left_node.right(), right);
-            let joined = self.make_branch(left_node.left(), middle);
-            self.release(left);
+            // `left` уже уходит из дерева: новый узел занимает его слот.
+            let joined = self.make_branch_or_reuse(left, left_node.left(), middle);
             // Свежий узел после спуска по правому ребёнку может разъехаться
             // на два: классический join обязан повернуть на каждом уровне, а
             // не только на верхнем. Без этого перекос копится в глубине.
             self.rebalance(joined)
         } else if right_height > left_height + 1 {
             let middle = self.concat(left, right_node.left());
-            let joined = self.make_branch(middle, right_node.right());
-            self.release(right);
+            let joined = self.make_branch_or_reuse(right, middle, right_node.right());
             self.rebalance(joined)
         } else {
             self.make_branch(left, right)
@@ -112,19 +111,26 @@ impl Tree {
             }
         } else {
             let (left, right) = (node.left(), node.right());
+            let old_height = node.height();
             let right_start = subtree_start + self.node_text_len(left);
             // Ровно на границе идём вправо: точка вставки — начало правого
             // поддерева. Иначе вставка в конец всегда уходила бы влево и
             // дерево вырождалось бы в список.
             let updated = if pos < right_start {
                 let left = self.insert_at(left, subtree_start, pos, leaf);
-                self.make_branch(left, right)
+                self.make_branch_or_reuse(id, left, right)
             } else {
                 let right = self.insert_at(right, right_start, pos, leaf);
-                self.make_branch(left, right)
+                self.make_branch_or_reuse(id, left, right)
             };
-            self.release(id);
-            self.rebalance(updated)
+            // Высота не выросла — перекос выше не появился, и поднимать
+            // повороты дальше незачем. Длину родителя всё равно обновит
+            // `make_branch_or_reuse` на следующем уровне.
+            if self.node_height(updated) == old_height {
+                updated
+            } else {
+                self.rebalance(updated)
+            }
         }
     }
 

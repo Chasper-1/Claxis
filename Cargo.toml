@@ -1,5 +1,9 @@
 [workspace]
 members = ["claxis-text", "claxis-core", "claxis-buffer", "claxis-disk", "claxis-input", "claxis-term", "claxis-i18n", "claxis-theme", "claxis-config", "claxis-commands"]
+# `cargo bench` без флагов должен запускать бенчмарки ядра и буфера, а не
+# только тестовую обвязку корневого пакета. Остальные команды по-прежнему
+# ходят по всему workspace явно.
+default-members = [".", "claxis-core", "claxis-buffer"]
 
 [package]
 name = "Claxis"

@@ -184,6 +184,16 @@ impl Tree {
 
     /// Новая ветка над двумя поддеревьями: длина и высота считаются сами.
     fn make_branch(&mut self, left: u32, right: u32) -> u32 {
+        self.make_branch_or_reuse(NIL, left, right)
+    }
+
+    /// Ветка над двумя поддеревьями: занять `id`, если это уже ветка.
+    ///
+    /// На пути вставки старый узел всё равно уходит из дерева. Переписать его
+    /// на месте дешевле, чем сначала взять слот под новую ветку, а потом
+    /// вернуть старый в пул: на локальной правке так исчезает почти весь
+    /// оборот узлов, даже если дети поменялись.
+    fn make_branch_or_reuse(&mut self, id: u32, left: u32, right: u32) -> u32 {
         // Оба ребёнка читаются из пула один раз: и длина, и высота лежат в
         // самом узле, а лишние обращения — это лишние проверки границ в самом
         // горячем пути.
@@ -201,7 +211,13 @@ impl Tree {
         };
         let len = left_len + right_len;
         let height = 1 + left_height.max(right_height);
-        self.alloc_node(Node::branch(left, right, len, height))
+        let branch = Node::branch(left, right, len, height);
+        if id != NIL && !self.nodes[id as usize].is_leaf() {
+            self.nodes[id as usize] = branch;
+            id
+        } else {
+            self.alloc_node(branch)
+        }
     }
 
     /// Выделить лист.
@@ -720,6 +736,26 @@ mod tests {
         tree.insert_leaf(tree.len, last);
         assert_eq!(tree.len, 9);
         assert_eq!(tree.leaf_end(), 9);
+    }
+
+    #[test]
+    fn a_local_insert_keeps_the_branch_slot() {
+        // Вставка в конец правого листа не меняет высоту ветки. Старый узел
+        // должен быть переписан на месте, а не заменён новым слотом из пула.
+        let mut tree = Tree::new();
+        let left = tree.alloc_leaf(0, 2);
+        let right = tree.alloc_leaf(10, 2);
+        tree.root = tree.concat(left, right);
+        tree.len = 4;
+        let root = tree.root;
+
+        let tail = tree.alloc_leaf(12, 1);
+        tree.insert_leaf(4, tail);
+
+        assert_eq!(tree.root, root, "корень переехал на другой слот");
+        assert_eq!(tree.len, 5);
+        assert_eq!(tree.leaves, 2);
+        assert!(tree.debug_sound());
     }
 
     #[test]
