@@ -30,7 +30,7 @@
 
 ## Требования к терминалу
 
-Нужен kitty keyboard protocol: kitty, WezTerm, foot, Ghostty, конфигурация
+Нужен [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/): kitty, WezTerm, foot, Ghostty, конфигурация
 Windows Terminal. Остальные получают внятное сообщение и отказ.
 
 ## Сборка
