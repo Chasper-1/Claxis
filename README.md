@@ -55,9 +55,13 @@ claxis help       # справка
 - [MVP и roadmap](docs/Ru/mvp.md) — что делается сейчас и в каком порядке.
 - [Философия](docs/Ru/philosophy.md) — зачем редактор и чего в нём не будет.
 - [Архитектура](docs/Ru/architecture.md) — крейты и границы между ними.
-- [Буфер](docs/Ru/buffer.md), [буфер и курсоры](docs/Ru/buffer-and-cursors.md).
-- [Конфиг](docs/Ru/config.md) — [локализация](docs/Ru/i18n.md).
-- [Модель ввода](docs/Ru/modes.md) — [система команд](docs/Ru/command-system.md).
-- [Плагины и макросы](docs/Ru/plugins.md) — [обучение](docs/Ru/tutorial.md).
+- [Буфер](docs/Ru/buffer.md) — устройство буфера редактора.
+- [буфер и курсоры](docs/Ru/buffer-and-cursors.md) — дополнение к прошлому описанию буфера.
+- [Конфиг](docs/Ru/config.md) — как настраивается редактор, темы и переводы.
+- [локализация](docs/Ru/i18n.md) — подробности и работа локализации.
+- [Модель ввода](docs/Ru/modes.md) — управление редактором и модальность.
+- [система команд](docs/Ru/command-system.md) — основная система управления редактором.
+- [Плагины и макросы](docs/Ru/plugins.md) — расширение через внешние файлы.
+- [обучение](docs/Ru/tutorial.md) — тутор, как работает редактор.
 
 Лицензия GPL-3.0, файл [LICENSE](LICENSE).
