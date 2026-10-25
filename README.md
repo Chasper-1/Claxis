@@ -35,9 +35,20 @@ Windows Terminal. Остальные получают внятное сообщ�
 
 ## Сборка
 
+### HTTP:
+```sh
+git clone https://github.com/Chasper-1/Claxis && cd Claxis && cargo b -r
+```
+
+### SSH:
+```sh
+git clone git@github.com:Chasper-1/Claxis.git && cd Claxis && cargo b -r
+```
+
+### Cargo
+Без клонирования репозитора, если вы сами справитесь с этим удобным вам способом, помимо выше указаных.
 ```sh
 cargo b -r
-cargo bench   # ядро и буфер
 ```
 
 Собранный редактор запускается без команды. Отладочные команды:
