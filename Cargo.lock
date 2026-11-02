@@ -3,24 +3,6 @@
 version = 4
 
 [[package]]
-name = "Claxis"
-version = "0.5.7"
-dependencies = [
- "claxis-buffer",
- "claxis-commands",
- "claxis-config",
- "claxis-core",
- "claxis-disk",
- "claxis-i18n",
- "claxis-input",
- "claxis-term",
- "claxis-text",
- "claxis-theme",
- "crossterm",
- "toml_edit",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -41,6 +23,24 @@ name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "claxis"
+version = "0.5.7"
+dependencies = [
+ "claxis-buffer",
+ "claxis-commands",
+ "claxis-config",
+ "claxis-core",
+ "claxis-disk",
+ "claxis-i18n",
+ "claxis-input",
+ "claxis-term",
+ "claxis-text",
+ "claxis-theme",
+ "crossterm",
+ "toml_edit",
+]
 
 [[package]]
 name = "claxis-buffer"
