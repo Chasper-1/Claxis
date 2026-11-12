@@ -3,6 +3,8 @@
 //! Один файл на крейт. Каждый файл отдаёт наружу только то, что крейт
 //! предоставляет другим. Сами вызовы сюда не приходят: перенаправлением
 //! занимается маршрутизатор, `crate::router`.
+//!
+//! Этот файл только связывает модули: код лежит в файлах рядом.
 
 pub mod buffer;
 pub mod commands;
@@ -252,6 +254,97 @@ mod tests {
         }
         names.sort();
         names
+    }
+
+    /// Соединители: файлы, которые только связывают модули.
+    ///
+    /// Это `lib.rs` каждого крейта, `mod.rs` подкаталогов и корневые
+    /// соединители бинарника. Код в них не живёт: он лежит в файлах рядом, а
+    /// соединитель только объявляет, что где находится.
+    fn connectors() -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for crate_name in crate_names() {
+            let src = root().join(&crate_name).join("src");
+            out.push(src.join("lib.rs"));
+            for entry in walk(&src) {
+                if entry.file_name().is_some_and(|name| name == "mod.rs") {
+                    out.push(entry);
+                }
+            }
+        }
+        let src = root().join("src");
+        out.push(src.join("lib.rs"));
+        out.push(src.join("api").join("mod.rs"));
+        out.push(src.join("router").join("mod.rs"));
+        out.retain(|path| path.is_file());
+        out.sort();
+        out
+    }
+
+    /// Строка соединителя — объявление модуля или переиспользование.
+    ///
+    /// Атрибуты разрешены: `#[cfg]` и `#[doc(hidden)]` стоят перед объявлением
+    /// и относятся к нему. Многострочный `pub use` разбирается по продолжению:
+    /// список имён может занять несколько строк, и начало его — `pub use`.
+    fn connector_offenders(lines: &[&str]) -> Vec<usize> {
+        let mut offenders = Vec::new();
+        let mut in_use = false;
+        for (n, line) in lines.iter().enumerate() {
+            let line = line.trim();
+            if in_use {
+                if line.ends_with(';') {
+                    in_use = false;
+                }
+                continue;
+            }
+            if line.is_empty() || line.starts_with("//") || line.starts_with("#[") {
+                continue;
+            }
+            // Объявление модуля: `mod имя;` или `pub mod имя;`.
+            let declaration = line
+                .strip_prefix("pub ")
+                .unwrap_or(line)
+                .starts_with("mod ")
+                && line.ends_with(';');
+            if declaration {
+                continue;
+            }
+            // Переиспользование: `pub use ...;` (может занять несколько строк).
+            if line.starts_with("pub use ") {
+                in_use = !line.ends_with(';');
+                continue;
+            }
+            offenders.push(n + 1);
+        }
+        offenders
+    }
+
+    #[test]
+    fn a_connector_only_connects() {
+        // Правило проекта: `lib.rs` и `mod.rs` только связывают файлы, кода в
+        // них нет. Код, попавший в соединитель, разъезжается с остальным
+        // проектом: его не видно среди файлов по делу и он тянет за собой
+        // импорты, которым в соединителе не место.
+        let mut offenders = Vec::new();
+        for path in connectors() {
+            let text = std::fs::read_to_string(&path).expect("файл читается");
+            let lines: Vec<&str> = text.lines().collect();
+            // Всё после `#[cfg(test)]` — тесты, а тесты в соединителе живут
+            // законно: они проверяют сам соединитель.
+            let test_start = lines
+                .iter()
+                .position(|l| l.trim() == "#[cfg(test)]")
+                .unwrap_or(lines.len());
+            for n in connector_offenders(&lines[..test_start]) {
+                let rel = path.strip_prefix(root()).unwrap_or(&path);
+                offenders.push(format!("{}:{}: {}", rel.display(), n, lines[n - 1].trim()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "в соединителях появился код:\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// Все файлы исходников бинарного крейта.

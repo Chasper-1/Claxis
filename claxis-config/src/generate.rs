@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use claxis_disk as disk;
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::Error;
@@ -57,7 +58,7 @@ pub fn ensure_files(
 ) -> std::result::Result<Generated, Error> {
     let mut result = Generated::default();
     // Каталог создаёт сам крейт диска: путь до файла — часть записи.
-    crate::disk::create_dir(dir)?;
+    disk::create_dir(dir)?;
 
     for &file in ConfigFile::ALL {
         let path = dir.join(file.file_name());
@@ -66,7 +67,7 @@ pub fn ensure_files(
             continue;
         }
         let text = render(file, catalog);
-        crate::disk::write_text(&path, &text)?;
+        disk::write_text(&path, &text)?;
         result.created.push(path);
     }
     Ok(result)
@@ -418,7 +419,7 @@ fn save(path: &Path, doc: &DocumentMut) -> std::result::Result<(), Error> {
     // Запись на диск — дело крейта диска: он делает её атомарно, через временный
     // файл с переименованием. Здесь только собрано содержимое.
     let written = expand_schema_tables(&doc.to_string());
-    crate::disk::write_text(path, &written)?;
+    disk::write_text(path, &written)?;
     Ok(())
 }
 

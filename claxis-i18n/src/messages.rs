@@ -96,3 +96,43 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::samples;
+
+    #[test]
+    fn samples_are_unique_and_have_no_empty_placeholders() {
+        let samples = samples();
+        let mut keys: Vec<&str> = samples.iter().map(|(k, _)| *k).collect();
+        let before = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "в примерах есть повторяющиеся ключи");
+
+        for (key, text) in samples {
+            assert!(!text.is_empty(), "{key} вышел пустым");
+            assert!(
+                !text.contains('{'),
+                "{key} оставил место без значения: {text}"
+            );
+            assert!(
+                !text.contains('}'),
+                "{key} оставил закрытие без места: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_sample_shows_its_values() {
+        // Пример без подставленных значений переводчику ничего не объясняет.
+        let samples: std::collections::HashMap<&str, String> = samples().into_iter().collect();
+        assert!(samples["unknown_lang"].contains("klingon"));
+        assert!(samples["read_failed"].contains("permission denied"));
+        assert!(samples["parse_failed"].contains("unclosed quote"));
+        assert!(samples["incomplete"].contains("12"));
+        assert!(samples["incomplete"].contains("340"));
+        assert!(samples["duplicate_key"].contains("Open file"));
+        assert!(samples["not_a_string"].contains("Open file"));
+    }
+}

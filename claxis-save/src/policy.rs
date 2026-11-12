@@ -144,6 +144,15 @@ mod tests {
     }
 
     #[test]
+    fn both_gates_decide_the_file_is_same() {
+        let anchor = Anchor { len: 4, hash: 7 };
+        assert!(agrees(&anchor, 4, 7));
+        // Размер разошёлся — хеш уже не важен, ступень не спрашивается.
+        assert!(!agrees(&anchor, 5, 7));
+        assert!(!agrees(&anchor, 4, 8));
+    }
+
+    #[test]
     fn both_gates_pass_and_the_file_is_written() {
         let store = store("written").unwrap();
         let path = temp_file("written");
