@@ -398,7 +398,7 @@ mod tests {
         assert!(find(ConfigFile::Global, "General.language").is_some());
     }
 
-    /// Режимы, названные в `docs/Ru/modes.md`.
+    /// Режимы, названные в `docs/ru/modes.md`.
     ///
     /// Секция конфига — это режим, и имя секции обязано быть именем режима.
     /// Список взят оттуда, а не выдуман: секция `[word]` годами стояла в схеме
@@ -438,7 +438,7 @@ mod tests {
             }
             assert!(
                 MODES.contains(&section),
-                "{}: секция `{section}` не режим из docs/Ru/modes.md: {:?}",
+                "{}: секция `{section}` не режим из docs/ru/modes.md: {:?}",
                 key.path,
                 MODES
             );
