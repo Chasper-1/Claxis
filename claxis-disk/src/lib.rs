@@ -27,17 +27,16 @@ pub mod checksum;
 pub mod defaults;
 pub mod error;
 pub mod file;
+pub mod hash;
 pub mod messages;
 pub mod path;
 pub mod snapshots;
 pub mod watch;
 
 pub use error::{Error, Result};
-pub use file::{
-    Change, Fingerprint, create_dir, file_len, fingerprint, list_files, read_bytes, read_text,
-    write_blob, write_text,
-};
+pub use file::{create_dir, file_len, list_files, read_bytes, read_text, write_blob, write_text};
+pub use hash::{from_blob, of, of_file, of_reader, to_blob};
 pub use messages::{En, Messages};
 pub use path::StorePaths;
-pub use snapshots::{Snapshot, SnapshotStore};
+pub use snapshots::{Anchor, Snapshot, SnapshotStore};
 pub use watch::{Changed, Watch};

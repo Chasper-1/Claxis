@@ -14,6 +14,8 @@ pub trait Messages {
     fn using_last_good(&self) -> String;
     /// Файл меняли снаружи, пока редактор был закрыт: `{path}`.
     fn changed_outside(&self, path: &str) -> String;
+    /// Якорь «база ↔ диск» пропал, а правки остались: `{path}`.
+    fn anchor_lost(&self, path: &str) -> String;
     /// Нет такого аргумента: `{arg}`.
     fn unknown_argument(&self, arg: &str) -> String;
     /// Строка usage: `{usage}` — как вызывается.
@@ -64,6 +66,14 @@ impl Messages for En {
         )
     }
 
+    fn anchor_lost(&self, path: &str) -> String {
+        crate::api::text::substitute(
+            "the freshness mark of {path} is gone while unsaved edits remain;\n\
+             the file will refuse to save until they are sorted out",
+            &[("path", path.to_string())],
+        )
+    }
+
     fn unknown_argument(&self, arg: &str) -> String {
         crate::api::text::substitute("unknown argument: {arg}", &[("arg", arg.to_string())])
     }
@@ -105,6 +115,7 @@ pub fn samples() -> Vec<(&'static str, String)> {
         ("event_line", m.event_line("KeyPressed { key: Char('a') }")),
         ("using_last_good", m.using_last_good()),
         ("changed_outside", m.changed_outside("/home/user/notes.txt")),
+        ("anchor_lost", m.anchor_lost("/home/user/notes.txt")),
         ("unknown_argument", m.unknown_argument("-x")),
         ("opens_editor", m.opens_editor()),
         ("commands_heading", m.commands_heading()),

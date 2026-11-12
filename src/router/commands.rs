@@ -13,9 +13,10 @@
 use crate::api::buffer::COMMANDS as BUFFER;
 use crate::api::commands::{Error, Registry};
 use crate::api::core::COMMANDS as CORE;
+use crate::api::save::COMMANDS as SAVE;
 
 /// Объявления крейтов: список имён из каждого `commands.rs`.
-const DECLARED: &[(&str, &[&str])] = &[("std", BUFFER), ("std", CORE)];
+const DECLARED: &[(&str, &[&str])] = &[("std", BUFFER), ("std", CORE), ("std", SAVE)];
 
 /// Реестр всех команд редактора.
 ///
@@ -53,7 +54,7 @@ mod tests {
     fn a_command_that_no_crate_declared_is_not_invented() {
         // Реестр не отвечает на всё подряд: объявить команду должен крейт.
         let registry = registry().unwrap();
-        assert!(registry.get(":std::file::save").is_err());
+        assert!(registry.get(":std::file::save").is_ok());
         assert!(registry.get(":std::edit::move::up").is_err());
     }
 

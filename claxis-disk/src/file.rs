@@ -6,98 +6,14 @@
 //! перезаписью на месте здесь один: он и роняет редактор, если кончилось
 //! место.
 //!
-//! Отпечаток отвечает на вопрос «меняли файл, пока мы смотрели в другую
-//! сторону». Сравнить размер и время правки дешевле, чем перечитывать файл, а
-//! хватает для всех случаев, где файл трогают снаружи: другой редактор,
-//! `git checkout`, скрипт.
-
-use std::io::Write;
-use std::path::{Path, PathBuf};
+//! Актуальность файла отвечает якорь «размер и хеш» в базе снапшотов:
+//! сначала размер, он ловит почти всё и стоит ничего, потом хеш, который
+//! платит только за правку той же длины. Себя он живёт в `super::hash`.
 
 use crate::error::{Error, Result};
 
-/// Отпечаток файла: каким он был, когда мы смотрели в последний раз.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fingerprint {
-    /// Размер в байтах.
-    len: u64,
-    /// Время последней правки.
-    modified: std::time::SystemTime,
-}
-
-impl Fingerprint {
-    /// Взять отпечаток файла. `None`, если файла нет.
-    ///
-    /// Файла нет — не ошибка: его ещё могли не создать, и это не поломка.
-    /// Каталог на месте файла — ошибка: читать его как файл бессмысленно, а
-    /// молчаливый отпечаток размера папки сбил бы с толку.
-    pub fn of(path: &Path) -> Result<Option<Self>> {
-        let meta = match std::fs::metadata(path) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(crate::error::io(path, e)),
-        };
-        if !meta.is_file() {
-            return Err(Error::Read {
-                path: path.display().to_string(),
-                reason: "not a regular file".to_string(),
-            });
-        }
-        Ok(Some(Self {
-            len: meta.len(),
-            modified: meta.modified().map_err(|e| crate::error::io(path, e))?,
-        }))
-    }
-
-    /// Тот же файл, что и раньше?
-    pub fn same_as(&self, other: &Self) -> bool {
-        self.len == other.len && self.modified == other.modified
-    }
-}
-
-/// Отпечаток файла. Короткое имя для вызывающего.
-pub fn fingerprint(path: &Path) -> Result<Option<Fingerprint>> {
-    Fingerprint::of(path)
-}
-
-/// Что с файлом по сравнению с тем, как мы его видели.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Change {
-    /// Файл тот же: и длина, и время совпали.
-    Unchanged,
-    /// Файл поменялся.
-    ///
-    /// Поле `by_length` отвечает, чем это выяснилось. Длина разошлась —
-    /// система ничего не стоила. Длина совпала, а время нет — догадались
-    /// только по времени, и это слабее: `cp -p` и `tar` время сохраняют.
-    Changed {
-        /// Разошлась ли длина.
-        by_length: bool,
-    },
-    /// Файла нет.
-    Gone,
-}
-
-/// Менялся ли файл с тех пор, как мы его видели.
-///
-/// Проверка идёт в два шага, от дешёвого к дорогому. Первым идёт размер: он
-/// ловит и дописывание, и усечение, а это почти всё, чем правят файлы
-/// снаружи. Вторым идёт время изменения, которое система отдаёт сама и
-/// стоит того же одного вызова. Содержимое не читается вовсе: система о нём
-/// знает не хуже нас, а чтение большого файла ради проверки — это работа,
-/// которой заниматься незачем.
-pub fn changed_since(path: &Path, was: &Fingerprint) -> Result<Change> {
-    let Some(now) = Fingerprint::of(path)? else {
-        return Ok(Change::Gone);
-    };
-    if now.len != was.len {
-        return Ok(Change::Changed { by_length: true });
-    }
-    if now.modified != was.modified {
-        return Ok(Change::Changed { by_length: false });
-    }
-    Ok(Change::Unchanged)
-}
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Прочитать файл как текст.
 ///
@@ -398,47 +314,6 @@ mod tests {
     }
 
     #[test]
-    fn an_untouched_file_keeps_its_fingerprint() {
-        let temp = Temp::new("same");
-        let path = temp.file("config.toml");
-        write_text(&path, "same").unwrap();
-        let before = fingerprint(&path).unwrap().expect("файл есть");
-        let after = fingerprint(&path).unwrap().expect("файл есть");
-        assert!(
-            before.same_as(&after),
-            "файл не трогали, отпечаток изменился"
-        );
-    }
-
-    #[test]
-    fn a_changed_file_gives_a_different_fingerprint() {
-        // Именно ради этого отпечаток и нужен: правка снаружи должна быть
-        // видна без перечитывания файла целиком.
-        let temp = Temp::new("changed");
-        let path = temp.file("config.toml");
-        write_text(&path, "short").unwrap();
-        let before = fingerprint(&path).unwrap().unwrap();
-        write_text(&path, "a much longer content than before").unwrap();
-        let after = fingerprint(&path).unwrap().unwrap();
-        assert!(!before.same_as(&after), "изменение не замечено");
-    }
-
-    #[test]
-    fn a_missing_file_has_no_fingerprint() {
-        // Отсутствие файла — не ошибка: его ещё могли не создать.
-        let temp = Temp::new("missing");
-        assert_eq!(fingerprint(&temp.file("нет.toml")).unwrap(), None);
-    }
-
-    #[test]
-    fn the_fingerprint_of_a_folder_is_not_a_file() {
-        // Каталог на месте файла — ошибка чтения, а не «файла нет».
-        let temp = Temp::new("dir");
-        let error = fingerprint(&temp.dir).unwrap_err();
-        assert!(matches!(error, Error::Read { .. }), "{error:?}");
-    }
-
-    #[test]
     fn a_temporary_name_stays_next_to_its_target() {
         // Переименование атомарно только внутри одного каталога.
         let temp = Temp::new("temp-name");
@@ -453,101 +328,5 @@ mod tests {
         let name = temp_path(Path::new("config.toml"));
         assert_eq!(name.parent(), Some(Path::new("")));
         assert!(name.to_string_lossy().contains(".tmp"));
-    }
-
-    /// Каталог под тест: файлы пишутся в папку с именем набора.
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("claxis-file-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// Большой текст: сравнение на гигабайтах тут не проверить, но на
-    /// мегабайте — вполне.
-    fn big(seed: u8, len: usize) -> Vec<u8> {
-        (0..len)
-            .map(|i| b'a' + ((i + seed as usize) % 26) as u8)
-            .collect()
-    }
-
-    #[test]
-    fn an_untouched_file_is_unchanged() {
-        let dir = temp_dir("unchanged");
-        let path = dir.join("a.rs");
-        let text = big(0, 200_000);
-        std::fs::write(&path, &text).unwrap();
-        let was = Fingerprint::of(&path).unwrap().unwrap();
-
-        assert_eq!(changed_since(&path, &was).unwrap(), Change::Unchanged);
-    }
-
-    #[test]
-    fn a_grown_file_is_caught_by_the_length_alone() {
-        // Отпечаток разошёлся — содержимое можно было не смотреть вовсе.
-        let dir = temp_dir("grown");
-        let path = dir.join("a.rs");
-        let text = big(0, 200_000);
-        std::fs::write(&path, &text).unwrap();
-        let was = Fingerprint::of(&path).unwrap().unwrap();
-
-        let mut longer = text.clone();
-        longer.push(b'\n');
-        std::fs::write(&path, &longer).unwrap();
-
-        assert_eq!(
-            changed_since(&path, &was).unwrap(),
-            Change::Changed { by_length: true }
-        );
-    }
-
-    #[test]
-    fn a_shrunken_file_is_caught_by_the_length_alone() {
-        let dir = temp_dir("shrunk");
-        let path = dir.join("a.rs");
-        let text = big(0, 200_000);
-        std::fs::write(&path, &text).unwrap();
-        let was = Fingerprint::of(&path).unwrap().unwrap();
-
-        std::fs::write(&path, &text[..100_000]).unwrap();
-        assert_eq!(
-            changed_since(&path, &was).unwrap(),
-            Change::Changed { by_length: true }
-        );
-    }
-
-    #[test]
-    fn an_edit_of_the_same_length_is_caught_by_the_time_alone() {
-        // Длина та же, дописывания нет. Остаётся время, которое система
-        // отдаёт сама. Это слабее всего — `cp -p` и `tar` его сохраняют, — но
-        // и стоит это ничего.
-        let dir = temp_dir("same-length");
-        let path = dir.join("a.rs");
-        std::fs::write(&path, big(0, 200_000)).unwrap();
-        let was = Fingerprint::of(&path).unwrap().unwrap();
-
-        let mut edited = big(0, 200_000);
-        let at = edited.len() / 2;
-        edited[at] = b'Z';
-        std::fs::write(&path, &edited).unwrap();
-
-        let change = changed_since(&path, &was).unwrap();
-        assert!(
-            matches!(change, Change::Changed { by_length: false }) || change == Change::Unchanged,
-            "ждали Changed или Unchanged, получили {change:?}"
-        );
-        // Время иногда совпадает: файловая система бывает с секундной
-        // гранулярностью, и две записи в одну секунду неразличимы. Потому и
-        // проверка такая: сначала длина, и только потом время.
-    }
-
-    #[test]
-    fn a_vanished_file_is_not_an_unchanged_file() {
-        let dir = temp_dir("gone");
-        let path = dir.join("a.rs");
-        std::fs::write(&path, "был".as_bytes()).unwrap();
-        let was = Fingerprint::of(&path).unwrap().unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(changed_since(&path, &was).unwrap(), Change::Gone);
     }
 }

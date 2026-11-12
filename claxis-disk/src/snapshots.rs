@@ -13,7 +13,22 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::checksum;
 use crate::error::{Error, Result};
+use crate::hash;
 use crate::path::StorePaths;
+
+/// Якорь «база ↔ диск»: каким файл был, когда мы его открыли.
+///
+/// Размер и хеш вместе отвечают на вопрос «менялся ли файл на диске с тех
+/// пор». Хранится в базе по пути файла: история правок держится поверх
+/// проверенного содержимого, и пока якорь сходится, редактор ручается за
+/// файл, даже когда сам давно не открывался.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    /// Размер файла в байтах.
+    pub len: u64,
+    /// Хеш содержимого.
+    pub hash: u128,
+}
 
 /// Один снапшот документа.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,10 +172,16 @@ impl SnapshotStore {
                     file     TEXT NOT NULL,
                     text     BLOB NOT NULL,
                     history  BLOB NOT NULL DEFAULT x'',
-                    checksum INTEGER
+                    checksum INTEGER,
+                    taken    INTEGER NOT NULL DEFAULT 0
                  );
 
                  CREATE INDEX IF NOT EXISTS snapshots_file ON snapshots(file, seq);
+                 CREATE TABLE IF NOT EXISTS anchors (
+                     file TEXT PRIMARY KEY,
+                     len  INTEGER NOT NULL,
+                     hash BLOB NOT NULL
+                  );
                  CREATE TABLE IF NOT EXISTS last_good (
                     name TEXT PRIMARY KEY,
                     body TEXT NOT NULL
@@ -173,7 +194,23 @@ impl SnapshotStore {
         self.add_history_column()?;
         // Сумма появилась позже истории: у пользователя база уже лежит, и
         // терять её из-за нового столбца нельзя.
-        self.add_checksum_column()
+        self.add_checksum_column()?;
+        // Время снятия появилось позже суммы: без него у правок был бы
+        // вечный срок, а чистка по сроку ничего не удаляла бы.
+        self.add_taken_column()
+    }
+
+    /// Добавить колонку времени снятия в базу, созданную до её появления.
+    fn add_taken_column(&self) -> Result<()> {
+        let sql = "ALTER TABLE snapshots ADD COLUMN taken INTEGER NOT NULL DEFAULT 0";
+        match self.conn.execute_batch(sql) {
+            Ok(()) => Ok(()),
+            // Колонка уже есть: база не старше миграции, всё в порядке.
+            Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+            Err(e) => Err(Error::Query {
+                reason: e.to_string(),
+            }),
+        }
     }
 
     /// Добавить колонку с суммой в базу, созданную до её появления.
@@ -257,8 +294,14 @@ impl SnapshotStore {
         let checksum = checksum::of_pair(text, history);
         let tx = self.conn.transaction().map_err(query)?;
         tx.execute(
-            "INSERT INTO snapshots (file, text, history, checksum) VALUES (?1, ?2, ?3, ?4)",
-            params![file, text, history, checksum as i64],
+            "INSERT INTO snapshots (file, text, history, checksum, taken) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                file,
+                text,
+                history,
+                checksum as i64,
+                now_secs(),
+            ],
         )
         .map_err(query)?;
 
@@ -394,6 +437,82 @@ impl SnapshotStore {
         Ok(n as u32)
     }
 
+    /// Положить якорь «база ↔ диск»: каким файл был при открытии.
+    ///
+    /// Пишет поверх прежнего: якорь всегда об одном — о том содержимом,
+    /// которое мы последними видели.
+    pub fn set_anchor(&self, file: &Path, anchor: Anchor) -> Result<()> {
+        let file = file.display().to_string();
+        self.conn
+            .execute(
+                "INSERT INTO anchors (file, len, hash) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(file) DO UPDATE SET len = excluded.len, hash = excluded.hash",
+                params![file, anchor.len as i64, hash::to_blob(anchor.hash)],
+            )
+            .map_err(query)?;
+        Ok(())
+    }
+
+    /// Каким файл был, когда мы его видели в последний раз.
+    pub fn anchor(&self, file: &Path) -> Result<Option<Anchor>> {
+        let file = file.display().to_string();
+        self.conn
+            .query_row(
+                "SELECT len, hash FROM anchors WHERE file = ?1",
+                params![file],
+                |row| {
+                    let len: i64 = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    match hash::from_blob(&blob) {
+                        Some(h) => Ok(Anchor {
+                            len: len.max(0) as u64,
+                            hash: h,
+                        }),
+                        // Обрезанный блоб в базе — испорченная запись. Молчаливый
+                        // ноль притворялся бы «файл в порядке», так что ошибка.
+                        None => Err(rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            "anchor hash is not 16 bytes".to_string().into(),
+                        )),
+                    }
+                },
+            )
+            .optional()
+            .map_err(query)
+    }
+
+    /// Забыть якорь файла.
+    pub fn forget_anchor(&self, file: &Path) -> Result<()> {
+        let file = file.display().to_string();
+        self.conn
+            .execute("DELETE FROM anchors WHERE file = ?1", params![file])
+            .map_err(query)?;
+        Ok(())
+    }
+
+    /// Убрать снапшоты файла, чей срок истёк.
+    ///
+    /// Срок — это сколько секунд правкам положено жить, из конфига. Ноль
+    /// означает «срока у правок нет»: что висит, то и висит, до сохранения
+    /// и выхода. Правки снимали до появления времени в базе срока не имеют,
+    /// и срывать их за неизвестный возраст — враньё: они остаются.
+    pub fn expire(&self, file: &Path, retention_secs: u64) -> Result<()> {
+        if retention_secs == 0 {
+            return Ok(());
+        }
+        let cutoff = now_secs().saturating_sub(retention_secs as i64);
+        let file = file.display().to_string();
+        self.conn
+            .execute(
+                "DELETE FROM snapshots
+                 WHERE file = ?1 AND taken > 0 AND taken < ?2",
+                params![file, cutoff],
+            )
+            .map_err(query)?;
+        Ok(())
+    }
+
     /// Убрать все снапшоты файла.
     pub fn forget(&self, file: &Path) -> Result<()> {
         let file = file.display().to_string();
@@ -430,6 +549,15 @@ fn query(e: rusqlite::Error) -> Error {
     Error::Query {
         reason: e.to_string(),
     }
+}
+
+/// Секунды по часам на этой машине: точность до секунды здесь достаточна.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        // Часы раньше начала времён: считаем началом отсчёта, а не правду.
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -675,6 +803,163 @@ mod tests {
         store.forget(&a).unwrap();
         assert_eq!(store.count(&a).unwrap(), 0);
         assert_eq!(store.count(&b).unwrap(), 1);
+    }
+
+    #[test]
+    fn an_anchor_round_trips_through_the_base() {
+        let temp = Temp::new("anchor");
+        let target = file("a.rs");
+        let store = temp.store(3);
+        assert!(store.anchor(&target).unwrap().is_none());
+
+        let anchor = super::Anchor {
+            len: 4321,
+            hash: crate::hash::of(b"text"),
+        };
+        store.set_anchor(&target, anchor).unwrap();
+        assert_eq!(store.anchor(&target).unwrap(), Some(anchor));
+    }
+
+    #[test]
+    fn a_fresh_anchor_overwrites_the_old_one() {
+        // Якорь всегда об одном — о том, что видели последним.
+        let temp = Temp::new("anchor-overwrite");
+        let target = file("a.rs");
+        let store = temp.store(3);
+        store
+            .set_anchor(&target, super::Anchor { len: 1, hash: 2 })
+            .unwrap();
+        let second = super::Anchor { len: 30, hash: 7 };
+        store.set_anchor(&target, second).unwrap();
+        assert_eq!(store.anchor(&target).unwrap(), Some(second));
+    }
+
+    #[test]
+    fn anchors_do_not_leak_across_files() {
+        let temp = Temp::new("anchor-files");
+        let store = temp.store(3);
+        store
+            .set_anchor(&file("a.rs"), super::Anchor { len: 1, hash: 1 })
+            .unwrap();
+        assert!(store.anchor(&file("b.rs")).unwrap().is_none());
+    }
+
+    #[test]
+    fn anchors_survive_reopening() {
+        // Якорь нужен именно между запусками: сверять его не с чем, если он
+        // умирает вместе с подключением.
+        let temp = Temp::new("anchor-reopen");
+        let target = file("a.rs");
+        {
+            let store = temp.store(3);
+            store
+                .set_anchor(
+                    &target,
+                    super::Anchor {
+                        len: 11,
+                        hash: crate::hash::of(b"base"),
+                    },
+                )
+                .unwrap();
+        }
+        let store = temp.store(3);
+        let anchor = store.anchor(&target).unwrap().expect("якорь на месте");
+        assert_eq!(anchor.len, 11);
+        assert_eq!(anchor.hash, crate::hash::of(b"base"));
+    }
+
+    #[test]
+    fn forget_anchor_removes_it_alone() {
+        let temp = Temp::new("anchor-forget");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store
+            .set_anchor(&target, super::Anchor { len: 1, hash: 1 })
+            .unwrap();
+        store.put(&target, "текст".as_bytes(), b"").unwrap();
+        store.forget_anchor(&target).unwrap();
+        assert!(store.anchor(&target).unwrap().is_none());
+        assert_eq!(store.count(&target).unwrap(), 1);
+    }
+
+    #[test]
+    fn expire_removes_only_the_aged_snapshots() {
+        let temp = Temp::new("expire-age");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store.put(&target, "давние".as_bytes(), b"").unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE snapshots SET taken = ?1 WHERE file = ?2",
+                rusqlite::params![
+                    super::now_secs() - 100, // сто секунд раньше now
+                    target.display().to_string(),
+                ],
+            )
+            .unwrap();
+        store.put(&target, "свежие".as_bytes(), b"").unwrap();
+
+        store.expire(&target, 50).unwrap();
+        let left = store.list(&target).unwrap();
+        assert_eq!(left.len(), 1, "должны остаться только свежие");
+        assert_eq!(left[0].text, "свежие".as_bytes());
+    }
+
+    #[test]
+    fn expire_with_zero_retention_takes_nothing() {
+        // Ноль — это «срока у правок нет», а не «срок уже прошёл».
+        let temp = Temp::new("expire-zero");
+        let target = file("a.rs");
+        let mut store = temp.store(3);
+        store.put(&target, "правки".as_bytes(), b"").unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE snapshots SET taken = ?1",
+                rusqlite::params![super::now_secs() - 1_000_000],
+            )
+            .unwrap();
+        store.expire(&target, 0).unwrap();
+        assert_eq!(store.count(&target).unwrap(), 1);
+    }
+
+    #[test]
+    fn expire_leaves_snapshots_of_an_empty_age_alone() {
+        // Время снятия появилось позже самих снапшотов: возраст неизвестен, и
+        // срывать за неизвестный возраст — враньё.
+        let temp = Temp::new("expire-unknown-age");
+        let target = file("старый.rs");
+        let store = temp.store(3);
+        store
+            .conn
+            .execute(
+                "INSERT INTO snapshots (file, text) VALUES (?1, ?2)",
+                rusqlite::params![target.display().to_string(), "без срока".as_bytes()],
+            )
+            .unwrap();
+        store.expire(&target, 1).unwrap();
+        assert_eq!(store.count(&target).unwrap(), 1);
+    }
+
+    #[test]
+    fn expire_does_not_touch_other_files() {
+        let temp = Temp::new("expire-files");
+        let mut store = temp.store(3);
+        store.put(&file("a.rs"), "старое".as_bytes(), b"").unwrap();
+        store
+            .put(&file("b.rs"), "тоже старое".as_bytes(), b"")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE snapshots SET taken = ?1",
+                rusqlite::params![super::now_secs() - 500],
+            )
+            .unwrap();
+        store.expire(&file("a.rs"), 1).unwrap();
+        assert_eq!(store.count(&file("b.rs")).unwrap(), 1);
     }
 
     #[test]

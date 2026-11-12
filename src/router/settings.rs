@@ -47,6 +47,11 @@ pub struct Settings {
     pub snapshots_persist: bool,
     /// Через сколько секунд снимать снапшот. Ноль — на каждой правке.
     pub snapshots_interval: u16,
+    /// Срок годности правок файла в секундах. Ноль — срока нет.
+    ///
+    /// Значение приходит как `"7d"`, `"2h"` или голое число секунд, и
+    /// разбирается здесь же: пусть ошибка конфига останется ошибкой конфига.
+    pub snapshots_retention: u64,
     /// Показывать ли экран статистики после сохранения.
     pub savescreen_include: bool,
     /// Как показывать: `fullscreen`, `message`, `window`.
@@ -85,6 +90,7 @@ impl Settings {
             snapshots_keep: 0,
             snapshots_persist: false,
             snapshots_interval: 0,
+            snapshots_retention: 0,
             savescreen_include: false,
             savescreen_mode: String::new(),
             savescreen_input_char: false,
@@ -134,6 +140,19 @@ impl Settings {
         }
         if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_interval") {
             settings.snapshots_interval = config.u16_or_default(def)?;
+        }
+        if let Some(def) = schema::find(ConfigFile::Files, "General.snapshots_days") {
+            // Срок годности разбирается по правилам крейта сохранения: форма
+            // значения — его дело. Разобрать не удалось — это ошибка значения,
+            // а не молчаливый ноль.
+            settings.snapshots_retention =
+                crate::api::save::retention(&config.string_or_default(def)).map_err(|_| {
+                    crate::api::config::Error::BadValue {
+                        key: def.path.to_string(),
+                        got: config.string_or_default(def),
+                        expected: "a number with d, h, m or s, or a bare number of seconds",
+                    }
+                })?;
         }
         if let Some(def) = schema::find(ConfigFile::Global, "Savescreen.mode") {
             settings.savescreen_mode = config.string_or_default(def);

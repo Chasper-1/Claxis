@@ -1,0 +1,8 @@
+[package]
+name = "claxis-save"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+claxis-text = { path = "../claxis-text" }
+claxis-disk = { path = "../claxis-disk" }

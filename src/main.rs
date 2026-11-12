@@ -104,6 +104,15 @@ fn run(path: Option<PathBuf>) {
             messages.event_line(&messages.changed_outside(&doc.path().display().to_string()))
         );
     }
+    // Якорь пропал, а правки остались: сверять файл не с чем, и сохранение
+    // такого файла откажется писать. Молчание здесь значило бы «всё под
+    // контролем», а это не так.
+    if doc.anchor_lost() {
+        eprintln!(
+            "{}",
+            messages.event_line(&messages.anchor_lost(&doc.path().display().to_string()))
+        );
+    }
 
     let mut term = match Terminal::new() {
         Ok(t) => t,
@@ -121,6 +130,12 @@ fn run(path: Option<PathBuf>) {
         &claxis::messages::En,
         |line| eprintln!("{}", messages.event_line(line)),
     );
+    if result.is_ok()
+        && doc.saved()
+        && let Err(e) = editor.session().forget_snapshots(doc.path())
+    {
+        eprintln!("{}", messages.event_line(&e.message(&claxis::messages::En)));
+    }
     if let Err(e) = result {
         eprintln!("{}", messages.terminal_failed(&e.to_string()));
     }

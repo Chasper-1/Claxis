@@ -1,5 +1,5 @@
 [workspace]
-members = ["claxis-text", "claxis-core", "claxis-buffer", "claxis-disk", "claxis-input", "claxis-term", "claxis-i18n", "claxis-theme", "claxis-config", "claxis-commands"]
+members = ["claxis-text", "claxis-core", "claxis-buffer", "claxis-disk", "claxis-save", "claxis-input", "claxis-term", "claxis-i18n", "claxis-theme", "claxis-config", "claxis-commands"]
 # `cargo bench` без флагов должен запускать бенчмарки ядра и буфера, а не
 # только тестовую обвязку корневого пакета. Остальные команды по-прежнему
 # ходят по всему workspace явно.
@@ -25,6 +25,7 @@ claxis-commands = { path = "claxis-commands" }            # Claxis
 claxis-core = { path = "claxis-core" }                    # Claxis
 claxis-buffer = { path = "claxis-buffer" }                # Claxis
 claxis-disk = { path = "claxis-disk" }                    # Claxis, claxis-config
+claxis-save = { path = "claxis-save" }                    # Claxis
 
 claxis-input = { path = "claxis-input" }                  # claxis-config
 claxis-i18n = { path = "claxis-i18n" }                    # claxis-config

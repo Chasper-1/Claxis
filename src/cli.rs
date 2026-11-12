@@ -11,6 +11,7 @@ use crate::api::commands;
 use crate::api::config;
 use crate::api::disk;
 use crate::api::i18n;
+use crate::api::save;
 use crate::api::term;
 use crate::api::theme;
 use crate::main_messages;
@@ -58,9 +59,10 @@ pub fn parse(args: &[String]) -> Command {
 /// Каждое сообщение выводится с настоящими значениями вместо имён в
 /// фигурных скобках, иначе переводчик не поймёт, что подставляется.
 pub fn print_messages(out: &mut impl Write) -> std::io::Result<()> {
-    let crates: [(&str, Vec<(&str, String)>); 9] = [
+    let crates: [(&str, Vec<(&str, String)>); 10] = [
         ("claxis-buffer", buffer::messages::samples()),
         ("claxis-disk", disk::messages::samples()),
+        ("claxis-save", save::messages::samples()),
         ("claxis-term", term::messages::samples()),
         ("claxis-i18n", i18n::messages::samples()),
         ("claxis-config", config::messages::samples()),
@@ -151,6 +153,8 @@ mod tests {
             "not_watched",
             "no_usable_config",
             "file_too_large",
+            "save_failed",
+            "saved",
         ];
         let samples: Vec<&str> = crate::messages::samples()
             .iter()
@@ -166,6 +170,7 @@ mod tests {
             "event_line",
             "using_last_good",
             "changed_outside",
+            "anchor_lost",
             "unknown_argument",
             "usage",
             "opens_editor",
@@ -309,6 +314,9 @@ mod tests {
             }
             fn changed_outside(&self, p: &str) -> String {
                 format!("файл {p} меняли снаружи")
+            }
+            fn anchor_lost(&self, p: &str) -> String {
+                format!("якорь {p} пропал")
             }
             fn unknown_argument(&self, a: &str) -> String {
                 format!("неизвестный аргумент: {a}")

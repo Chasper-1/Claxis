@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Instant;
 
+use crate::api::save;
+use crate::api::save::messages::Messages as SaveMessages;
 use crate::api::term::{Event, Key, KeyCode, Modifiers, Terminal};
 use crate::router::session::Document;
 
@@ -20,6 +22,8 @@ use crate::router::session::Document;
 pub enum Action {
     /// Работаем дальше.
     Continue,
+    /// Документ сохраняется в файл.
+    Save,
     /// Из редактора выходим.
     Quit,
 }
@@ -48,6 +52,11 @@ impl Cycle {
                     // Выход до учёта нажатия: время ушедшего нажатия уже ничего
                     // не значит, документ закрывается.
                     return Action::Quit;
+                }
+                if key.code == KeyCode::Char('s') && key.modifiers == Modifiers::CTRL {
+                    // Сохранение тоже до учёта: запись файла — не нажатие в
+                    // документе, и время удержания Ctrl+S в работу не идёт.
+                    return Action::Save;
                 }
                 // Клавиша уже нажата — значит это повтор без отпускания,
                 // время отсчитывается от первого нажатия. Перезапись
@@ -119,8 +128,25 @@ impl Cycle {
             }
 
             let event = term.next_event()?;
-            if self.handle(event, doc) == Action::Quit {
-                return Ok(());
+            match self.handle(event, doc) {
+                Action::Quit => return Ok(()),
+                Action::Save => {
+                    // Решение у политики сохранения: отказ — это ответ, а не
+                    // поломка. Правки при отказе остаются в снапшотах, поэтому
+                    // цикл продолжает работать как ни в чём не бывало.
+                    let path = doc.path().display().to_string();
+                    match editor.session().save_document(doc) {
+                        Ok(save::Write::Written { bytes }) => {
+                            editor.session().mark_saved(doc);
+                            report(&messages.saved(&path, bytes));
+                        }
+                        Ok(save::Write::Refused(refusal)) => {
+                            report(&save::messages::En.save_refused(&path, &refusal));
+                        }
+                        Err(e) => report(&e.message(&crate::messages::En)),
+                    }
+                }
+                Action::Continue => {}
             }
         }
     }
@@ -192,6 +218,51 @@ mod tests {
     fn a_fresh_cycle_has_nothing_pressed() {
         let cycle = Cycle::new();
         assert!(cycle.pressed.is_empty());
+    }
+
+    #[test]
+    fn ctrl_s_asks_for_a_save() {
+        let mut fixture = Fixture::new("save");
+        let mut cycle = Cycle::new();
+        let save = Event::KeyPressed {
+            key: Key {
+                code: KeyCode::Char('s'),
+                modifiers: Modifiers::CTRL,
+            },
+            time: Instant::now(),
+        };
+        assert_eq!(cycle.handle(save, &mut fixture.doc), Action::Save);
+    }
+
+    #[test]
+    fn ctrl_s_is_not_counted_as_a_press() {
+        // Запись файла — не нажатие в документе: время удержания Ctrl+S в
+        // статистику работы не идёт.
+        let mut fixture = Fixture::new("save-not-counted");
+        let mut cycle = Cycle::new();
+        let before = fixture.doc.stats().presses;
+        cycle.handle(
+            Event::KeyPressed {
+                key: Key {
+                    code: KeyCode::Char('s'),
+                    modifiers: Modifiers::CTRL,
+                },
+                time: Instant::now(),
+            },
+            &mut fixture.doc,
+        );
+        assert_eq!(fixture.doc.stats().presses, before);
+        assert!(cycle.pressed.is_empty(), "сохранение не держит клавишу");
+    }
+
+    #[test]
+    fn plain_s_keeps_working() {
+        // Сохранение только у чистого Ctrl+S: `s` без Ctrl остаётся обычным
+        // нажатием, иначе печатать было бы нельзя.
+        let mut fixture = Fixture::new("plain-s");
+        let mut cycle = Cycle::new();
+        let plain = press(KeyCode::Char('s'), Instant::now());
+        assert_eq!(cycle.handle(plain, &mut fixture.doc), Action::Continue);
     }
 
     #[test]

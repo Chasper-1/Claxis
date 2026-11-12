@@ -35,6 +35,7 @@ dependencies = [
  "claxis-disk",
  "claxis-i18n",
  "claxis-input",
+ "claxis-save",
  "claxis-term",
  "claxis-text",
  "claxis-theme",
@@ -58,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "claxis-config"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "claxis-disk",
  "claxis-i18n",
@@ -76,11 +77,12 @@ dependencies = [
 
 [[package]]
 name = "claxis-disk"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "claxis-text",
  "notify",
  "rusqlite",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -95,6 +97,14 @@ dependencies = [
 [[package]]
 name = "claxis-input"
 version = "0.2.3"
+
+[[package]]
+name = "claxis-save"
+version = "0.1.0"
+dependencies = [
+ "claxis-disk",
+ "claxis-text",
+]
 
 [[package]]
 name = "claxis-term"
@@ -751,3 +761,9 @@ checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"

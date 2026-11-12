@@ -16,7 +16,8 @@ use crate::api::buffer::{
     Document as Rope, Error as RopeError, History, MIN_DEPTH, Record as RopeRecord, SnapshotSink,
 };
 use crate::api::core::LineMap;
-use crate::api::disk::{KEEP, PERSIST, SnapshotStore, StorePaths, file_len, read_bytes};
+use crate::api::disk::{KEEP, PERSIST, SnapshotStore, StorePaths, file_len, hash, read_bytes};
+use crate::api::save;
 use crate::messages::Messages;
 use crate::router::stats::{self, Stats};
 
@@ -31,6 +32,13 @@ pub enum SessionError {
     ReadFile { path: String, reason: String },
     /// Файл больше, чем помещается в `u32`.
     FileTooLarge { bytes: u64 },
+    /// Файл не сохранён: `{path}`, `{reason}`.
+    ///
+    /// Здесь две разные правды: диск отказал — и тогда причина его слова, а
+    /// политика записи отказалась — и тогда причина её решение. Оба текста
+    /// приходят собранными: расшифровкой `save::messages` занимается слой
+    /// выше, к ней сводится всё, что сохранение может сказать.
+    Save { path: String, reason: String },
     /// Объявления команд не разобрались.
     ///
     /// Список команд приходит из крейтов при сборке программы, поэтому такая
@@ -52,6 +60,7 @@ impl SessionError {
                 u32::MAX as u64,
                 u32::MAX as f64 / 1_000_000_000.0,
             ),
+            SessionError::Save { path, reason } => messages.save_failed(path, reason),
         }
     }
 
@@ -226,6 +235,17 @@ pub struct Document {
     /// не видна и уехала бы под следующим сохранением. Пользователю об этом
     /// говорит вызывающий.
     changed_outside: bool,
+    /// Якорь «база ↔ диск» пропал, а правки в базе остались.
+    ///
+    /// Файл мог измениться, пока якоря не было, и проверять нечем. Новый
+    /// якорь на месте правок не выдумывается: сохранение такого файла и
+    /// дальше будет отказываться писать, пока правки не разберут руками.
+    anchor_lost: bool,
+    /// Документ записан на диск в этом сеансе.
+    ///
+    /// По нему выход решает, чистить ли историю файла в базе: несохранённые
+    /// правки чистке не подлежат — это ещё не отражённая в файле работа.
+    saved: bool,
     /// Ячейка, куда приёмник кладёт ошибку записи снапшота.
     ///
     /// Приёмник живёт внутри rope и обратного хода не имеет: ошибку забирает
@@ -266,6 +286,25 @@ impl Document {
     /// этом честно сказано.
     pub fn changed_outside(&self) -> bool {
         self.changed_outside
+    }
+
+    /// Якорь «база ↔ диск» пропал, а правки в базе остались.
+    ///
+    /// Файл могли поменять, пока сверять было нечем: правки сохраняются
+    /// как были, а файл на запись не пойдёт, пока человек не разберёт
+    /// содержимое руками.
+    pub fn anchor_lost(&self) -> bool {
+        self.anchor_lost
+    }
+
+    /// Документ записан на диск в этом сеансе.
+    pub fn saved(&self) -> bool {
+        self.saved
+    }
+
+    /// Отметить документ записанным. Делает сохранение после успешной записи.
+    pub fn mark_saved(&mut self) {
+        self.saved = true;
     }
 
     /// Номер строки для позиции, начиная с нуля.
@@ -508,6 +547,10 @@ pub struct Session {
     persist: bool,
     /// Через сколько снимать следующий снапшот. Из конфига.
     interval: Duration,
+    /// Сколько секунд правкам положено жить. Из конфига.
+    ///
+    /// Ноль означает «срока нет»: чистка идёт только по сохранению и выходу.
+    retention: u64,
     /// Глубина, с которой сессия открыта и под которую созданы буферы.
     ///
     /// Отличается от `history_depth`, если конфиг поменяли на лету: буферы
@@ -561,6 +604,10 @@ impl Session {
             history_depth,
             persist,
             interval: DEFAULT_SNAPSHOT_INTERVAL,
+            // Неделя: та же неделя, что у умолчания крейта сохранения, и
+            // совпадение сторожит тест в этом файле. В константе — потому,
+            // что разбор строки в константу не укладывается.
+            retention: 7 * 24 * 60 * 60,
             opened_depth: history_depth,
         })
     }
@@ -609,6 +656,56 @@ impl Session {
     /// откроются дальше; уже открытые держат то, что получили при открытии.
     pub fn set_snapshot_interval(&mut self, interval: Duration) {
         self.interval = interval;
+    }
+
+    /// Задать срок годности правок в секундах. Ноль — срока нет.
+    ///
+    /// Применяется к документам, которые откроются дальше: чистка происходит
+    /// при открытии файла, и уже открытые свой срок отработали.
+    pub fn set_snapshots_retention(&mut self, retention: u64) {
+        self.retention = retention;
+    }
+
+    /// Сколько секунд правкам положено жить.
+    pub fn snapshots_retention(&self) -> u64 {
+        self.retention
+    }
+
+    /// Записать документ в его файл через ворота проверки.
+    ///
+    /// Решение остаётся у политики сохранения: обе ступени против файла на
+    /// диске, и при отказе на диск ничего не уезжает. Даже при отказе ошибка
+    /// не рождается: отказ — ответ, а не поломка. Возвращает итог с байтом
+    /// записанного: рассказать, сколько на диске стало.
+    pub fn save_document(&self, document: &Document) -> Result<save::Write, SessionError> {
+        let path = document.path();
+        save::write(&self.store, path, &document.text()).map_err(|e| SessionError::Save {
+            path: path.display().to_string(),
+            reason: e.text(),
+        })
+    }
+
+    /// Отметить документ записанным.
+    pub fn mark_saved(&self, document: &mut Document) {
+        document.mark_saved();
+    }
+
+    /// Забыть в базе и якорь, и все правки файла.
+    ///
+    /// После успешного сохранения и выхода: работа уже в файле, и истории
+    /// вокруг файла дальше держать незачем.
+    pub fn forget_snapshots(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
+        let path = path.as_ref();
+        self.store.forget(path).map_err(|e| SessionError::Save {
+            path: path.display().to_string(),
+            reason: e.text(),
+        })?;
+        self.store
+            .forget_anchor(path)
+            .map_err(|e| SessionError::Save {
+                path: path.display().to_string(),
+                reason: e.text(),
+            })
     }
 
     /// Глубина истории из последнего прочитанного конфига.
@@ -673,6 +770,10 @@ impl Session {
             self.history_depth = settings.history_depth;
             applied.needs_restart.push("history_depth");
         }
+        if self.retention != settings.snapshots_retention {
+            self.retention = settings.snapshots_retention;
+            applied.applied.push("snapshots_days");
+        }
 
         applied
     }
@@ -700,31 +801,94 @@ impl Session {
         let mut buffer = Rope::with_depth(text.clone(), self.history_depth_for_new_documents()?)
             .map_err(SessionError::Buffer)?;
         let mut changed_outside = false;
-        // Снапшот хранит только правки поверх файла. Исходный текст уже прочитан
-        // с диска, поэтому история накладывается на него, а не заменяет его.
+        let mut anchor_lost = false;
+        // Снапшот хранит только правки поверх файла. Исходный текст уже
+        // прочитан с диска, поэтому история накладывается на него, а не
+        // заменяет его.
         if self.persist
             && let Ok(store) = self.store.reopen()
-            && let Ok(Some(snapshot)) = store.latest(&path)
         {
+            // Срок годности отрабатывает при открытии: просроченные правки
+            // из базы уходят.
+            if self.retention > 0
+                && let Err(e) = store.expire(&path, self.retention)
+            {
+                return Err(SessionError::Store {
+                    path: self.paths.database().display().to_string(),
+                    reason: e.text(),
+                });
+            }
+            let snapshot = store.latest(&path).ok().flatten();
+            let anchor = store.anchor(&path).map_err(|e| SessionError::Store {
+                path: self.paths.database().display().to_string(),
+                reason: e.to_string(),
+            })?;
+            // Якоря нет, а правки лежат: якорь пропал, файл мог измениться.
+            // Новым на его место живое содержимое не выдумывается: сохранение
+            // у такого файла будет категорически отказываться писать, пока
+            // правки не выйдут по сроку.
+            let file_agrees = match anchor {
+                None if snapshot.is_some() => {
+                    anchor_lost = true;
+                    false
+                }
+                // Файла нет: буфер пуст, с основой не сверяешь.
+                None => true,
+                Some(anchor) => {
+                    // Ступень размера: почти всё решается здесь и бесплатно.
+                    match file_len(&path).map_err(read_error)? {
+                        // Файла нет. Якорь нулевой длины — файла и не было,
+                        // меняться нечему; якорь с длиной — файл исчез.
+                        None => anchor.len == 0,
+                        // Разошёлся размер — правка извне видна сразу.
+                        Some(len) if len != anchor.len => false,
+                        // Размер сошёлся — платит хеш: правка той же длины
+                        // теперь действительно отчёта требует.
+                        Some(len) => match hash::of_file(&path).map_err(read_error)? {
+                            Some(on_disk) => save::agrees(&anchor, len, on_disk),
+                            None => false,
+                        },
+                    }
+                }
+            };
             // Чужой или битый блоб историю не восстановит — и не должен:
             // файл-то на месте, терять его из-за испорченного хвоста незачем.
-            if let Ok(history) = History::decode(&snapshot.history) {
+            if file_agrees
+                && let Some(ref snapshot) = snapshot
+                && let Ok(history) = History::decode(&snapshot.history)
+            {
                 match history.matches_base(&text) {
                     // Файл тот же, на котором снят снапшот: применяем.
                     Ok(true) => {
-                        // Глубина берётся у уже открытого буфера: в снимке её
-                        // нет, а восстановленный документ должен снимать
-                        // снимки по настройке, а не по умолчанию.
+                        // Глубина берётся у уже открытого буфера: в снимке
+                        // её нет, а восстановленный документ должен
+                        // снимать снимки по настройке, а не по умолчанию.
                         if let Ok(restored) = history.restore(&text, buffer.history_depth()) {
                             buffer = restored;
                         }
                     }
-                    // Файл могли поменять снаружи. Применять снапшот нельзя:
-                    // правка извне станет невидимой и уедет под следующим
-                    // сохранением. Открываем файл как есть и говорим об этом.
-                    Ok(false) => changed_outside = true,
+                    // Основа истории не тот текст, что на диске, хотя якорь
+                    // сходится: история старше файла. Накладывать нельзя,
+                    // но и тревожить не о чем — якорь за файл ручается.
+                    Ok(false) => {}
                     Err(_) => {}
                 }
+            }
+            // Файл не тот, на котором снят снапшот: применять нельзя, правка
+            // извне стала бы невидимой и уехала бы под следующим
+            // сохранением. Открываем файл как есть и говорим об этом.
+            if !file_agrees && snapshot.is_some() {
+                changed_outside = true;
+            }
+            // Якорь ставится заново, если буфер видит сейчас другое
+            // содержимое: правка извне стала основой, или якоря не было.
+            // При пропавшем якоре новый на месте правок не выдумывается:
+            // пока правки живы, записываться файлу нельзя честно.
+            if !anchor_lost && (anchor.is_none() || !file_agrees) {
+                save::reanchor(&store, &path, &text).map_err(|e| SessionError::Store {
+                    path: self.paths.database().display().to_string(),
+                    reason: e.message(&crate::api::save::messages::En),
+                })?;
             }
         }
         // Приёмник вешается только если снапшоты положено хранить. Ноль в кольце —
@@ -759,6 +923,8 @@ impl Session {
             lines: LineMap::build(&buffer.read()),
             buffer,
             changed_outside,
+            anchor_lost,
+            saved: false,
             sink_failed,
             snapshot_failed: None,
             interval: self.interval,
@@ -1521,6 +1687,86 @@ mod tests {
             "открыт файл как есть"
         );
         assert!(doc.changed_outside(), "об изменении сообщаем");
+    }
+
+    #[test]
+    fn a_saved_document_leaves_nothing_behind_on_exit() {
+        // После записи работа целиком в файле: и снапшоты, и якорь дальше
+        // держать незачем. Выход после сохранения чистит базу.
+        let tmp = Temp::new("save-forget");
+        let file = tmp.dir.join("doc.txt");
+        std::fs::write(&file, "abc\n").unwrap();
+        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let mut doc = session.open_file(&file).unwrap();
+        doc.insert(3, b"XY").unwrap();
+
+        let written = session.save_document(&doc).unwrap();
+        assert!(
+            matches!(written, save::Write::Written { .. }),
+            "файл под нами не меняли, запись должна пройти: {written:?}"
+        );
+        session.mark_saved(&mut doc);
+        session.forget_snapshots(&file).unwrap();
+
+        let store = session.store().reopen().unwrap();
+        assert!(store.latest(&file).unwrap().is_none());
+        assert!(store.anchor(&file).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unsaved_document_keeps_its_snapshots() {
+        // Несохранённая работа — это ещё не отражённая в файле работа: чистить
+        // её на выходе значило бы терять то, что человек не успел записать.
+        let tmp = Temp::new("save-keep");
+        let file = tmp.dir.join("doc.txt");
+        std::fs::write(&file, "abc\n").unwrap();
+        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let mut doc = session.open_file(&file).unwrap();
+        doc.insert(3, b"XY").unwrap();
+        doc.snapshot();
+
+        let store = session.store().reopen().unwrap();
+        assert_eq!(store.count(&file).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_file_changed_outside_refuses_the_save() {
+        // Чужая правка на диске: затирать её отданной работой — врать. Отказ —
+        // ответ политики, а не ошибка, и на диск не уезжает ничего.
+        let tmp = Temp::new("save-refused");
+        let file = tmp.dir.join("doc.txt");
+        std::fs::write(&file, "abc\n").unwrap();
+        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let mut doc = session.open_file(&file).unwrap();
+        std::fs::write(&file, "чужая правка\n").unwrap();
+        doc.insert(0, b"XY").unwrap();
+
+        assert_eq!(
+            session.save_document(&doc).unwrap(),
+            save::Write::Refused(save::Refusal::Changed)
+        );
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            "чужая правка\n".as_bytes(),
+            "на диске стоит чужое"
+        );
+    }
+
+    #[test]
+    fn save_document_reanchors_to_what_was_written() {
+        // Якорь всегда о том, что мы последними видели: после записи — о
+        // записанном, иначе следующая проверка отвергла бы свой же файл.
+        let tmp = Temp::new("save-reanchor");
+        let file = tmp.dir.join("doc.txt");
+        std::fs::write(&file, "abc\n").unwrap();
+        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let doc = session.open_file(&file).unwrap();
+
+        session.save_document(&doc).unwrap();
+        let store = session.store().reopen().unwrap();
+        let anchor = store.anchor(&file).unwrap().expect("якорь на месте");
+        assert_eq!(anchor.len, 4);
+        assert_eq!(anchor.hash, hash::of(b"abc\n"));
     }
 
     #[test]

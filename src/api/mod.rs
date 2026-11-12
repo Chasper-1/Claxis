@@ -11,6 +11,7 @@ pub mod core;
 pub mod disk;
 pub mod i18n;
 pub mod input;
+pub mod save;
 pub mod term;
 pub mod text;
 pub mod theme;

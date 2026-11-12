@@ -46,6 +46,13 @@ pub trait Messages {
     /// `{bytes}` и `{limit_bytes}` — точные размеры, `{size_gb}` и
     /// `{limit_gb}` — те же числа в гигабайтах.
     fn file_too_large(&self, bytes: u64, size_gb: f64, limit_bytes: u64, limit_gb: f64) -> String;
+    /// Файл не сохранён: `{path}`, `{reason}`.
+    ///
+    /// Причина уже собрана: словами диска, если отказал диск, или словами
+    /// политики сохранения, если она отказалась писать поверх чужой правки.
+    fn save_failed(&self, path: &str, reason: &str) -> String;
+    /// Файл сохранён: `{path}`, `{bytes}` — сколько байт на диске стало.
+    fn saved(&self, path: &str, bytes: u64) -> String;
 }
 
 /// Английские сообщения — язык по умолчанию.
@@ -121,6 +128,20 @@ impl Messages for En {
         )
     }
 
+    fn save_failed(&self, path: &str, reason: &str) -> String {
+        substitute(
+            "cannot save file {path}: {reason}",
+            &[("path", path.to_string()), ("reason", reason.to_string())],
+        )
+    }
+
+    fn saved(&self, path: &str, bytes: u64) -> String {
+        substitute(
+            "saved {path}, {bytes} bytes",
+            &[("path", path.to_string()), ("bytes", group_digits(bytes))],
+        )
+    }
+
     fn file_too_large(&self, bytes: u64, size_gb: f64, limit_bytes: u64, limit_gb: f64) -> String {
         substitute(
             "file is too large: {bytes} bytes ({size_gb} GB),\n\
@@ -170,6 +191,11 @@ pub fn samples() -> Vec<(&'static str, String)> {
             m.snapshot_failed("/home/user/notes.txt", "disk is full"),
         ),
         ("no_usable_config", m.no_usable_config(2)),
+        (
+            "save_failed",
+            m.save_failed("/home/user/notes.txt", "the file was changed outside"),
+        ),
+        ("saved", m.saved("/home/user/notes.txt", 4_096)),
         (
             "schema_failed",
             m.schema_failed("default value of General.history_depth is not a number"),

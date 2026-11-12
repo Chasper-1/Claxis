@@ -1,6 +1,6 @@
 [package]
 name = "claxis-disk"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 
 [features]
@@ -9,6 +9,9 @@ test-support = []
 
 [dependencies]
 claxis-text = { path = "../claxis-text" }
+# Хеш якоря «база ↔ диск»: не криптостойкий, не для подписи, только чтобы
+# очень быстро узнать, что содержимое то же самое.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # bundled: SQLite собирается из исходников, системный пакет не нужен.
 rusqlite = { version = "0.37", features = ["bundled"] }
 # Наблюдение за файлами нужно всем, а доступно не всем: зависимость живёт

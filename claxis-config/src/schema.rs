@@ -272,6 +272,15 @@ pub const KEYS: &[KeyDef] = &[
         kind: Kind::U16,
         comment: "Seconds between snapshots of one document. Zero means no snapshots at all.",
     },
+    KeyDef {
+        file: ConfigFile::Files,
+        path: "General.snapshots_days",
+        default: "7d",
+        kind: Kind::Str,
+        comment: "How long to keep the edits of a file: a number with d, h, m or s \
+                  (a bare number is seconds). Zero means keep until the file is saved \
+                  and the editor exits.",
+    },
     // ── экран статистики после сохранения ────────────────────────────────
     //
     // Как в демо-конфиге: своя секция с подсекциями, а не плоские ключи в
