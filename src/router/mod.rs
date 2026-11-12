@@ -28,26 +28,37 @@
 //!
 //! # Как читать
 //!
-//! Файлы внутри идут от простого к сложному:
-//!
 //! | Файл | Что связывает |
 //! | --- | --- |
 //! | [`session`] | буфер и хранилище: открыть документ, снять снапшот на диск |
+//! | [`document`] | открытый документ: текст, карта строк, статистика |
+//! | [`lines`] | карта строк документа: едет вместе с текстом |
+//! | [`sink`] | приёмник снапшота: кольцо на диске и проверка записи |
+//! | [`clock`] | источник времени |
+//! | [`error`] | ошибки сессии |
 //! | [`stats`] | что человек делал: символы, нажатия, занятая история |
 //! | [`cycle`] | цикл: события терминала идут в документ |
 //! | [`settings`] | конфиг и перевод: язык, значения настроек, комментарии |
 //! | [`editor`] | всё вместе: то, с чего начинается запуск |
 
+mod clock;
 mod commands;
 mod cycle;
+mod document;
 mod editor;
+pub mod error;
+mod lines;
 pub mod session;
 mod settings;
+mod sink;
 pub mod stats;
 
 pub use crate::api::core::LineMap;
+pub use clock::{Clock, FixedClock, SystemClock};
 pub use cycle::{Action, Cycle};
+pub use document::Document;
 pub use editor::{Editor, Reloaded, StartError};
-pub use session::{Applied, Document, Session, SessionError};
+pub use error::SessionError;
+pub use session::{Applied, Session};
 pub use settings::Settings;
 pub use stats::Stats;

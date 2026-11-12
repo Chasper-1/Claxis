@@ -12,3 +12,10 @@ pub use claxis_disk::{
     Anchor, Error, Snapshot, SnapshotStore, StorePaths, Watch, create_dir, file_len, from_blob,
     hash, list_files, read_bytes, read_text, to_blob, write_blob, write_text,
 };
+
+/// Временные каталоги для тестов: только под тестами.
+///
+/// Модуль есть в крейте диска только с фичей `test-support`, а она включена
+/// для тестов этого пакета. В обычной сборке ручки нет — и не нужно.
+#[cfg(test)]
+pub use claxis_disk::temp;

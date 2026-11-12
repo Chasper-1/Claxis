@@ -1,537 +1,19 @@
-//! Связывает документ с хранилищем снапшотов.
+//! Редакторская сессия: хранилище снапшотов и открытые документы.
 //!
-//! Оба крейта по отдельности ничего не знают друг о друге: `claxis-buffer`
-//! отдаёт текст и историю приёмнику и не знает, куда они уйдут,
-//! `claxis-disk` умеет только складывать и доставать байты. Соединяются они
-//! здесь — это и есть работа маршрутизатора.
+//! Сессия держит хранилище и настройки снапшотов и открывает документы:
+//! читает файл, восстанавливает историю из базы и решает, можно ли писать.
 
-use std::cell::RefCell;
-use std::fmt;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::api::buffer::defaults::buffer::HISTORY_DEPTH;
-use crate::api::buffer::{
-    Document as Rope, Error as RopeError, History, MIN_DEPTH, Record as RopeRecord, SnapshotSink,
-};
-use crate::api::core::LineMap;
+use crate::api::buffer::{Error as RopeError, History, MIN_DEPTH};
 use crate::api::disk::{KEEP, PERSIST, SnapshotStore, StorePaths, file_len, hash, read_bytes};
 use crate::api::save;
-use crate::messages::Messages;
-use crate::router::stats::{self, Stats};
-
-/// Что пошло не так в сессии.
-#[derive(Debug)]
-pub enum SessionError {
-    /// Документ не создан: глубина истории недопустима.
-    Buffer(crate::api::buffer::Error),
-    /// Хранилище не открылось.
-    Store { path: String, reason: String },
-    /// Файл документа не прочитан.
-    ReadFile { path: String, reason: String },
-    /// Файл больше, чем помещается в `u32`.
-    FileTooLarge { bytes: u64 },
-    /// Файл не сохранён: `{path}`, `{reason}`.
-    ///
-    /// Здесь две разные правды: диск отказал — и тогда причина его слова, а
-    /// политика записи отказалась — и тогда причина её решение. Оба текста
-    /// приходят собранными: расшифровкой `save::messages` занимается слой
-    /// выше, к ней сводится всё, что сохранение может сказать.
-    Save { path: String, reason: String },
-    /// Объявления команд не разобрались.
-    ///
-    /// Список команд приходит из крейтов при сборке программы, поэтому такая
-    /// ошибка означает опечатку в объявлении, а не поломку у пользователя.
-    Commands(crate::api::commands::Error),
-}
-
-impl SessionError {
-    /// Текст ошибки на языке каталога. По умолчанию — английский.
-    pub fn message(&self, messages: &dyn Messages) -> String {
-        match self {
-            SessionError::Buffer(e) => messages.buffer_error(e),
-            SessionError::Commands(e) => messages.commands_error(e),
-            SessionError::Store { path, reason } => messages.store_failed(path, reason),
-            SessionError::ReadFile { path, reason } => messages.read_file_failed(path, reason),
-            SessionError::FileTooLarge { bytes } => messages.file_too_large(
-                *bytes,
-                *bytes as f64 / 1_000_000_000.0,
-                u32::MAX as u64,
-                u32::MAX as f64 / 1_000_000_000.0,
-            ),
-            SessionError::Save { path, reason } => messages.save_failed(path, reason),
-        }
-    }
-
-    /// Текст ошибки на языке по умолчанию.
-    pub fn text(&self) -> String {
-        self.message(&crate::messages::En)
-    }
-}
-
-impl fmt::Display for SessionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.text())
-    }
-}
-
-impl std::error::Error for SessionError {}
-
-/// Приёмник снапшота: кольцо на диске и один снимок в памяти.
-///
-/// Это тот самый стык: документ отдаёт текст и историю, дальше они уходят в
-/// sqlite байтами, в том формате, в котором их собрал rope.
-#[derive(Debug)]
-struct StoreSink {
-    store: SnapshotStore,
-    /// Последняя ошибка записи: снапшот не лёг, и об этом должен узнать человек.
-    ///
-    /// Ошибку нельзя вернуть из `accept`: у приёмника нет вызывающего, а
-    /// разорвать из-за неё правку нельзя — текст уже изменён. Поэтому ошибка
-    /// кладётся в общую ячейку, документ забирает её после снятия снапшота и
-    /// говорит о ней пользователю. Молчаливая потеря работы хуже всего.
-    failed: Rc<RefCell<Option<String>>>,
-}
-
-/// Сколько раз пишется снимок, прежде чем признать запись негодной.
-///
-/// Повтор спасает от сбоя записи и не спасает от порчи извне: если содержимое
-/// переписали между попытками, переписывание будет затирать чужое. Разница
-/// видна по тому, что именно вернулось, и на пятый раз об этом сказано.
-const WRITE_ATTEMPTS: u32 = 5;
-
-impl SnapshotSink for StoreSink {
-    fn accept(&mut self, file: &Path, text: &[u8], history: &[u8]) -> bool {
-        // История идёт вместе с текстом: без неё после перезапуска отменять
-        // было бы нечего, то есть снапшот сохранил бы половину работы.
-        //
-        // Запись проверяется чтением обратно. Если содержимое разошлось, его
-        // переписывают: с первого раза это может быть сбой записи, и повтор
-        // проходит. Пять попыток подряд — уже не сбой, а порча извне, и
-        // перезапись тут бессильна: она затрёт то, что сделали руками.
-        let mut last: Option<crate::api::disk::Error> = None;
-        for _ in 0..WRITE_ATTEMPTS {
-            let seq = match self.store.put(file, text, history) {
-                Ok(seq) => seq,
-                Err(e) => {
-                    last = Some(e);
-                    continue;
-                }
-            };
-            match self.read_back(file, seq, text, history) {
-                Ok(()) => return true,
-                Err(e) => last = Some(e),
-            }
-        }
-        // Пять попыток не помогли. Что именно — известно: ошибка с файлом,
-        // номером снимка и обеими суммами, а не «не получилось». Возвращаем
-        // `false`: снимок не сохранён, история остаётся в памяти.
-        // Сюда можно прийти только с ошибкой: каждая попытка либо вернула
-        // `true`, либо записала причину в `last`. Если инвариант когда-нибудь
-        // сломают, пользователь не получит выдуманный текст на чужом языке.
-        if let Some(error) = last {
-            *self.failed.borrow_mut() = Some(error.text());
-        }
-        false
-    }
-}
-
-impl StoreSink {
-    /// Прочитать только что записанный снимок и сверить с тем, что писали.
-    ///
-    /// Сверку делает хранилище по своей сумме: если содержимое переписали
-    /// между записью и чтением, вернётся ошибка порчи, и вызывающий решит,
-    /// переписывать или жаловаться.
-    fn read_back(
-        &self,
-        file: &Path,
-        seq: u64,
-        text: &[u8],
-        history: &[u8],
-    ) -> Result<(), crate::api::disk::Error> {
-        let snapshot =
-            self.store
-                .get(file, seq)?
-                .ok_or_else(|| crate::api::disk::Error::NoSnapshot {
-                    file: file.display().to_string(),
-                })?;
-        if snapshot.text != text || snapshot.history != history {
-            return Err(crate::api::disk::Error::Corrupted {
-                file: file.display().to_string(),
-                seq,
-                expected: crate::api::disk::checksum::of_pair(text, history),
-                got: snapshot.checksum,
-            });
-        }
-        Ok(())
-    }
-}
-
-/// Источник времени.
-///
-/// Отдельный тип, а не `Instant::now()` в коде: иначе проверить, что сработало
-/// правильно, можно было бы только ожиданием вживую.
-pub trait Clock: std::fmt::Debug {
-    /// Сколько прошло с начала работы процесса.
-    fn elapsed(&self) -> Duration;
-}
-
-/// Часы, которые двигает тест: ждать настоящие пять минут нельзя.
-#[derive(Clone, Copy, Debug)]
-pub struct FixedClock(pub Duration);
-
-impl FixedClock {
-    /// Часы, прошедшие указанное время от старта процесса.
-    pub fn after(elapsed: Duration) -> Self {
-        Self(elapsed)
-    }
-}
-
-impl Clock for FixedClock {
-    fn elapsed(&self) -> Duration {
-        self.0
-    }
-}
-
-/// Настоящие часы.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn elapsed(&self) -> Duration {
-        use std::sync::OnceLock;
-        use std::time::Instant;
-        static START: OnceLock<Instant> = OnceLock::new();
-        START.get_or_init(Instant::now).elapsed()
-    }
-}
-
-/// Открытый документ: rope плюс привязка к файлу.
-///
-/// Время живёт здесь, а не в документе: снапшот — это решение сессии, у неё
-/// есть и документ, и хранилище. Сам документ про часы не знает и снимает
-/// снапшот только по прямой просьбе.
-#[derive(Debug)]
-pub struct Document {
-    path: PathBuf,
-    buffer: Rope,
-    /// Через сколько снимать следующий снапшот.
-    interval: Duration,
-    /// Сколько прошло с начала работы, когда снят последний снапшот.
-    last_snapshot: Duration,
-    /// Откуда берётся время.
-    clock: Box<dyn Clock>,
-    /// Что набрано за сеанс работы над этим документом.
-    stats: Stats,
-    /// Где в документе переводы строк.
-    ///
-    /// Карта живёт здесь, а не в буфере: документ знает про байты и ничего не
-    /// знает про строки. Сюда приходят только дельты правок.
-    lines: LineMap,
-    /// Файл на диске разошёлся с тем, на котором строился снапшот.
-    ///
-    /// Снапшот тогда не применяется: иначе правка, сделанная снаружи, была бы
-    /// не видна и уехала бы под следующим сохранением. Пользователю об этом
-    /// говорит вызывающий.
-    changed_outside: bool,
-    /// Якорь «база ↔ диск» пропал, а правки в базе остались.
-    ///
-    /// Файл мог измениться, пока якоря не было, и проверять нечем. Новый
-    /// якорь на месте правок не выдумывается: сохранение такого файла и
-    /// дальше будет отказываться писать, пока правки не разберут руками.
-    anchor_lost: bool,
-    /// Документ записан на диск в этом сеансе.
-    ///
-    /// По нему выход решает, чистить ли историю файла в базе: несохранённые
-    /// правки чистке не подлежат — это ещё не отражённая в файле работа.
-    saved: bool,
-    /// Ячейка, куда приёмник кладёт ошибку записи снапшота.
-    ///
-    /// Приёмник живёт внутри rope и обратного хода не имеет: ошибку забирает
-    /// документ при следующем снятии снапшота и показывает пользователю.
-    sink_failed: Rc<RefCell<Option<String>>>,
-    /// Ошибка записи снапшота, ждущая показа.
-    snapshot_failed: Option<String>,
-}
-
-impl Document {
-    /// Путь к файлу.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Документ для чтения: текст, история, длина.
-    ///
-    /// Правок тут нет намеренно: иначе можно изменить документ мимо карты
-    /// строк и статистики, и они тихо разъедутся.
-    pub fn buffer(&self) -> &Rope {
-        &self.buffer
-    }
-
-    /// Текст документа.
-    pub fn text(&self) -> Vec<u8> {
-        self.buffer.read()
-    }
-
-    /// Карта строк документа.
-    pub fn lines(&self) -> &LineMap {
-        &self.lines
-    }
-
-    /// Файл меняли снаружи, пока редактор был закрыт.
-    ///
-    /// Снапшот тогда не применялся: иначе правка извне была бы не видна и
-    /// уехала бы под следующим сохранением. Документ открыт как есть, и об
-    /// этом честно сказано.
-    pub fn changed_outside(&self) -> bool {
-        self.changed_outside
-    }
-
-    /// Якорь «база ↔ диск» пропал, а правки в базе остались.
-    ///
-    /// Файл могли поменять, пока сверять было нечем: правки сохраняются
-    /// как были, а файл на запись не пойдёт, пока человек не разберёт
-    /// содержимое руками.
-    pub fn anchor_lost(&self) -> bool {
-        self.anchor_lost
-    }
-
-    /// Документ записан на диск в этом сеансе.
-    pub fn saved(&self) -> bool {
-        self.saved
-    }
-
-    /// Отметить документ записанным. Делает сохранение после успешной записи.
-    pub fn mark_saved(&mut self) {
-        self.saved = true;
-    }
-
-    /// Номер строки для позиции, начиная с нуля.
-    pub fn line_of(&self, pos: u32) -> u32 {
-        self.lines.line_of(pos)
-    }
-
-    /// Сколько строк в документе.
-    pub fn line_count(&self) -> u32 {
-        self.lines.line_count()
-    }
-
-    /// Позиция, с которой начинается строка.
-    pub fn offset_of_line(&self, line: u32) -> u32 {
-        self.lines.offset_of_line(line, self.buffer.len())
-    }
-
-    /// Позиция конца строки: сам перевод строки.
-    pub fn end_of_line(&self, line: u32) -> u32 {
-        self.lines.end_of_line(line, self.buffer.len())
-    }
-
-    /// Что собрано за сеанс: символы, нажатия, правки.
-    pub fn stats(&self) -> Stats {
-        self.stats
-    }
-
-    /// Вставить текст и посчитать введённые символы.
-    pub fn insert(&mut self, anchor: u32, data: &[u8]) -> Result<(), RopeError> {
-        self.buffer.insert(anchor, data)?;
-        self.lines.insert(anchor, data);
-        stats::note_input(&mut self.stats, data);
-        self.snapshot_if_over_depth();
-        Ok(())
-    }
-
-    /// Вырезать диапазон и посчитать удалённые символы.
-    pub fn delete(&mut self, anchor: u32, len: u32) -> Result<(), RopeError> {
-        self.buffer.delete(anchor, len)?;
-        self.lines.delete(anchor, anchor + len);
-        stats::note_deleted(&mut self.stats, len);
-        self.snapshot_if_over_depth();
-        Ok(())
-    }
-
-    /// Заменить диапазон: вставка и удаление одной операцией.
-    pub fn replace(&mut self, anchor: u32, len: u32, data: &[u8]) -> Result<(), RopeError> {
-        self.buffer.replace(anchor, len, data)?;
-        self.replace_in_lines(anchor, len, data);
-        stats::note_replace(&mut self.stats, data, len);
-        self.snapshot_if_over_depth();
-        Ok(())
-    }
-
-    /// Провести карту строк по правке: диапазон исчез, на его место пришёл текст.
-    ///
-    /// Один ход на оба действия, а не два вызова карты: между ними не должно
-    /// быть места, где документ уже изменён, а карта ещё нет.
-    fn replace_in_lines(&mut self, anchor: u32, len: u32, data: &[u8]) {
-        if len > 0 {
-            self.lines.delete(anchor, anchor + len);
-        }
-        self.lines.insert(anchor, data);
-    }
-
-    /// Отменить правку. Карта строк едет вместе с текстом.
-    pub fn undo(&mut self) -> Result<Option<u32>, RopeError> {
-        let path = self.buffer.path();
-        let Some(id) = self.buffer.undo()? else {
-            return Ok(None);
-        };
-        // Запись узнаём по её месту в ветке: отмена убрала последнюю.
-        if let Some(record) = path.get(path.len().wrapping_sub(1)) {
-            self.undo_line(record);
-        }
-        Ok(Some(id))
-    }
-
-    /// Откатить карту строк под обратную операцию.
-    fn undo_line(&mut self, record: &RopeRecord) {
-        match record {
-            // Отмена вставки: вырезать вставленное.
-            RopeRecord::Insert { anchor, head, .. } => self.lines.delete(*anchor, *head),
-            // Отмена удаления: вернуть вырезанное.
-            RopeRecord::Delete { anchor, .. } => self.restore_lines(*anchor, record),
-            // Отмена замены: вырезать вставленное и вернуть вырезанное.
-            RopeRecord::Replace { anchor, head, .. } => {
-                if *head > *anchor {
-                    self.lines.delete(*anchor, *head);
-                }
-                self.restore_lines(*anchor, record);
-            }
-        }
-    }
-
-    /// Вернуть в карту текст, который запись вырезала из документа.
-    ///
-    /// Смещение берётся из самой записи: после отмены на прежнем месте может
-    /// стоять совсем другое. Нет текста — значит отменять было нечего: пустая
-    /// замена оставляет карту как есть.
-    fn restore_lines(&mut self, anchor: u32, record: &RopeRecord) {
-        let Some(removed) = self.buffer.removed_text(record) else {
-            return;
-        };
-        let removed = removed.to_vec();
-        self.lines.insert(anchor, &removed);
-    }
-
-    /// Повторить отменённую правку. Карта строк едет вместе с текстом.
-    pub fn redo(&mut self) -> Result<Option<u32>, RopeError> {
-        let before = self.buffer.path().len();
-        let Some(id) = self.buffer.redo()? else {
-            return Ok(None);
-        };
-        // Повтор добавил одну запись в конец ветки.
-        if let Some(record) = self.buffer.path().get(before) {
-            self.redo_line(record);
-        }
-        Ok(Some(id))
-    }
-
-    /// Провести карту строк по прямой правке.
-    fn redo_line(&mut self, record: &RopeRecord) {
-        match record {
-            RopeRecord::Insert { anchor, .. } => {
-                if let Some(piece) = self.buffer.inserted_text(record) {
-                    let piece = piece.to_vec();
-                    self.lines.insert(*anchor, &piece);
-                }
-            }
-            RopeRecord::Delete { anchor, head, .. } => self.lines.delete(*anchor, *head),
-            RopeRecord::Replace { anchor, head, .. } => {
-                self.lines.delete(*anchor, *head);
-                if let Some(piece) = self.buffer.inserted_text(record) {
-                    let piece = piece.to_vec();
-                    self.lines.insert(*anchor, &piece);
-                }
-            }
-        }
-    }
-
-    /// Записать одно нажатие.
-    ///
-    /// Время нажатия дописывается отдельно: оно известно только в момент
-    /// отпускания, а нажатие без отпускания — обычное дело.
-    pub fn note_press(&mut self) {
-        stats::note_press(&mut self.stats);
-    }
-
-    /// Дописать время, которое нажатие пролежало.
-    pub fn note_held(&mut self, held: Duration) {
-        stats::note_held(&mut self.stats, held);
-    }
-
-    /// Через сколько после последнего снапшота снимать следующий.
-    pub fn snapshot_interval(&self) -> Duration {
-        self.interval
-    }
-
-    /// Подменить часы: тестам нужно время, которое они двигают сами.
-    ///
-    /// Отсчёт не сбрасывается: иначе перевести часы вперёд было бы нельзя —
-    /// документ решил бы, что только что снял снапшот.
-    pub fn set_clock(&mut self, clock: Box<dyn Clock>) {
-        self.clock = clock;
-    }
-
-    /// Снять снапшот, если с последнего прошло достаточно времени.
-    ///
-    /// Время, а не число правок: человек может править один и тот же абзац
-    /// десять минут, и снапшот каждые пять минут отдаст память обратно. И
-    /// наоборот — сто правок подряд за минуту снапшот не заслужили. Предел
-    /// памяти — отдельный повод, и он проверяется прямо на правке.
-    pub fn snapshot_if_due(&mut self) {
-        // Ноль — это «снимков нет вообще», а не «на каждой правке». Иначе
-        // человек, выключивший интервал, получил бы обратный смысл настройки
-        // и вдвое больше работы на диске, чем просил.
-        if self.interval.is_zero() {
-            return;
-        }
-        if self.clock.elapsed().saturating_sub(self.last_snapshot) >= self.interval {
-            self.snapshot();
-        }
-    }
-
-    /// Снять снапшот и отсчитать время заново.
-    pub fn snapshot(&mut self) {
-        // Текст от этого не меняется, поэтому карта строк остаётся в силе.
-        self.buffer.snapshot();
-        self.take_sink_failure();
-        self.last_snapshot = self.clock.elapsed();
-    }
-
-    /// Снять снапшот, если с прошлого прошло достаточно правок.
-    ///
-    /// Это второй повод для снимка, кроме времени: время сохраняет сессию, а
-    /// глубина задаёт шаг между снимками. Время сдвигается только когда снимок
-    /// правда снят, — иначе следующий плановый снимок отложился бы.
-    fn snapshot_if_over_depth(&mut self) {
-        let before = self.buffer.snapshots_taken();
-        self.buffer.snapshot_if_over_depth();
-        // Ошибку приёмника забираем в любом случае: снимок мог не лечь, и
-        // тогда история осталась в памяти — об этом человек обязан узнать.
-        self.take_sink_failure();
-        if self.buffer.snapshots_taken() != before {
-            self.last_snapshot = self.clock.elapsed();
-        }
-    }
-
-    /// Забрать ошибку приёмника, если он не смог записать снимок.
-    fn take_sink_failure(&mut self) {
-        // Приёмник отдал текст и историю и ошибться мог там, где у него нет
-        // вызывающего. Ошибку забираем здесь: она про работу пользователя, а не
-        // про кеш, и молчать о ней нельзя.
-        if let Some(reason) = self.sink_failed.borrow_mut().take() {
-            self.snapshot_failed = Some(reason);
-        }
-    }
-
-    /// Снапшот не лёг на диск. Текст с причиной, уже переведённый.
-    ///
-    /// Пока ошибка не забрана вызывающим, она здесь: следующий вызов вернёт её
-    /// и очистит, чтобы одно и то же не сообщать дважды.
-    pub fn snapshot_error(&mut self) -> Option<String> {
-        self.snapshot_failed.take()
-    }
-}
+use crate::router::document::Document;
+use crate::router::error::SessionError;
+use crate::router::lines::Lines;
+use crate::router::sink::StoreSink;
 
 /// Снапшот по умолчанию: раз в пять минут.
 pub const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
@@ -629,7 +111,7 @@ impl Session {
 
     /// То же, но путь принимается как ссылка.
     pub fn open_at_ref(
-        dir: &Path,
+        dir: &std::path::Path,
         keep: u8,
         persist: bool,
         history_depth: u32,
@@ -694,7 +176,7 @@ impl Session {
     ///
     /// После успешного сохранения и выхода: работа уже в файле, и истории
     /// вокруг файла дальше держать незачем.
-    pub fn forget_snapshots(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
+    pub fn forget_snapshots(&self, path: impl AsRef<std::path::Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
         self.store.forget(path).map_err(|e| SessionError::Save {
             path: path.display().to_string(),
@@ -782,7 +264,7 @@ impl Session {
     ///
     /// Файла может не быть — тогда это новый пустой документ, ошибка не
     /// возникает.
-    pub fn open_file(&self, path: impl AsRef<Path>) -> Result<Document, SessionError> {
+    pub fn open_file(&self, path: impl AsRef<std::path::Path>) -> Result<Document, SessionError> {
         let path = path.as_ref().to_path_buf();
 
         // Проверяем размер до чтения: буфер работает с u32, файл больше
@@ -798,8 +280,11 @@ impl Session {
         }
 
         let text = read_bytes(&path).map_err(read_error)?.unwrap_or_default();
-        let mut buffer = Rope::with_depth(text.clone(), self.history_depth_for_new_documents()?)
-            .map_err(SessionError::Buffer)?;
+        let mut buffer = crate::api::buffer::Document::with_depth(
+            text.clone(),
+            self.history_depth_for_new_documents()?,
+        )
+        .map_err(SessionError::Buffer)?;
         let mut changed_outside = false;
         let mut anchor_lost = false;
         // Снапшот хранит только правки поверх файла. Исходный текст уже
@@ -901,13 +386,10 @@ impl Session {
                 path: self.paths.database().display().to_string(),
                 reason: e.to_string(),
             })?;
-            let failed: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+            let failed = std::rc::Rc::new(std::cell::RefCell::new(None));
             buffer.set_sink(
                 path.clone(),
-                Box::new(StoreSink {
-                    store,
-                    failed: Rc::clone(&failed),
-                }),
+                Box::new(StoreSink::new(store, std::rc::Rc::clone(&failed))),
             );
             Some(failed)
         } else {
@@ -916,72 +398,72 @@ impl Session {
         // Без приёмника ошибки писать некуда: ячейка всё равно нужна, чтобы
         // документ ждал одинаково в обоих случаях.
         let sink_failed = sink_failed.unwrap_or_default();
-        Ok(Document {
+        Ok(Document::from_parts(crate::router::document::Parts {
             path,
             // Карта строится по тексту, а не едет дельтами: документ только что
             // открыт, истории правок ещё не было.
-            lines: LineMap::build(&buffer.read()),
+            lines: Lines::build(&buffer.read()),
             buffer,
             changed_outside,
             anchor_lost,
-            saved: false,
             sink_failed,
-            snapshot_failed: None,
             interval: self.interval,
-            last_snapshot: Duration::ZERO,
-            clock: Box::new(SystemClock),
-            stats: Stats::default(),
-        })
+            clock: Box::new(crate::router::clock::SystemClock),
+        }))
     }
 }
 
+/// Приспособления для тестов: общие на несколько файлов.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod testing {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    /// Отдельный каталог под каждый тест: базы не делятся.
-    struct Temp {
-        dir: PathBuf,
+    use crate::router::clock::FixedClock;
+    use crate::router::session::Session;
+
+    /// Каталог под тест: базы не делятся, и каталог убирается вместе с собой.
+    pub struct Temp {
+        /// Хранилище каталога: убирает его при выходе из теста.
+        inner: crate::api::disk::temp::Temp,
     }
 
     impl Temp {
-        fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("claxis-session-{name}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Self { dir }
+        /// Новый каталог под тест.
+        pub fn new(name: &str) -> Self {
+            Self {
+                inner: crate::api::disk::temp::Temp::new(name),
+            }
+        }
+
+        /// Каталог, в котором живёт база и файлы теста.
+        pub fn dir(&self) -> &Path {
+            self.inner.path()
         }
 
         /// Файл документа рядом с базой.
-        fn file(&self, name: &str) -> PathBuf {
-            self.dir.join(name)
+        pub fn file(&self, name: &str) -> PathBuf {
+            self.dir().join(name)
         }
 
-        fn session(&self, keep: u8) -> Session {
-            Session::open_at(self.dir.clone(), keep).unwrap()
+        /// Сессия с обычной глубиной истории.
+        pub fn session(&self, keep: u8) -> Session {
+            Session::open_at(self.dir().to_path_buf(), keep).unwrap()
         }
 
         /// Сессия с короткой историей: снапшот срабатывает быстро.
-        fn short_session(&self, keep: u8, depth: u32) -> Session {
-            Session::open_at_with(self.dir.clone(), keep, true, depth).unwrap()
+        pub fn short_session(&self, keep: u8, depth: u32) -> Session {
+            Session::open_at_with(self.dir().to_path_buf(), keep, true, depth).unwrap()
         }
 
         /// Сессия, которая не пишет снапшоты на диск.
-        fn no_persist_session(&self, keep: u8, depth: u32) -> Session {
-            Session::open_at_with(self.dir.clone(), keep, false, depth).unwrap()
-        }
-    }
-
-    impl Drop for Temp {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+        pub fn no_persist_session(&self, keep: u8, depth: u32) -> Session {
+            Session::open_at_with(self.dir().to_path_buf(), keep, false, depth).unwrap()
         }
     }
 
     /// Набрать текст и снять снапшот, дождавшись интервала на поддельных часах.
-    fn type_until_snapshot(session: &Session, file: &Path, chunk: &str) -> usize {
+    pub fn type_until_snapshot(session: &Session, file: &Path, chunk: &str) -> usize {
         let mut doc = session.open_file(file).unwrap();
         // Пока часы стоят, снапшот не снимется ни при какой правке.
         doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
@@ -998,283 +480,14 @@ mod tests {
         assert_eq!(doc.buffer().snapshots_taken(), 1, "снапшот не сработал");
         i
     }
+}
 
-    /// Документ с настоящей сессией и настоящим приёмником.
-    fn doc_in(dir: &Path) -> Document {
-        let file = dir.join("a.rs");
-        std::fs::write(&file, "abc\n").unwrap();
-        Session::open_at_with(dir, 3, true, 64)
-            .unwrap()
-            .open_file(&file)
-            .unwrap()
-    }
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("claxis-session-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn a_snapshot_that_failed_to_write_is_reported() {
-        // Приёмник снапшотов не может вернуть ошибку: у него нет вызывающего.
-        // Молчать об этом нельзя — человек закрыл бы редактор, решив, что работа
-        // сохранена, и потерял бы её.
-        let dir = temp_dir("snapshot-failed");
-        let mut doc = doc_in(&dir);
-
-        // Ошибка приходит от приёмника в общую ячейку — так же, как при
-        // настоящей поломке диска.
-        *doc.sink_failed.borrow_mut() = Some("диск кончился".to_string());
-
-        doc.snapshot();
-        let reason = doc
-            .snapshot_error()
-            .expect("ошибка записи снапшота обязана дойти до документа");
-        assert_eq!(reason, "диск кончился");
-        // Второй раз то же не повторяется: показали один раз и хватит.
-        assert!(
-            doc.snapshot_error().is_none(),
-            "одна ошибка — одно сообщение"
-        );
-    }
-
-    #[test]
-    fn the_line_map_stays_in_sync_across_snapshots() {
-        // Снимок не меняет текст и не рвёт историю. Карта строк должна
-        // совпадать с текстом после каждого шага отмены.
-        let tmp = Temp::new("lines-through-ring");
-        let file = tmp.file("a.rs");
-        let session = tmp.short_session(3, 1_000);
-        let mut doc = session.open_file(&file).unwrap();
-
-        // Три строки, между снимками переводы строк двигаются.
-        doc.insert(0, "один\nдва\nтри".as_bytes()).unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(300))));
-        doc.snapshot_if_due();
-
-        doc.insert(0, "ноль\n".as_bytes()).unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(600))));
-        doc.snapshot_if_due();
-
-        let before = LineMap::build(&doc.text());
-        assert_eq!(
-            doc.lines().breaks(),
-            before.breaks(),
-            "до отката карта жива"
-        );
-
-        // Откатываем всё до основания, проверяя карту на каждом шаге.
-        let mut undone = false;
-        while doc.undo().unwrap().is_some() {
-            let fresh = LineMap::build(&doc.text());
-            assert_eq!(
-                doc.lines().breaks(),
-                fresh.breaks(),
-                "карта разошлась с текстом {:?}",
-                doc.text()
-            );
-            assert_eq!(doc.line_count(), fresh.line_count());
-            undone = true;
-        }
-        assert!(undone, "откат должен был что-то отменить");
-        assert_eq!(doc.text(), Vec::<u8>::new(), "откатилось всё");
-        assert_eq!(
-            doc.lines().breaks(),
-            LineMap::build(&doc.text()).breaks(),
-            "после полного отката карта совпадает"
-        );
-    }
-
-    #[test]
-    fn undo_walks_back_through_all_edits() {
-        // Снимки не обрезают память: человек отматывает всё, что наработал,
-        // хотя на диск легли четыре снимка.
-        let tmp = Temp::new("undo-through-ring");
-        let file = tmp.file("a.rs");
-        let session = tmp.short_session(4, 1_000);
-        let mut doc = session.open_file(&file).unwrap();
-
-        // Четыре снимка, между ними по одной правке.
-        for round in 0..4u32 {
-            doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
-            doc.insert(doc.buffer().len(), b"x").unwrap();
-            doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(
-                300 * (round as u64 + 1),
-            ))));
-            doc.snapshot_if_due();
-        }
-        assert_eq!(session.store().count(&file).unwrap(), 4, "кольцо полное");
-
-        // Теперь четыре правки назад — вся история ещё в памяти.
-        for _ in 0..4 {
-            doc.undo()
-                .unwrap()
-                .expect("откат по истории должен продолжаться");
-        }
-        assert!(doc.text().is_empty(), "откатилось не всё");
-    }
-
-    #[test]
-    fn undo_stops_after_the_last_edit() {
-        // Дальше основания истории идти некуда, и это должно быть понятно,
-        // а не выглядеть как зависшая отмена.
-        let tmp = Temp::new("undo-ring-end");
-        let file = tmp.file("a.rs");
-        let session = tmp.short_session(4, 1_000);
-        let mut doc = session.open_file(&file).unwrap();
-
-        doc.insert(doc.buffer().len(), b"x").unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(300))));
-        doc.snapshot_if_due();
-        assert_eq!(doc.buffer().snapshots_taken(), 1, "снимок снят");
-        assert_eq!(session.store().count(&file).unwrap(), 1, "и лежит в кольце");
-
-        doc.undo().unwrap().expect("правка отменяется по истории");
-        assert!(doc.text().is_empty(), "первая правка откатилась");
-        assert!(
-            doc.undo().unwrap().is_none(),
-            "правка одна, дальше откатываться некуда"
-        );
-    }
-
-    #[test]
-    fn without_snapshots_undo_stops_at_the_base() {
-        // `keep = 0` — снимки на диск не пишутся. Откат всё равно идёт по
-        // памяти до основания: это честное «дальше некуда».
-        let tmp = Temp::new("undo-no-ring");
-        let file = tmp.file("a.rs");
-        let session = tmp.no_persist_session(0, 1_000);
-        let mut doc = session.open_file(&file).unwrap();
-
-        doc.insert(doc.buffer().len(), b"x").unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(300))));
-        doc.snapshot_if_due();
-
-        doc.undo()
-            .unwrap()
-            .expect("правка отменяется по памяти, кольца нет");
-        assert!(doc.text().is_empty());
-        assert!(
-            doc.undo().unwrap().is_none(),
-            "без кольца откат дальше не идёт"
-        );
-    }
-
-    #[test]
-    fn without_a_ring_the_memory_keeps_the_whole_undo_chain() {
-        // `keep = 0` — это «снимков не делаем», а не «снимки делаем и роняем
-        // историю». Без кольца история остаётся в памяти целиком.
-        let tmp = Temp::new("no-ring-history");
-        let file = tmp.file("a.rs");
-        let session = tmp.session(0);
-        let mut doc = session.open_file(&file).unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
-
-        for _ in 0..5 {
-            let at = doc.buffer().len();
-            doc.insert(at, b"x").unwrap();
-            doc.snapshot_if_due();
-        }
-        assert_eq!(
-            session.store().count(&file).unwrap(),
-            0,
-            "на диск ничего не пишется"
-        );
-        assert_eq!(
-            doc.buffer().path().len(),
-            5,
-            "история в памяти осталась целой"
-        );
-
-        for i in (0..5u32).rev() {
-            doc.undo().unwrap().expect("откат по памяти");
-            assert_eq!(doc.text(), "x".repeat(i as usize).into_bytes());
-        }
-        assert!(doc.undo().unwrap().is_none());
-    }
-
-    #[test]
-    fn a_snapshot_does_not_stop_undo_while_it_is_still_written_to_disk() {
-        // Обе способности сразу: история живёт в памяти целиком, и та же
-        // история уезжает на диск. Отменять можно через любой снапшот.
-        let tmp = Temp::new("undo-through-snapshot");
-        let file = tmp.file("a.rs");
-        let session = tmp.short_session(3, 1_000);
-        let mut doc = session.open_file(&file).unwrap();
-
-        // Часы стоят: правки идут, но пять минут ещё не прошло.
-        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
-        for _ in 0..3 {
-            let at = doc.buffer().len();
-            doc.insert(at, b"x").unwrap();
-            doc.snapshot_if_due();
-        }
-        assert_eq!(
-            doc.buffer().snapshots_taken(),
-            0,
-            "за три правки подряд снапшот не заслужили"
-        );
-
-        // Пять минут прошло — снапшот снят, история на диске.
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(600))));
-        doc.snapshot_if_due();
-        let stored = session.store().count(&file).unwrap();
-        assert!(stored > 0, "на диске должен быть хоть один снапшот");
-
-        // Отмена идёт через снапшот насквозь: все три правки.
-        for i in (0..3).rev() {
-            doc.undo().unwrap().expect("отменять есть что");
-            assert_eq!(doc.text(), b"x".repeat(i));
-        }
-        assert!(doc.undo().unwrap().is_none(), "дальше отменять нечего");
-    }
-
-    #[test]
-    fn an_untouched_document_has_no_snapshot_to_restore_from() {
-        // Обратная сторона: файл не трогали, но снапшот есть. Он и должен
-        // применяться — иначе правка пропала бы.
-        let tmp = Temp::new("untouched-snapshot");
-        let file = tmp.file("a.rs");
-        let session = tmp.short_session(3, 1_000);
-        let mut doc = session.open_file(&file).unwrap();
-        doc.insert(0, b"abc").unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(600))));
-        doc.snapshot_if_due();
-        assert!(doc.snapshot_error().is_none());
-
-        let session2 = tmp.short_session(3, 1_000);
-        let mut back = session2.open_file(&file).unwrap();
-        assert_eq!(back.text(), b"abc");
-        back.undo().unwrap().expect("история из снапшота жива");
-        assert!(back.text().is_empty());
-    }
-
-    #[test]
-    fn a_snapshot_written_without_trouble_says_nothing() {
-        let dir = temp_dir("snapshot-ok");
-        let mut doc = doc_in(&dir);
-        doc.snapshot();
-        assert!(
-            doc.snapshot_error().is_none(),
-            "снапшот лёг, жаловаться не на что"
-        );
-    }
-
-    #[test]
-    fn a_document_without_a_sink_has_nothing_to_report() {
-        // Хранилище выключено: писать некуда и жаловаться не на что.
-        let dir = temp_dir("no-sink");
-        let file = dir.join("b.rs");
-        std::fs::write(&file, "abc\n").unwrap();
-        let session = Session::open_at_with(&dir, 3, false, 64).unwrap();
-        let mut doc = session.open_file(&file).unwrap();
-        doc.snapshot();
-        assert!(doc.snapshot_error().is_none());
-    }
-
-    // ── Связка буфера и хранилища ──────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::testing::{Temp, type_until_snapshot};
+    use super::*;
+    use crate::api::disk::{KEEP, PERSIST};
+    use crate::router::error::SessionError;
 
     #[test]
     fn snapshot_reaches_disk() {
@@ -1373,7 +586,9 @@ mod tests {
 
         let mut doc = session.open_file(&file).unwrap();
         // Часы стоят: по времени снимков не будет, только по глубине.
-        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
+        doc.set_clock(Box::new(crate::router::clock::FixedClock::after(
+            std::time::Duration::ZERO,
+        )));
         for _ in 0..40 {
             let end = doc.buffer().len();
             doc.insert(end, b"z").unwrap();
@@ -1396,7 +611,7 @@ mod tests {
     fn unreadable_file_reports_error() {
         // Каталог на месте файла — это не «нет файла», а ошибка чтения.
         let tmp = Temp::new("unreadable");
-        let dir = tmp.dir.join("папка");
+        let dir = tmp.dir().join("папка");
         std::fs::create_dir_all(&dir).unwrap();
         let session = tmp.session(3);
         let err = session
@@ -1406,94 +621,6 @@ mod tests {
             SessionError::ReadFile { path, .. } => assert!(path.contains("папка")),
             other => panic!("не та ошибка: {other}"),
         }
-    }
-
-    #[test]
-    fn buffer_and_store_do_not_know_each_other() {
-        // Стык сделан в роутере: крейты не зависят друг от друга.
-        // Проверяем, что документ работает и без приёмника вообще.
-        let mut doc = crate::api::buffer::Document::new("начало".as_bytes()).unwrap();
-        for _ in 0..9000 {
-            doc.insert(doc.len(), b"x").unwrap();
-        }
-        assert_eq!(
-            doc.snapshots_taken(),
-            0,
-            "документ сам снимает только по прямой просьбе"
-        );
-        doc.snapshot();
-        assert_eq!(
-            doc.snapshots_taken(),
-            0,
-            "без приёмника снимку некуда уйти, он не берётся"
-        );
-        assert_eq!(doc.read().len(), 9000 + "начало".len());
-    }
-
-    #[test]
-    fn history_depth_reaches_the_buffer() {
-        // Глубина истории из конфига доходит до буфера.
-        let tmp = Temp::new("depth");
-        let file = tmp.file("a.rs");
-        let session = tmp.short_session(3, 4);
-        assert_eq!(session.history_depth(), 4);
-        let doc = session.open_file(&file).unwrap();
-        assert_eq!(doc.buffer().history_depth(), 4);
-    }
-
-    #[test]
-    fn the_depth_takes_snapshots_without_cutting_history() {
-        // Два повода для снимка: время сохраняет сессию, а глубина задаёт шаг
-        // между снимками. История из памяти не уходит — иначе восстановить её
-        // после перезапуска было бы не из чего.
-        let tmp = Temp::new("depth-snapshot");
-        let file = tmp.file("a.rs");
-        let session = tmp.short_session(3, 4);
-
-        let mut doc = session.open_file(&file).unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
-        for _ in 0..10 {
-            let end = doc.buffer().len();
-            doc.insert(end, b"x").unwrap();
-            doc.snapshot_if_due();
-        }
-
-        assert_eq!(
-            doc.buffer().snapshots_taken(),
-            2,
-            "глубина переросла дважды и каждый раз снимался снимок"
-        );
-        assert_eq!(
-            doc.buffer().path().len(),
-            10,
-            "история целиком осталась в памяти"
-        );
-        assert_eq!(doc.text().len(), 10, "текст цел");
-
-        for _ in 0..10 {
-            doc.undo().unwrap().expect("откат идёт по памяти");
-        }
-        assert!(doc.undo().unwrap().is_none(), "дальше отменять нечего");
-        assert!(doc.text().is_empty(), "дошли до пустого документа");
-    }
-
-    #[test]
-    fn a_full_history_without_a_sink_keeps_the_edits() {
-        // Без приёмника снимку некуда уйти. История при этом остаётся в
-        // памяти: терять возможность отменить нельзя.
-        let tmp = Temp::new("depth-no-sink");
-        let file = tmp.file("a.rs");
-        let session = tmp.no_persist_session(3, 4);
-
-        let mut doc = session.open_file(&file).unwrap();
-        for _ in 0..10 {
-            let end = doc.buffer().len();
-            doc.insert(end, b"x").unwrap();
-            doc.snapshot_if_due();
-        }
-        assert_eq!(doc.buffer().snapshots_taken(), 0, "снимку некуда уйти");
-        assert_eq!(doc.buffer().path().len(), 10, "история осталась целой");
-        assert_eq!(session.store().count(&file).unwrap(), 0, "и на диске пусто");
     }
 
     #[test]
@@ -1524,65 +651,6 @@ mod tests {
     }
 
     #[test]
-    fn file_too_large_reports_bytes_and_limit() {
-        // Файл больше u32::MAX не помещается в буфер.
-        let err = SessionError::FileTooLarge {
-            bytes: 5_000_000_000,
-        };
-        let text = err.text();
-
-        // Точный размер в байтах.
-        assert!(
-            text.contains("5 000 000 000 bytes"),
-            "в сообщении должен быть точный размер в байтах: {text}"
-        );
-        // Размер файла в десятичных гигабайтах: 5 000 000 000 / 10^9 = 5.0.
-        assert!(
-            text.contains("(5.0 GB)"),
-            "размер файла должен быть в десятичных ГБ: {text}"
-        );
-        // Предел — точные байты: u32::MAX = 4 294 967 295.
-        assert!(
-            text.contains("\nthe maximum is 4 294 967 295 bytes"),
-            "предел должен быть в точных байтах: {text}"
-        );
-        // Гигабайты приложены для удобства: 4.29 ГБ, а не 4.0.
-        assert!(
-            text.contains("(4.3 GB)"),
-            "предел в ГБ должен быть 4.3, а не 4.0: {text}"
-        );
-    }
-
-    #[test]
-    fn gigabytes_are_decimal_not_binary() {
-        // Гигабайт считается в 10^9. Если считать в 2^30, то получится 4.0 и
-        // пользователю покажут неверный предел.
-        let limit_gb = u32::MAX as f64 / 1_000_000_000.0;
-        assert!(
-            (limit_gb - 4.294967295).abs() < 1e-9,
-            "предел должен быть 4.294967295 ГБ, получено {limit_gb}"
-        );
-        assert!(
-            (u32::MAX as f64 / 1_073_741_824.0 - 4.0).abs() < 1e-9,
-            "деление на 2^30 даёт 4.0 — это гибибайты, а не гигабайты"
-        );
-    }
-
-    #[test]
-    fn big_numbers_are_split_into_readable_parts() {
-        use crate::api::text::group_digits;
-
-        // Без разделителей длинное число не читается.
-        assert_eq!(group_digits(4_294_967_295), "4 294 967 295");
-        assert_eq!(group_digits(1_000), "1 000");
-        assert_eq!(group_digits(1_234_567_890), "1 234 567 890");
-        // Числа короче трёх разрядов не трогаем.
-        assert_eq!(group_digits(999), "999");
-        assert_eq!(group_digits(100), "100");
-        assert_eq!(group_digits(0), "0");
-    }
-
-    #[test]
     fn persist_false_writes_no_snapshots_to_disk() {
         // Настройка persist обязана что-то значить: при false приёмник не
         // вешается вовсе, поэтому снимок не берётся и на диск ничего не уходит.
@@ -1591,7 +659,9 @@ mod tests {
         let session = tmp.no_persist_session(3, 8);
 
         let mut doc = session.open_file(&file).unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
+        doc.set_clock(Box::new(crate::router::clock::FixedClock::after(
+            std::time::Duration::ZERO,
+        )));
         for _ in 0..40 {
             let end = doc.buffer().len();
             doc.insert(end, b"z").unwrap();
@@ -1619,12 +689,12 @@ mod tests {
         // Сессия по умолчанию берёт значения из настроек крейтов, а не из
         // зашитых констант.
         let tmp = Temp::new("defaults");
-        let session = Session::open_at(tmp.dir.clone(), crate::api::disk::KEEP).unwrap();
+        let session = Session::open_at(tmp.dir().to_path_buf(), KEEP).unwrap();
         assert_eq!(
             session.history_depth(),
             crate::api::buffer::defaults::buffer::HISTORY_DEPTH.value
         );
-        assert_eq!(session.persist(), crate::api::disk::PERSIST);
+        assert_eq!(session.persist(), PERSIST);
     }
 
     #[test]
@@ -1632,11 +702,11 @@ mod tests {
         // Главное: правки и снапшот переживают перезапуск. Текст верный, но без
         // истории отменять нечего — половина работы пользователя исчезает.
         let tmp = Temp::new("history-survives");
-        std::fs::create_dir_all(&tmp.dir).unwrap();
-        let file = tmp.dir.join("doc.txt");
+        std::fs::create_dir_all(tmp.dir()).unwrap();
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
 
-        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
 
         {
             let mut doc = session.open_file(&file).unwrap();
@@ -1648,7 +718,7 @@ mod tests {
         }
 
         // Новый процесс читает тот же файл.
-        let session2 = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session2 = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         let mut doc = session2.open_file(&file).unwrap();
 
         // Текст на месте.
@@ -1666,10 +736,10 @@ mod tests {
         // применять его нельзя: правка извне стала бы невидимой и уехала бы под
         // следующим сохранением.
         let tmp = Temp::new("changed-outside");
-        let file = tmp.dir.join("doc.txt");
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
 
-        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         {
             let mut doc = session.open_file(&file).unwrap();
             doc.insert(3, b"XY").unwrap();
@@ -1679,7 +749,7 @@ mod tests {
         // Правка снаружи: и содержимое, и длина.
         std::fs::write(&file, "чужая правка\n").unwrap();
 
-        let session2 = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session2 = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         let doc = session2.open_file(&file).unwrap();
         assert_eq!(
             doc.text(),
@@ -1694,9 +764,9 @@ mod tests {
         // После записи работа целиком в файле: и снапшоты, и якорь дальше
         // держать незачем. Выход после сохранения чистит базу.
         let tmp = Temp::new("save-forget");
-        let file = tmp.dir.join("doc.txt");
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
-        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         let mut doc = session.open_file(&file).unwrap();
         doc.insert(3, b"XY").unwrap();
 
@@ -1718,9 +788,9 @@ mod tests {
         // Несохранённая работа — это ещё не отражённая в файле работа: чистить
         // её на выходе значило бы терять то, что человек не успел записать.
         let tmp = Temp::new("save-keep");
-        let file = tmp.dir.join("doc.txt");
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
-        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         let mut doc = session.open_file(&file).unwrap();
         doc.insert(3, b"XY").unwrap();
         doc.snapshot();
@@ -1734,9 +804,9 @@ mod tests {
         // Чужая правка на диске: затирать её отданной работой — врать. Отказ —
         // ответ политики, а не ошибка, и на диск не уезжает ничего.
         let tmp = Temp::new("save-refused");
-        let file = tmp.dir.join("doc.txt");
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
-        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         let mut doc = session.open_file(&file).unwrap();
         std::fs::write(&file, "чужая правка\n").unwrap();
         doc.insert(0, b"XY").unwrap();
@@ -1757,9 +827,9 @@ mod tests {
         // Якорь всегда о том, что мы последними видели: после записи — о
         // записанном, иначе следующая проверка отвергла бы свой же файл.
         let tmp = Temp::new("save-reanchor");
-        let file = tmp.dir.join("doc.txt");
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
-        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         let doc = session.open_file(&file).unwrap();
 
         session.save_document(&doc).unwrap();
@@ -1776,10 +846,10 @@ mod tests {
         // пользователь с `persist = true` думал бы, что работа переживает
         // перезапуск.
         let tmp = Temp::new("keep-zero");
-        let file = tmp.dir.join("doc.txt");
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
 
-        let session = Session::open_at_with(tmp.dir.clone(), 0, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 0, true, 64).unwrap();
         {
             let mut doc = session.open_file(&file).unwrap();
             doc.insert(3, b"XY").unwrap();
@@ -1797,17 +867,17 @@ mod tests {
     fn an_untouched_file_still_gets_its_snapshot() {
         // Обратная сторона проверки: файл не трогали, снапшот применяется.
         let tmp = Temp::new("untouched");
-        let file = tmp.dir.join("doc.txt");
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
 
-        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         {
             let mut doc = session.open_file(&file).unwrap();
             doc.insert(3, b"XY").unwrap();
             doc.snapshot();
         }
 
-        let session2 = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session2 = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         let doc = session2.open_file(&file).unwrap();
         assert_eq!(doc.text(), b"abcXY\n", "история легла поверх файла");
         assert!(!doc.changed_outside(), "файл не меняли, ложной тревоги нет");
@@ -1819,10 +889,10 @@ mod tests {
         // свой формат. Такой блоб историю не восстановит, но файл обязан
         // открыться, а текст — оказаться на месте.
         let tmp = Temp::new("foreign-blob");
-        let file = tmp.dir.join("doc.txt");
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
 
-        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         {
             let mut store = session.store().reopen().unwrap();
             let mut old = b"BUFH".to_vec();
@@ -1830,7 +900,7 @@ mod tests {
             store.put(&file, "abc\n".as_bytes(), &old).unwrap();
         }
 
-        let session2 = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session2 = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         let mut doc = session2.open_file(&file).unwrap();
         assert_eq!(doc.text(), b"abc\n", "текст из снапшота на месте");
         // Истории нет — отменять нечего, и это не ошибка.
@@ -1844,10 +914,10 @@ mod tests {
         // Что уходит в базу, обязан быть форматом rope: с магией и версией.
         // Иначе следующий запуск не поймёт, что там лежит.
         let tmp = Temp::new("rope-format");
-        let file = tmp.dir.join("doc.txt");
+        let file = tmp.dir().join("doc.txt");
         std::fs::write(&file, "abc\n").unwrap();
 
-        let session = Session::open_at_with(tmp.dir.clone(), 3, true, 64).unwrap();
+        let session = Session::open_at_with(tmp.dir().to_path_buf(), 3, true, 64).unwrap();
         {
             let mut doc = session.open_file(&file).unwrap();
             doc.insert(3, b"XY").unwrap();
@@ -1865,365 +935,5 @@ mod tests {
             .restore(b"abc\n", crate::api::buffer::DEFAULT_DEPTH)
             .expect("документ собирается");
         assert_eq!(restored.read(), b"abcXY\n");
-    }
-
-    #[test]
-    fn a_snapshot_is_taken_by_the_clock_when_the_history_has_room() {
-        // Снапшот снимает время, если глубина истории ещё не выбрана: правок
-        // может быть много, и интервал честно отсчитывается часами.
-        let tmp = Temp::new("snapshot-by-time");
-        let file = tmp.dir.join("doc.txt");
-        std::fs::write(&file, "x\n").unwrap();
-
-        let mut session = Session::open_at_with(tmp.dir.clone(), 3, true, 10_000).unwrap();
-        session.set_snapshot_interval(Duration::from_secs(300));
-
-        // Часы стоят: сколько правок ни сделай, пяти минут не прошло.
-        let mut doc = session.open_file(&file).unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
-        for _ in 0..500 {
-            let at = doc.buffer().len() - 1;
-            doc.insert(at, b"y").unwrap();
-            doc.snapshot_if_due();
-        }
-        assert_eq!(doc.text().len(), 502, "правки на месте");
-        assert_eq!(doc.buffer().snapshots_taken(), 0, "время не шло");
-
-        // Часы пошли: пять минут прошло, и первая же проверка снимает снапшот.
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(299))));
-        doc.snapshot_if_due();
-        assert_eq!(doc.buffer().snapshots_taken(), 0, "до интервала рано");
-
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(300))));
-        doc.snapshot_if_due();
-        assert_eq!(
-            doc.buffer().snapshots_taken(),
-            1,
-            "интервал вышел, снимок есть"
-        );
-
-        // И отсчёт начинается заново: следующий снимок ещё не через пять минут.
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(420))));
-        doc.snapshot_if_due();
-        assert_eq!(doc.buffer().snapshots_taken(), 1, "отсчёт пошёл заново");
-    }
-
-    #[test]
-    fn the_interval_comes_from_the_settings() {
-        // Интервал из конфига доходит до сессии и до документа.
-        let tmp = Temp::new("interval-setting");
-        let file = tmp.file("a.rs");
-        let mut session = tmp.session(3);
-        session.set_snapshot_interval(Duration::from_secs(60));
-        assert_eq!(session.snapshot_interval(), Duration::from_secs(60));
-
-        let doc = session.open_file(&file).unwrap();
-        assert_eq!(doc.snapshot_interval(), Duration::from_secs(60));
-    }
-
-    #[test]
-    fn a_zero_interval_means_no_snapshots_at_all() {
-        // Ноль — это «снимков нет вообще», а не «на каждой правке». Иначе
-        // человек, выключивший интервал, получил бы обратный смысл настройки и
-        // вдвое больше работы на диске, чем просил.
-        let tmp = Temp::new("zero-interval");
-        let file = tmp.file("a.rs");
-        let mut session = tmp.session(3);
-        session.set_snapshot_interval(Duration::ZERO);
-
-        let mut doc = session.open_file(&file).unwrap();
-        for _ in 0..5 {
-            let at = doc.buffer().len();
-            doc.insert(at, b"x").unwrap();
-            doc.snapshot_if_due();
-        }
-        assert_eq!(
-            doc.buffer().snapshots_taken(),
-            0,
-            "при нулевом интервале снимков быть не должно"
-        );
-        assert_eq!(session.store().count(&file).unwrap(), 0, "и на диске тоже");
-    }
-
-    #[test]
-    fn a_one_second_interval_snapshots_on_every_edit_past_it() {
-        // Обратная сторона: интервал в секунду — это снимок раз в секунду, а не
-        // раз в правку. Часы двигаем сами.
-        let tmp = Temp::new("one-second");
-        let file = tmp.file("a.rs");
-        let mut session = tmp.session(3);
-        session.set_snapshot_interval(Duration::from_secs(1));
-
-        let mut doc = session.open_file(&file).unwrap();
-        doc.set_clock(Box::new(FixedClock::after(Duration::ZERO)));
-        for _ in 0..3 {
-            let at = doc.buffer().len();
-            doc.insert(at, b"x").unwrap();
-            doc.snapshot_if_due();
-            assert_eq!(
-                doc.buffer().snapshots_taken(),
-                0,
-                "за секунду снимок не заслужен"
-            );
-        }
-        doc.set_clock(Box::new(FixedClock::after(Duration::from_secs(1))));
-        doc.snapshot_if_due();
-        assert_eq!(doc.buffer().snapshots_taken(), 1, "секунда прошла");
-    }
-
-    #[test]
-    fn a_missing_file_opens_as_an_empty_document() {
-        // Файла нет — это не ошибка, а новый документ. Снапшот такого должен
-        // разобраться обратно.
-        let tmp = Temp::new("missing-file-snapshot");
-        let file = tmp.file("нет-такого.rs");
-        let session = tmp.session(3);
-
-        let mut doc = session.open_file(&file).unwrap();
-        assert_eq!(doc.text(), Vec::<u8>::new(), "пустой документ");
-        doc.insert(0, "новый текст".as_bytes()).unwrap();
-        doc.snapshot();
-        assert_eq!(doc.text(), "новый текст".as_bytes());
-
-        // С диска читается то, что осталось, и история не ломает его.
-        let session2 = tmp.session(3);
-        let mut back = session2.open_file(&file).unwrap();
-        assert_eq!(back.text(), "новый текст".as_bytes());
-        back.undo().unwrap().expect("история из снапшота живая");
-        assert_eq!(back.text(), Vec::<u8>::new());
-    }
-
-    // ── Статистика работы ──────────────────────────────────────────────────────
-
-    #[test]
-    fn the_statistics_counts_what_the_user_did() {
-        // Счётчик живёт в документе сессии: он видит правки, документ — нет.
-        let tmp = Temp::new("stats");
-        let file = tmp.file("a.rs");
-        let session = tmp.session(3);
-        let mut doc = session.open_file(&file).unwrap();
-
-        doc.insert(0, "абв".as_bytes()).unwrap();
-        doc.insert(3, "г".as_bytes()).unwrap();
-        doc.delete(0, 1).unwrap();
-        // «абв» — три буквы, а не шесть байт.
-        assert_eq!(doc.stats().input_chars, 4);
-        assert_eq!(doc.stats().deleted_chars, 1);
-        assert_eq!(doc.stats().edits, 3);
-    }
-
-    #[test]
-    fn the_statistics_count_only_the_time_a_key_was_held() {
-        // Секунды между нажатиями — это размышление, а не печать.
-        let tmp = Temp::new("presses");
-        let file = tmp.file("a.rs");
-        let session = tmp.session(3);
-        let mut doc = session.open_file(&file).unwrap();
-
-        doc.note_press();
-        // Между нажатиями прошло двадцать секунд: они сюда не попадают.
-        doc.note_press();
-        doc.note_held(Duration::from_millis(70));
-        doc.note_held(Duration::from_millis(130));
-        // Третье нажатие так и не отпустили: время оно не добавит.
-        doc.note_press();
-
-        assert_eq!(doc.stats().presses, 3, "нажатий три");
-        assert_eq!(
-            doc.stats().pressed,
-            Duration::from_millis(200),
-            "время заняли сами нажатия"
-        );
-    }
-
-    #[test]
-    fn replace_counts_both_sides() {
-        // Замена — это удаление и вставка, и статистика должна видеть обе.
-        let tmp = Temp::new("stats-replace");
-        let file = tmp.file("a.rs");
-        let session = tmp.session(3);
-        let mut doc = session.open_file(&file).unwrap();
-
-        doc.insert(0, "строка".as_bytes()).unwrap();
-        assert_eq!(doc.stats().edits, 1);
-
-        // Позиции и длины — в байтах, а не в буквах: «строка» это 12 байт.
-        let len = "строка".len() as u32;
-        doc.replace(0, len, "другая".as_bytes()).unwrap();
-        let stats = doc.stats();
-        assert_eq!(stats.edits, 2, "замена — одна правка");
-        assert_eq!(stats.input_chars, 6 + 6, "шесть букв, потом шесть");
-        assert_eq!(stats.deleted_chars, u64::from(len));
-        assert_eq!(doc.text(), "другая".as_bytes());
-    }
-
-    #[test]
-    fn statistics_survive_a_snapshot() {
-        // Снапшот чинит документ, но не обнуляет счётчики: статистика за
-        // сеанс считается с открытия файла, а не с последнего снимка.
-        let tmp = Temp::new("stats-snapshot");
-        let file = tmp.file("a.rs");
-        let session = tmp.session(3);
-        let mut doc = session.open_file(&file).unwrap();
-
-        doc.insert(0, "до".as_bytes()).unwrap();
-        doc.note_press();
-        doc.note_held(Duration::from_millis(50));
-        doc.snapshot();
-        assert_eq!(doc.stats().input_chars, 2, "счётчик не сбросился");
-        assert_eq!(doc.stats().presses, 1);
-
-        doc.insert(0, "после".as_bytes()).unwrap();
-        assert_eq!(doc.stats().input_chars, 7, "счётчик считает и дальше");
-        assert_eq!(doc.stats().edits, 2);
-    }
-
-    #[test]
-    fn a_document_survives_a_thousand_tiny_edits() {
-        // Много мелких правок подряд: дерево перестраивается на каждой, и ни
-        // одна из них не должна его сломать.
-        let tmp = Temp::new("tiny-edits");
-        let file = tmp.file("a.rs");
-        let session = tmp.session(3);
-        let mut doc = session.open_file(&file).unwrap();
-
-        for i in 0..1000u32 {
-            doc.insert(0, "•".as_bytes()).unwrap();
-            // Булет — три байта, как и любая буква кириллицы.
-            assert_eq!(doc.buffer().len(), (i + 1) * 3);
-        }
-        assert_eq!(doc.text().len(), 3000);
-        assert_eq!(doc.buffer().read_range(0, 0), Vec::<u8>::new());
-    }
-
-    // ── Карта строк едет вместе с документом ──────────────────────────────────
-
-    #[test]
-    fn the_line_map_stays_with_the_document() {
-        // Карта строк обязана ехать вместе с текстом на каждой правке, отмене и
-        // повторе. Эталон — обычная строка с историей правок: любое расхождение
-        // означает, что карта разъехалась.
-        //
-        // Снимки на диск не пишутся (`keep = 0`): откат упирается в память, и
-        // эталон ведёт себя так же. Про откат через кольцо — отдельный тест.
-        let tmp = Temp::new("line-map");
-        let file = tmp.file("a.rs");
-        let session = tmp.session(0);
-        let mut doc = session.open_file(&file).unwrap();
-
-        let mut text = String::new();
-        let mut history: Vec<Op> = Vec::new();
-        let mut seed = 0x2545F4914F6CDD1Du64;
-        let mut next = |n: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % n.max(1) as u64) as usize
-        };
-
-        for _ in 0..600 {
-            // Что именно сделали на этом шаге: без этого расхождение
-            // бесполезно.
-            let done: String;
-            match next(5) {
-                0 if !text.is_empty() => {
-                    let at = next(text.len());
-                    let len = 1 + next((text.len() - at).min(20));
-                    let removed = text[at..at + len].to_string();
-                    doc.delete(at as u32, len as u32).unwrap();
-                    text.replace_range(at..at + len, "");
-                    history.push(Op::Delete { at, removed });
-                    done = format!("удалить {at}..{}", at + len);
-                }
-                1 => {
-                    let at = next(text.len() + 1);
-                    let typed = if next(2) == 0 { "\n" } else { "ab" };
-                    doc.insert(at as u32, typed.as_bytes()).unwrap();
-                    text.insert_str(at, typed);
-                    history.push(Op::Insert {
-                        at,
-                        len: typed.len(),
-                    });
-                    done = format!("вставить {typed:?} на {at}");
-                }
-                2 => {
-                    let at = next(text.len() + 1);
-                    let len = next((text.len() - at).min(10));
-                    let removed = text[at..at + len].to_string();
-                    let typed = "xy\n";
-                    doc.replace(at as u32, len as u32, typed.as_bytes())
-                        .unwrap();
-                    text.replace_range(at..at + len, typed);
-                    history.push(Op::Replace { at, removed });
-                    done = format!("заменить {at}..{} на {typed:?}", at + len);
-                }
-                3 => {
-                    // Снапшот не меняет текст, и карта строк после него
-                    // обязана остаться в силе. Эталон делает то же самое:
-                    // история правок остаётся в памяти.
-                    doc.snapshot();
-                    history.clear();
-                    done = "снапшот".to_string();
-                }
-                _ => {
-                    let Some(op) = history.pop() else { continue };
-                    doc.undo().unwrap().expect("отменять есть что");
-                    done = format!("отменить {op:?}");
-                    match op {
-                        Op::Insert { at, len } => text.replace_range(at..at + len, ""),
-                        Op::Delete { at, removed, .. } => text.insert_str(at, &removed),
-                        // Отмена замены убирает вставленное и возвращает
-                        // вырезанное.
-                        Op::Replace { at, removed, .. } => {
-                            text.replace_range(at..at + 3, "");
-                            text.insert_str(at, &removed);
-                        }
-                    }
-                }
-            }
-
-            let fresh = crate::router::LineMap::build(text.as_bytes());
-            assert_eq!(
-                doc.lines().breaks(),
-                fresh.breaks(),
-                "карта строк разошлась с текстом: {done}, текст {:?}",
-                text
-            );
-            assert_eq!(doc.line_count(), fresh.line_count());
-            assert_eq!(
-                doc.text(),
-                text.as_bytes(),
-                "текст разошёлся: {done}, было {:?}",
-                text
-            );
-        }
-    }
-
-    #[test]
-    fn a_line_map_survives_undo_and_replace() {
-        // Отмена вставки убирает её переводы строк, отмена удаления и замены
-        // возвращает их на место.
-        let tmp = Temp::new("lines-undo");
-        let file = tmp.file("a.rs");
-        let session = tmp.session(3);
-        let mut doc = session.open_file(&file).unwrap();
-
-        doc.insert(0, b"one\ntwo\n").unwrap();
-        assert_eq!(doc.lines().breaks(), [3, 7]);
-        doc.undo().unwrap();
-        assert_eq!(doc.lines().breaks(), []);
-
-        doc.replace(0, 0, b"a\nb").unwrap();
-        assert_eq!(doc.lines().breaks(), [1]);
-        doc.undo().unwrap();
-        assert_eq!(doc.lines().breaks(), []);
-    }
-
-    /// Правка в эталоне: сколько байт затронуто и что было там до неё.
-    #[derive(Debug)]
-    enum Op {
-        Insert { at: usize, len: usize },
-        Delete { at: usize, removed: String },
-        Replace { at: usize, removed: String },
     }
 }

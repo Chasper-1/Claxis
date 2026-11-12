@@ -33,3 +33,7 @@ claxis-theme = { path = "claxis-theme" }                  # claxis-config
 toml_edit = "0.22"                                        # claxis-config, claxis-i18n, Claxis
 
 crossterm = "0.29"                                        # claxis-term
+
+[dev-dependencies]
+# Временные каталоги для тестов: убирают за собой.
+claxis-disk = { path = "claxis-disk", features = ["test-support"] }

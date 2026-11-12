@@ -15,7 +15,7 @@ use std::time::Instant;
 use crate::api::save;
 use crate::api::save::messages::Messages as SaveMessages;
 use crate::api::term::{Event, Key, KeyCode, Modifiers, Terminal};
-use crate::router::session::Document;
+use crate::router::document::Document;
 
 /// Что цикл сделал с событием.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
